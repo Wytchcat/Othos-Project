@@ -109,6 +109,29 @@ static class FirestarterApp
         return Process.Start(psi);
     }
 
+    // like Run, but hands `input` to the script on stdin (an API key: never on a command line,
+    // where other programs could see it)
+    public static string RunWithInput(string args, string input)
+    {
+        var psi = new ProcessStartInfo(Py, Script + " " + args);
+        psi.WorkingDirectory = AgentDir;
+        psi.UseShellExecute = false;
+        psi.CreateNoWindow = true;
+        psi.RedirectStandardInput = true;
+        psi.RedirectStandardOutput = true;
+        psi.RedirectStandardError = true;
+        psi.StandardOutputEncoding = System.Text.Encoding.UTF8;
+        psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8";
+        using (var p = Process.Start(psi))
+        {
+            p.StandardInput.WriteLine(input);
+            p.StandardInput.Close();
+            string o = p.StandardOutput.ReadToEnd() + p.StandardError.ReadToEnd();
+            p.WaitForExit(30000);
+            return o.Trim();
+        }
+    }
+
     public static string RunScript(string scriptAndArgs)
     {
         var psi = new ProcessStartInfo(Py, scriptAndArgs);
@@ -356,6 +379,197 @@ class DownloaderForm : Form
     }
 }
 
+// "Providers" window (both workers): other model providers by API key, so nobody needs to edit
+// .env or the settings by hand. Local ones first. A key is typed into a hidden box, handed to
+// the worker's script on stdin (worker_cloud.py: set-key) and saved encrypted by Windows
+// (worker_keys.py, %LOCALAPPDATA%\Othos\keys.dat); only its last 4 characters are ever shown.
+// Turning on a free tier that may train on what's sent asks Yes/No first.
+class ProvidersForm : Form
+{
+    static readonly Color Bg = Color.FromArgb(2, 7, 5), Ink = Color.FromArgb(200, 230, 210),
+        Dim = Color.FromArgb(120, 140, 130), Gold = Color.FromArgb(231, 195, 104), Ok = Color.FromArgb(120, 200, 140),
+        PurpleFill = Color.FromArgb(14, 16, 25), PurpleLine = Color.FromArgb(64, 53, 105), PurpleHover = Color.FromArgb(25, 24, 43);
+    static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
+    readonly Panel body = new Panel();
+    readonly TextBox tokensDay = new TextBox(), usdDay = new TextBox();
+    readonly Label footer = new Label();
+    bool filling;
+
+    public ProvidersForm()
+    {
+        Text = FirestarterApp.Name + ": providers";
+        try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
+        FormBorderStyle = FormBorderStyle.FixedSingle; MaximizeBox = false; MinimizeBox = false;
+        StartPosition = FormStartPosition.CenterParent;
+        ClientSize = new Size(760, 640);
+        BackColor = Bg; ForeColor = Ink; Font = new Font("Segoe UI", 9.5f);
+
+        var head = new Label();
+        head.Text = "Local first: these run on this PC and nothing leaves it. Cloud providers get only what a task " +
+                    "would give the local model, after the redaction filter, and only while switched On.";
+        head.ForeColor = Dim; head.SetBounds(16, 10, 728, 38);
+        Controls.Add(head);
+        body.SetBounds(10, 50, 740, 500); body.AutoScroll = true; body.BackColor = Bg;
+        Controls.Add(body);
+
+        AddLabel(this, "Cloud limit per day:", 16, 564, 140, Dim);
+        tokensDay.SetBounds(160, 561, 100, 24); StyleBox(tokensDay); Controls.Add(tokensDay);
+        AddLabel(this, "tokens   and", 264, 564, 90, Dim);
+        usdDay.SetBounds(356, 561, 60, 24); StyleBox(usdDay); Controls.Add(usdDay);
+        AddLabel(this, "dollars (dollars count once prices are set)", 420, 564, 330, Dim);
+        var saveLimits = MakeButton(this, "Save limits", 16, 596, 120);
+        saveLimits.Click += (s, e) => SaveLimits();
+        var close = MakeButton(this, "Close", 624, 596, 120);
+        close.Click += (s, e) => Close();
+        footer.SetBounds(146, 602, 470, 22); footer.ForeColor = Dim; Controls.Add(footer);
+        Reload();
+    }
+
+    static void StyleBox(TextBox t) { t.BackColor = PurpleFill; t.ForeColor = Ink; t.BorderStyle = BorderStyle.FixedSingle; }
+
+    static Label AddLabel(Control parent, string text, int x, int y, int w, Color c, bool bold = false)
+    {
+        var l = new Label(); l.Text = text; l.ForeColor = c; l.SetBounds(x, y, w, 20);
+        if (bold) l.Font = new Font("Segoe UI Semibold", 10f);
+        parent.Controls.Add(l); return l;
+    }
+
+    static Button MakeButton(Control parent, string text, int x, int y, int w)
+    {
+        var b = new Button(); b.Text = text; b.SetBounds(x, y, w, 26); b.FlatStyle = FlatStyle.Flat;
+        b.FlatAppearance.BorderColor = PurpleLine; b.FlatAppearance.MouseOverBackColor = PurpleHover;
+        b.BackColor = PurpleFill; b.ForeColor = Ink; parent.Controls.Add(b); return b;
+    }
+
+    static string S(Dictionary<string, object> d, string k) { return d != null && d.ContainsKey(k) && d[k] != null ? Convert.ToString(d[k]) : ""; }
+    static bool B(Dictionary<string, object> d, string k) { return d != null && d.ContainsKey(k) && d[k] is bool && (bool)d[k]; }
+
+    void Reload()
+    {
+        footer.Text = "Reading…";
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            Dictionary<string, object> m = null;
+            try { m = Json.Deserialize<Dictionary<string, object>>(FirestarterApp.Run("providers")); } catch { }
+            try { BeginInvoke((Action)(() => Fill(m))); } catch { }
+        });
+    }
+
+    void Fill(Dictionary<string, object> m)
+    {
+        filling = true;
+        body.Controls.Clear();
+        if (m == null) { footer.Text = "Couldn't read the providers."; filling = false; return; }
+        tokensDay.Text = S(m, "max_tokens_per_day"); usdDay.Text = S(m, "max_usd_per_day");
+        int y = 6;
+        string section = "";
+        foreach (Dictionary<string, object> p in (System.Collections.ArrayList)m["providers"])
+        {
+            string where = S(p, "where");
+            string sec = where == "local" ? "On this PC" : "Cloud (by API key)";
+            if (sec != section) { section = sec; AddLabel(body, sec.ToUpper(), 6, y, 300, Gold, true); y += 26; }
+            AddRow(p, y); y += 84;
+        }
+        footer.Text = "";
+        filling = false;
+    }
+
+    void AddRow(Dictionary<string, object> p, int y)
+    {
+        string name = S(p, "name"), label = S(p, "label"), where = S(p, "where");
+        bool needsKey = B(p, "needs_key"), trains = B(p, "trains");
+        var title = AddLabel(body, label + (where == "proxy" ? "  (on this PC, then cloud)" : ""), 6, y, 300, Ink, true);
+        string note = S(p, "note") + (trains ? " Its free tier may use what's sent for training." : "");
+        var n = AddLabel(body, note, 6, y + 20, 690, trains ? Gold : Dim);
+        int y2 = y + 44;
+
+        var on = new CheckBox(); on.Text = "On"; on.ForeColor = Ink; on.SetBounds(6, y2 + 2, 50, 22);
+        on.Checked = B(p, "on");
+        body.Controls.Add(on);
+
+        TextBox key = null;
+        if (needsKey)
+        {
+            key = new TextBox(); key.SetBounds(60, y2, 170, 24); StyleBox(key); key.UseSystemPasswordChar = true;
+            body.Controls.Add(key);
+            string shown = S(p, "key");
+            var keyState = AddLabel(body, shown == "" ? "no key" : shown + (S(p, "key_from") == ".env" ? " (.env)" : ""),
+                                    234, y2 + 3, 150, shown == "" ? Dim : Ok);
+            var save = MakeButton(body, "Save key", 388, y2 - 1, 72);
+            var k = key;
+            save.Click += (s, e) =>
+            {
+                string v = k.Text.Trim(); k.Text = "";
+                if (v == "") return;
+                ThreadPool.QueueUserWorkItem(_ => { string r = FirestarterApp.RunWithInput("set-key " + name, v);
+                    try { BeginInvoke((Action)(() => { if (r != "saved") MessageBox.Show(this, r, Text); Reload(); })); } catch { } });
+            };
+            if (S(p, "key_from") == "saved")
+            {
+                var del = MakeButton(body, "Remove", 464, y2 - 1, 62);
+                del.Click += (s, e) => ThreadPool.QueueUserWorkItem(_ => { FirestarterApp.Run("del-key " + name);
+                    try { BeginInvoke((Action)Reload); } catch { } });
+            }
+        }
+        else AddLabel(body, "no key needed", 60, y2 + 3, 190, Dim);
+
+        var model = new TextBox(); model.SetBounds(530, y2, 112, 24); StyleBox(model); model.Text = S(p, "model");
+        body.Controls.Add(model);
+        model.Leave += (s, e) => { string v = model.Text.Trim().Replace("\"", "");
+            ThreadPool.QueueUserWorkItem(_ => FirestarterApp.Run("provider-set " + name + " \"model=" + v + "\"")); };
+        var test = MakeButton(body, "Test", 646, y2 - 1, 50);
+        var result = AddLabel(body, "", 300, y, 290, Dim);
+        result.TextAlign = ContentAlignment.TopRight;
+        test.Click += (s, e) =>
+        {
+            if (MessageBox.Show(this, "Send " + label + " one tiny request (“Reply with the single word OK”)? " +
+                    "Nothing of yours is sent. A cloud provider may charge a fraction of a cent.", Text,
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+            result.Text = "Testing…"; result.ForeColor = Dim;
+            ThreadPool.QueueUserWorkItem(_ => { string r = FirestarterApp.Run("test-provider " + name).Trim();
+                try { BeginInvoke((Action)(() => { result.Text = r; result.ForeColor = r.StartsWith("Works") ? Ok : Gold; })); } catch { } });
+        };
+        var keyBox = key;
+        string page = S(p, "key_page");
+        if (page != "")
+        {
+            var link = new LinkLabel(); link.Text = needsKey ? "Get a key" : "Website"; link.LinkColor = Gold;
+            link.SetBounds(600, y + 2, 96, 20); link.TextAlign = ContentAlignment.TopRight; body.Controls.Add(link);
+            link.Click += (s, e) => { try { Process.Start(page); } catch { } };
+        }
+        on.CheckedChanged += (s, e) =>
+        {
+            if (filling) return;
+            if (on.Checked && needsKey && S(p, "key") == "" && (keyBox == null || keyBox.Text.Trim() == ""))
+            {
+                MessageBox.Show(this, "Save a key for " + label + " first.", Text);
+                filling = true; on.Checked = false; filling = false; return;
+            }
+            string extra = "";
+            if (on.Checked && trains && !B(p, "accepted"))
+            {
+                var a = MessageBox.Show(this, label + "'s free tier may use what's sent to improve its products " +
+                    "(training). Allow it for " + label + "?", Text, MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+                if (a != DialogResult.Yes) { filling = true; on.Checked = false; filling = false; return; }
+                extra = " accept=yes";
+            }
+            if (!on.Checked && trains) extra = " accept=no";
+            string arg = "provider-set " + name + (on.Checked ? " on" : " off") + extra;
+            ThreadPool.QueueUserWorkItem(_ => { FirestarterApp.Run(arg); try { BeginInvoke((Action)Reload); } catch { } });
+        };
+    }
+
+    void SaveLimits()
+    {
+        double t, u;
+        if (!double.TryParse(tokensDay.Text.Trim(), out t) || !double.TryParse(usdDay.Text.Trim(), out u) || t < 0 || u < 0)
+        { footer.Text = "Limits must be numbers, 0 or more."; return; }
+        string arg = "set-limits " + ((long)t) + " " + u.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        ThreadPool.QueueUserWorkItem(_ => { string r = FirestarterApp.Run(arg).Trim();
+            try { BeginInvoke((Action)(() => footer.Text = r == "saved" ? "Limits saved." : r)); } catch { } });
+    }
+}
+
 class FirestarterForm : Form
 {
     static readonly Color Bg = Color.FromArgb(2, 7, 5);
@@ -394,9 +608,9 @@ class FirestarterForm : Form
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
 #if SMITHY
-        ClientSize = new Size(420, 176 + 36 * FirestarterApp.Tiers.Length + 128 + 62);
+        ClientSize = new Size(420, 176 + 36 * FirestarterApp.Tiers.Length + 128 + 62 + 38);
 #else
-        ClientSize = new Size(420, 176 + 36 * FirestarterApp.Tiers.Length + 116 + 166 + 38);
+        ClientSize = new Size(420, 176 + 36 * FirestarterApp.Tiers.Length + 116 + 166 + 76);
 #endif
         BackColor = Bg; ForeColor = Ink;
         Font = new Font("Segoe UI", 10f);
@@ -417,10 +631,13 @@ class FirestarterForm : Form
         foreach (var t in FirestarterApp.Tiers) { var box = new ComboBox(); boxes.Add(box); AddModelRow(t[0], box, t[1], y2); y2 += 36; }
 #if SMITHY
         // which model provider the next tasks use (smithy.json cloud.default; worker_cloud.py).
-        // Only providers already turned on (smithy.json + a key in .env) are offered here.
+        // Only providers already turned on (in Providers..., with a key) are offered here.
         AddProviderRow(y2); y2 += 36;
         cloudLine = new Label(); cloudLine.ForeColor = Dim; cloudLine.SetBounds(150, y2, 250, 22);
         Controls.Add(cloudLine); y2 += 26;
+        var providersButton = MakeButton("Providers…", 150, y2, 250);
+        providersButton.Click += (s, e) => { using (var d = new ProvidersForm()) d.ShowDialog(this); LoadCloud(); };
+        y2 += 38;
 #endif
 #if !SMITHY
         // which kind of website the next tasks are written for (worker.json "site"); Site setup...
@@ -457,6 +674,10 @@ class FirestarterForm : Form
         zooButton.Click += (s, e) => { using (var d = new ZooForm()) d.ShowDialog(this); };
         var pcButton = MakeButton("Check my PC\u2026", 150, y2 + 158, 250);
         pcButton.Click += (s, e) => CheckPc();
+        // other model providers (shared window; worker.json "cloud"; off until one is turned on).
+        // No restart needed: the worker reads its settings and keys again at each task.
+        var provButton = MakeButton("Providers…", 150, y2 + 196, 250);
+        provButton.Click += (s, e) => { using (var d = new ProvidersForm()) d.ShowDialog(this); };
 #endif
 
         timer.Interval = 2000;

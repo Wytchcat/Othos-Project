@@ -248,9 +248,11 @@ a separate add-on with its own repository, **published later**; it isn't availab
   speak. In offline mode neither is used.
 - **Tavily** gets search questions. Personal questions are never sent to it.
 - **Other model providers for The Smithy** (Anthropic, DeepSeek, Mistral and others, by API
-  key) are **off until you turn one on** in `smithy.json`, with its key in `.env`. Even
-  then, a task uses them only when you name the provider, or when you set it as the
-  default.
+  key) are **off until you turn one on** in The Smithy's **Providers…** window. Keys
+  typed there are encrypted for your Windows account and kept outside the Othos folder
+  (`%LOCALAPPDATA%\Othos\keys.dat`), so they never end up in git. `.env` works too (the
+  advanced way). Even then, a task uses a provider only when you name it, or when you
+  set it as the default.
   - **What's sent:** that task's request, after the same filter that removes personal
     details.
   - **Refused:** providers whose free tiers may train on what you send, unless you allow

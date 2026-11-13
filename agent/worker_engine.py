@@ -384,6 +384,8 @@ def main(profile: Profile, argv: list[str]) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
     q, reg = profile.queue, profile.registry
+    if worker_cloud.command(argv, profile.config_path):   # the Providers window's commands
+        return
     cmd = argv[1] if len(argv) > 1 else "status"
     if cmd == "run":
         Worker(profile).run()

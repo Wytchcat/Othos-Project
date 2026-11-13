@@ -101,7 +101,8 @@ Tavily get data" rule, approved Nov 12 with these safeguards, all checked in cod
 - **deepseek, mistral (Codestral), nvidia, gemini, groq, cerebras, together, fireworks,
   openai, huggingface.**
 - **freellmapi:** [FreeLLMAPI](https://github.com/tashfeenahmed/freellmapi), a program you
-  run yourself (default `127.0.0.1:3001`) that pools many providers' free tiers behind one
+  run yourself (its server on `127.0.0.1:3001`; its desktop app on `127.0.0.1:31415`: set
+  `cloud.local_urls.freellmapi` to match) that pools many providers' free tiers behind one
   address.
   - **Treated as cloud:** it runs on this PC but passes everything on to free cloud tiers,
     which may train on what's sent. So it needs `cloud.accept_data_use`.
@@ -111,12 +112,29 @@ Tavily get data" rule, approved Nov 12 with these safeguards, all checked in cod
 
 xAI isn't offered.
 
-**To turn one on:**
-1. Put its key in `.env`, for example `DEEPSEEK_API_KEY=...`. Keys never go in
-   `smithy.json`. The key names are in `_cloud` in `smithy.json`.
-2. Add it to `cloud.enabled` in `smithy.json`, for example `"enabled": ["deepseek"]`.
-3. Set its model under `cloud.models` if it has no default. The defaults are Claude Opus
-   5.5, deepseek-chat and codestral-latest.
+**To turn one on: the Providers… window** (button in The Smithy's window; Firestarter
+has the same one). Local first ("On this PC"), then "Cloud". Each provider's row has:
+- **On:** a tick box. A free tier that may train on what's sent has a yellow note and
+  asks Yes/No first.
+- **Key:** a hidden box, then **Save key** (or **Remove**). Only the last 4 characters are
+  ever shown.
+- **Get a key:** opens the provider's own key page.
+- **Model:** filled in where there's a default.
+- **Test:** asks first, then sends one tiny "Reply with OK" request, nothing of yours.
+
+The daily limits (tokens, dollars) are at the bottom.
+
+**Where keys are kept:** encrypted by Windows for your account (DPAPI), in
+`%LOCALAPPDATA%\Othos\keys.dat`, outside the Othos folder (`worker_keys.py`). They never go
+into git or a shared copy.
+
+**The advanced way:**
+- A key in `.env` (for example `DEEPSEEK_API_KEY=...`) also works, and the window shows it
+  as "(.env)". A saved key wins.
+- Settings by hand: `cloud.enabled`, `cloud.models` and `cloud.accept_data_use` in
+  `smithy.json`.
+- Command line: `smithy.py providers | provider-set NAME on|off model=M accept=yes|no |
+  set-key NAME` (key on stdin) `| del-key NAME | test-provider NAME | set-limits TOKENS USD`.
 
 **Using one:**
 - **In the window:** the **Provider** row under Coding model. It offers "Local (this PC)"

@@ -65,7 +65,8 @@
     "models": {
       "anthropic": "claude-opus-5-5",
       "deepseek": "deepseek-chat",
-      "mistral": "codestral-latest"
+      "mistral": "codestral-latest",
+      "freellmapi": "qwen3-coder-480b-a35b-instruct"
     },
     "accept_data_use": [],
     "max_tokens_per_task": 200000,
