@@ -1,0 +1,23 @@
+{
+  "_about": "How Othos should SAY words the Rime voice gets wrong. Left: the word as written (not case-sensitive). Right: a spelling that sounds right. Only the voice changes; the on-screen transcript keeps the real spelling. Edit in Notepad++, then close and reopen Othos. (Place names go in personal.json's \"pronunciations\". GPU model numbers like 4060 -> 'forty sixty' are handled in agent.py.)",
+
+  "Ti": "tee eye",
+  "GHz": "gigahertz",
+  "MHz": "megahertz",
+  "Hz": "hertz",
+  "RTX": "R T X",
+  "GTX": "G T X",
+  "XTX": "X T X",
+  "RX": "R X",
+  "VRAM": "vee ram",
+  "NVMe": "N V M E",
+  "PCIe": "P C I E",
+  "CUDA": "cooda",
+  "PSU": "P S U",
+  "AIO": "A I O",
+  "DJI": "D J I",
+  "OBS": "O B S",
+  "LiFePO4": "lithium iron phosphate",
+  "TechPowerUp": "Tech Power Up",
+  "KitGuru": "Kit Guru"
+}

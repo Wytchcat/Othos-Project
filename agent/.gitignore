@@ -1,0 +1,39 @@
+# secrets: real keys live only in these files
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# personal data and run output (notes, note vectors, logs)
+brain/
+logs/
+*.tmp
+
+# old copy-style backups: git versions replace them
+agent.*.py
+
+# built from app\Othos.cs by build-othos-app.ps1
+app/Othos.exe
+
+# code chat drafts (Othos-ui /code 'Save code to drafts')
+drafts/
+
+# gaming mode's live state (override and status files)
+state/
+
+# Firestarter (CPU worker app), built from app\Firestarter.cs by build-firestarter.ps1
+app/Firestarter.exe
+
+# The Smithy (coding worker app), built from app\WorkerApp.cs by build-smithy.ps1
+app/Smithy.exe
+
+# the workers' work logs (personal; rewritten from their queues)
+workers/
+
+# personal settings: name, town, feeds (copy the .example files to make them)
+personal.json
+profile.md

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- Othos: a chip with an O, in the Circuit Board's green -->
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#06120c"/>
+  <g stroke="#3ddc84" stroke-width="3" stroke-linecap="round">
+    <path d="M20 6v7M32 6v7M44 6v7M20 51v7M32 51v7M44 51v7M6 20h7M6 32h7M6 44h7M51 20h7M51 32h7M51 44h7"/>
+  </g>
+  <rect x="13" y="13" width="38" height="38" rx="6" fill="#0b2a1a" stroke="#3ddc84" stroke-width="2"/>
+  <circle cx="32" cy="32" r="10" fill="none" stroke="#a6ffd0" stroke-width="4.5"/>
+</svg>

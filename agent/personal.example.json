@@ -1,0 +1,59 @@
+{
+  "_about": "Your personal settings. setup.ps1 copies this file to personal.json, which stays on your computer and is never committed. Fill in what you want; an empty field switches that feature off. Close and reopen Othos after editing. Every field is explained in README.md, and _example below shows a filled-in file (it is never used).",
+
+  "name": "",
+
+  "assistant": {
+    "name": "",
+    "heard_as": [],
+    "logo": "",
+    "color": ""
+  },
+
+  "weather_location": "",
+  "weather_latlon": "",
+  "home_location": "",
+
+  "contact_url": "",
+
+  "local_news": {
+    "trigger_words": [],
+    "feeds": []
+  },
+
+  "state_news": {
+    "state": "",
+    "trigger_words": [],
+    "feeds": []
+  },
+
+  "pronunciations": {},
+
+  "keyterms": [],
+
+  "_example": {
+    "name": "Alex",
+    "assistant": {"name": "Jarvis", "heard_as": ["Jervis"], "logo": "my-logo.png", "color": "#9d7bff"},
+    "weather_location": "Springfield, Greene County, MO, US",
+    "weather_latlon": "37.2090,-93.2923",
+    "contact_url": "https://example.com",
+    "local_news": {
+      "trigger_words": ["springfield", "greene county", "ozarks"],
+      "feeds": [
+        {"site": "example-local-paper.com", "name": "the Example Local Paper",
+         "url": "https://example-local-paper.com/feed/",
+         "skip_urls": "example-local-paper\\.com/(?:wire|ap)/"},
+        {"site": "example-tv.com", "name": "Example TV 5", "url": "https://example-tv.com/news/local.rss"}
+      ]
+    },
+    "state_news": {
+      "state": "Missouri",
+      "trigger_words": ["jefferson city"],
+      "feeds": [
+        {"site": "example-state-news.org", "name": "the Example State Independent", "url": "https://example-state-news.org/feed/"}
+      ]
+    },
+    "pronunciations": {"Ozarks": "Oh zarks"},
+    "keyterms": ["Springfield"]
+  }
+}

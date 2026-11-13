@@ -1,0 +1,33 @@
+{
+  "_about": "Othos gaming mode. Edit in Notepad++. Program names must match Task Manager > Details exactly (not case-sensitive). Close and reopen Othos after changes. Plan: Documents\\Othos_future\\gaming mode handoff.md",
+
+  "check_seconds": 10,
+
+  "_models": "gaming_model runs on the CPU only (Ollama variant with num_gpu 0, made by make-gaming-model.ps1). normal_model empty = OLLAMA_MODEL from .env.",
+  "normal_model": "",
+  "gaming_model": "othos-gaming",
+
+  "profiles": {
+    "gpu-heavy": { "voice_on_cpu": true,  "pause_worker": true,  "speech_on_cpu": true },
+    "cpu-heavy": { "voice_on_cpu": false, "pause_worker": true,  "speech_on_cpu": false },
+    "light":     { "voice_on_cpu": false, "pause_worker": true,  "speech_on_cpu": false }
+  },
+
+  "_override_profile": "used for 'gaming mode on' when no listed game is running",
+  "override_profile": "gpu-heavy",
+
+  "games": [
+    { "name": "Diablo IV", "process": "Diablo IV.exe", "profile": "gpu-heavy",
+      "_note": "dropping textures one notch may let it run as 'light'" },
+    { "name": "Skyrim (modded)", "process": "SkyrimSE.exe", "profile": "gpu-heavy",
+      "_note": "unmodded Skyrim: change profile to light" },
+    { "name": "Diablo III", "process": "Diablo III64.exe", "profile": "light" },
+    { "name": "Hytale", "process": "HytaleClient.exe", "profile": "cpu-heavy",
+      "_note": "program name not confirmed yet: check Task Manager on the new machine" },
+    { "name": "Minecraft (Java)", "process": "javaw.exe", "window_title": "Minecraft", "profile": "cpu-heavy",
+      "_note": "Java shows up as javaw.exe, so the window title is checked too; heavy shader packs -> gpu-heavy" },
+
+    { "name": "Test game (Notepad)", "process": "notepad.exe", "profile": "gpu-heavy", "enabled": false,
+      "_note": "for testing on the laptop: set enabled to true, open Notepad" }
+  ]
+}

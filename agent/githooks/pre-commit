@@ -1,0 +1,11 @@
+#!/bin/sh
+# Othos-agent pre-commit: requirements.txt must pin every package (name==version)
+# and match what's installed in .venv. Fix with update-requirements.ps1.
+# Turned on by setup.ps1 (git config core.hooksPath githooks, or agent/githooks when
+# Othos-agent is the agent\ folder of a bigger repo).
+# The agent folder is the one above this githooks folder, wherever the repo starts.
+agent="$(cd "$(dirname "$0")/.." && pwd)"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$agent/update-requirements.ps1" -Check || {
+  echo "Commit stopped: requirements.txt needs exact versions that match .venv (see above)."
+  exit 1
+}

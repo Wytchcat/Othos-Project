@@ -1,0 +1,60 @@
+{
+  "_about": "The Smithy (coding worker) settings. Edit in Notepad++, then close and reopen The Smithy. It runs on the CPU only and independently of voice Othos and of Firestarter (they take turns on the CPU when both have work).",
+  "_backend": "Which program runs the Smithy's model: \"ollama\" or \"llama-server\" (llama.cpp, or ik_llama.cpp). The model switcher in The Smithy app changes the model below.",
+  "backend": "ollama",
+  "_llama_server": "Only used when backend is llama-server. exe = path to llama-server.exe; models_dir = folder of .gguf files. Started with -ngl 0 and the graphics card hidden. Port 11438 (Firestarter's llama-server uses 11437).",
+  "llama_server": {
+    "exe": "",
+    "models_dir": "",
+    "port": 11438,
+    "extra_args": [
+      "-fa",
+      "on"
+    ]
+  },
+  "_ollama": "A small PC (this laptop, 16 GB RAM): the shared Ollama on 11434. A bigger PC (the new build: 12-core CPU, 128 GB RAM; The Smithy still runs on the CPU only): set start_own to true; The Smithy then runs its own Ollama on port 11436 with the graphics card hidden from it (CPU only).",
+  "ollama": {
+    "url": "http://127.0.0.1:11434",
+    "start_own": false,
+    "own_port": 11436
+  },
+  "_models": "qwen2.5-coder:3b is the stand-in for a small PC (this laptop, 16 GB RAM). On a bigger PC (the new build: 12-core CPU, 128 GB RAM; The Smithy still runs on the CPU only): code = Qwen3-Coder 30B-A3B (name as in ollama list).",
+  "models": {
+    "code": "qwen2.5-coder:3b"
+  },
+  "_threads": "CPU threads per task. The Smithy and Firestarter take turns (never side by side), so each gets all of these. Small PC (this laptop): 4, leaving the rest for voice Othos. Bigger PC (the new build, 12 cores): about 10.",
+  "num_thread": 4,
+  "_gaming": "While a game from gaming.json runs (or gaming mode is turned on by hand). pause = stop and requeue the task; throttle = keep going, held back.",
+  "gaming": {
+    "cpu-heavy": {
+      "action": "pause"
+    },
+    "gpu-heavy": {
+      "action": "throttle",
+      "num_thread": 2,
+      "low_priority": true
+    },
+    "light": {
+      "action": "throttle",
+      "num_thread": 4,
+      "low_priority": true
+    }
+  },
+  "keep_alive": "10m",
+  "_context_tokens": "How much the model can read at once. Small PC (this laptop): 8192. Bigger PC (the new build): 32768 (builds see more of the files already written).",
+  "context_tokens": 8192,
+  "poll_seconds": 5,
+  "game_check_seconds": 10,
+  "max_job_minutes": 30,
+  "_max_build_minutes": "Builds from scratch write several files, so they get longer.",
+  "max_build_minutes": 180,
+  "_max_build_files": "The most files one build may plan (the README is extra).",
+  "max_build_files": 20,
+  "max_attempts": 2,
+  "_code_folders": "Folders the review, fix and Joomla tasks may read files from; private files inside them stay blocked (worker_files.py). Relative paths start from this folder; missing ones are skipped (../ui is the shared copy's layout).",
+  "code_folders": [
+    ".",
+    "../Othos-ui",
+    "../ui"
+  ]
+}
