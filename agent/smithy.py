@@ -15,6 +15,8 @@ worker_engine.py.
     smithy.py add build WHAT               a project from scratch
     smithy.py add joomla WHAT [--file PATH]
     smithy.py add followup ID QUESTION     (on a build: a new version)
+    smithy.py add ... --provider NAME      on another model provider (worker_cloud.py; off by default)
+    smithy.py cloud | set-provider NAME|local
     smithy.py list | status | types | log
     smithy.py cancel [ID]
     smithy.py models
@@ -42,15 +44,62 @@ def _add(kind: str, rest: list[str]) -> dict:
             "script": lambda: {"request": " ".join(rest)},
             "build": lambda: {"request": " ".join(rest), "path": path},
             "joomla": lambda: {"request": " ".join(rest), "path": path},
-            "followup": lambda: {"parent_id": rest[0], "question": " ".join(rest[1:])}}[kind]()
+            "followup": lambda: {"parent_id": rest[0], "question": " ".join(rest[1:])},
+            "check": lambda: {"path": " ".join(rest)}}[kind]()
 
 
 PROFILE = worker_engine.Profile(
     queue=SMITHY, config_path=HERE / "smithy.json", registry=REGISTRY, log_name="smithy.log",
     script="smithy.py", tiers=("code",),
     add_usage=("usage: smithy.py add review PATH | fix PATH WHAT | script WHAT | build WHAT | "
-               "joomla WHAT [--file PATH] | followup TASK_ID QUESTION"),
+               "joomla WHAT [--file PATH] | followup TASK_ID QUESTION"
+               + (" | check PROGRAM.exe" if "check" in REGISTRY else "")      # not in the shared copy
+               + "   (any: --provider NAME [--model NAME])"),
     add_parse=_add)
 
+def _cloud(argv: list[str]) -> bool:
+    """The window's Provider row: `cloud` (JSON: what's turned on, the default, today's use)
+    and `set-provider NAME|local`. Turning a provider ON stays in smithy.json + .env."""
+    import json
+    import worker_cloud
+    import worker_shared
+    cmd = argv[1] if len(argv) > 1 else ""
+    if cmd not in ("cloud", "set-provider"):
+        return False
+    path = HERE / "smithy.json"
+    cfg = worker_shared.load_json(path)
+    cc = cfg.get("cloud") or {}
+    if cmd == "cloud":
+        ready, why = [], {}
+        for name in cc.get("enabled", []):
+            p = worker_cloud.PROVIDERS.get(str(name).lower())
+            if not p:
+                continue
+            try:
+                worker_cloud.pick(cfg, {"provider": p.name}, "review")
+                ready.append({"name": p.name, "label": p.spoken + (" (this PC)" if p.local else " (this PC, then cloud)" if p.proxy else " (cloud)")})
+            except ValueError as e:
+                why[p.name] = str(e)
+        u = worker_cloud.usage_today()
+        tot = {"tokens": sum(v.get("in", 0) + v.get("out", 0) for v in u["providers"].values()),
+               "usd": round(sum(v.get("usd", 0.0) for v in u["providers"].values()), 4),
+               "calls": sum(v.get("calls", 0) for v in u["providers"].values())}
+        print(json.dumps({"ready": ready, "not_ready": why, "default": cc.get("default", "") or "local",
+                          "today": tot, "max_tokens_per_day": cc.get("max_tokens_per_day", 1_000_000),
+                          "max_usd_per_day": cc.get("max_usd_per_day")}))
+        return True
+    name = (argv[2] if len(argv) > 2 else "").lower()
+    if name not in ("", "local"):
+        try:
+            worker_cloud.pick(cfg, {"provider": name}, "review")      # every safeguard, before saving
+        except ValueError as e:
+            raise SystemExit(f"can't use that: {e}")
+    cfg.setdefault("cloud", {})["default"] = "" if name in ("", "local") else name
+    path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    print(f"tasks now use {'the local model' if name in ('', 'local') else name} (from the next task)")
+    return True
+
+
 if __name__ == "__main__":
-    worker_engine.main(PROFILE, sys.argv)
+    if not _cloud(sys.argv):
+        worker_engine.main(PROFILE, sys.argv)

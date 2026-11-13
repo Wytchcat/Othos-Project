@@ -232,6 +232,15 @@ class MainForm : Form
         title.SetBounds(20, 14, 300, 30);
         Controls.Add(title);
 
+        var check = new LinkLabel();
+        check.Text = "Check my PC...";
+        check.LinkColor = Gold;
+        check.ActiveLinkColor = Green;
+        check.SetBounds(330, 22, 104, 22);
+        check.TextAlign = ContentAlignment.MiddleRight;
+        check.LinkClicked += (s, e) => ShowSpecs();
+        Controls.Add(check);
+
         for (int i = 0; i < rows.Length; i++)
         {
             rows[i] = new Label();
@@ -263,6 +272,258 @@ class MainForm : Form
         Refresh_();
     }
 
+
+    // ---- this PC's specs (system_specs.py): asked once on first start, "Check my PC..." any time
+    static readonly string SpecsFile = Path.Combine(OthosApp.AgentDir, "state", "system-specs.json");
+
+    static string RunSpecs(string args)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo(Path.Combine(OthosApp.AgentDir, ".venv", "Scripts", "python.exe"),
+                "\"" + Path.Combine(OthosApp.AgentDir, "system_specs.py") + "\" " + args);
+            psi.WorkingDirectory = OthosApp.AgentDir;
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError = true;
+            psi.StandardOutputEncoding = System.Text.Encoding.UTF8;
+            psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8";
+            using (var pr = Process.Start(psi))
+            {
+                string o = pr.StandardOutput.ReadToEnd();
+                string err = pr.StandardError.ReadToEnd();
+                pr.WaitForExit(120000);
+                return pr.ExitCode == 0 ? o.Trim() : (o + "\r\n" + err).Trim();
+            }
+        }
+        catch (Exception ex) { return "Couldn't run system_specs.py: " + ex.Message; }
+    }
+
+    // A Yes/No question in the Othos window's own look (not Windows' grey message box).
+    internal bool AskYesNo(IWin32Window owner, string heading, string text, string yes, string no)
+    {
+        using (var d = new Form())
+        {
+            d.Text = OthosApp.Name + ": this PC";
+            d.Icon = Icon;
+            d.StartPosition = owner == null ? FormStartPosition.CenterScreen : FormStartPosition.CenterParent;
+            d.FormBorderStyle = FormBorderStyle.FixedDialog;
+            d.MaximizeBox = false;
+            d.MinimizeBox = false;
+            d.ShowInTaskbar = owner == null;
+            d.BackColor = Bg;
+            d.ForeColor = Ink;
+            d.Font = new Font("Segoe UI", 10f);
+            var h = new Label();
+            h.Text = heading;
+            h.Font = new Font("Segoe UI Semibold", 14f);
+            h.ForeColor = Green;
+            h.SetBounds(20, 14, 440, 30);
+            d.Controls.Add(h);
+            var t = new Label();
+            t.Text = text;
+            t.ForeColor = Ink;
+            t.AutoSize = true;
+            t.MaximumSize = new Size(440, 0);
+            t.Location = new Point(22, 54);
+            d.Controls.Add(t);
+            int by = 54 + t.PreferredHeight + 20;
+            var y = new Button();
+            var n = new Button();
+            y.Text = yes; n.Text = no;
+            y.DialogResult = DialogResult.Yes; n.DialogResult = DialogResult.No;
+            int x = 22;
+            foreach (var b in new[] { y, n })
+            {
+                b.SetBounds(x, by, 150, 36);
+                b.FlatStyle = FlatStyle.Flat;
+                b.FlatAppearance.BorderColor = b == y ? Green : PurpleLine;
+                b.FlatAppearance.MouseOverBackColor = PurpleHover;
+                b.FlatAppearance.MouseDownBackColor = PurpleHover;
+                b.BackColor = PurpleFill;
+                b.ForeColor = Ink;
+                d.Controls.Add(b);
+                x += 160;
+            }
+            d.AcceptButton = y;
+            d.CancelButton = n;
+            d.ClientSize = new Size(484, by + 56);
+            return (owner == null ? d.ShowDialog() : d.ShowDialog(owner)) == DialogResult.Yes;
+        }
+    }
+
+    void AskSpecsOnce()
+    {
+        if (File.Exists(SpecsFile) || !File.Exists(Path.Combine(OthosApp.AgentDir, "system_specs.py"))) return;
+        bool yes = AskYesNo(this, "T H I S   P C",
+            "May I check your current system specs, so I can best advise you of providers and set up?\n\n" +
+            "This reads your PC's hardware only. Nothing leaves this computer.",
+            "Yes, check my PC", "No thanks");
+        if (yes) ShowSpecs();
+        else ThreadPool.QueueUserWorkItem(_ => RunSpecs("--decline"));
+    }
+
+    static readonly Color Dim = Color.FromArgb(140, 162, 150);
+    static readonly Color Red = Color.FromArgb(232, 110, 110);
+
+    // The advice window, in the Othos window's own look: a heading, then one row per piece
+    // of advice with a coloured tag (Fits / Tight / Won't fit), then Apply and Close.
+    void ShowSpecs()
+    {
+        var f = new Form();
+        f.Text = OthosApp.Name + ": this PC";
+        f.Icon = Icon;
+        f.StartPosition = FormStartPosition.CenterScreen;
+        f.FormBorderStyle = FormBorderStyle.FixedSingle;
+        f.MaximizeBox = false;
+        f.ClientSize = new Size(720, 540);
+        f.BackColor = Bg;
+        f.ForeColor = Ink;
+        f.Font = new Font("Segoe UI", 10f);
+
+        var head = new Label();
+        head.Text = "T H I S   P C";
+        head.Font = new Font("Segoe UI Semibold", 14f);
+        head.ForeColor = Green;
+        head.SetBounds(20, 14, 400, 30);
+        f.Controls.Add(head);
+        var sub = new Label();
+        sub.ForeColor = Dim;
+        sub.SetBounds(22, 46, 680, 40);
+        sub.Text = "Reading this PC's specs (about 10 seconds). Nothing leaves this computer.";
+        f.Controls.Add(sub);
+
+        var list = new System.Windows.Forms.Panel();
+        list.AutoScroll = true;
+        list.BackColor = Panel;
+        list.BorderStyle = BorderStyle.FixedSingle;
+        list.SetBounds(20, 92, 680, 376);
+        f.Controls.Add(list);
+
+        var apply = new Button();
+        apply.Text = "Apply these settings";
+        apply.Enabled = false;
+        var close = new Button();
+        close.Text = "Close";
+        int x = 20;
+        foreach (var b in new[] { apply, close })
+        {
+            b.SetBounds(x, 484, b == apply ? 190 : 110, 36);
+            b.FlatStyle = FlatStyle.Flat;
+            b.FlatAppearance.BorderColor = PurpleLine;
+            b.FlatAppearance.MouseOverBackColor = PurpleHover;
+            b.BackColor = PurpleFill;
+            b.ForeColor = Ink;
+            f.Controls.Add(b);
+            x += b.Width + 10;
+        }
+        close.Click += (s, e) => f.Close();
+
+        // rows: {fit, area, text}; fit "" = a plain line (the apply results)
+        Action<string[][]> fill = rows =>
+        {
+            list.SuspendLayout();
+            list.Controls.Clear();
+            int y = 10, textW = list.ClientSize.Width - 250;
+            foreach (var r in rows)
+            {
+                string fit = r[0], area = r[1], text = r[2];
+                int h = 24;
+                if (fit.Length > 0)
+                {
+                    var tag = new Label();
+                    tag.Text = fit == "fits" ? "Fits" : fit == "tight" ? "Tight" : "Won't fit";
+                    tag.ForeColor = fit == "fits" ? Green : fit == "tight" ? Gold : Red;
+                    tag.BackColor = Bg;
+                    tag.TextAlign = ContentAlignment.MiddleCenter;
+                    tag.Font = new Font("Segoe UI Semibold", 9f);
+                    tag.SetBounds(10, y, 74, 22);
+                    list.Controls.Add(tag);
+                }
+                var a = new Label();
+                a.Text = area;
+                a.ForeColor = Ink;
+                a.Font = new Font("Segoe UI Semibold", 10f);
+                a.SetBounds(fit.Length > 0 ? 94 : 10, y + 1, 130, 22);
+                list.Controls.Add(a);
+                var t = new Label();
+                t.Text = text;
+                t.ForeColor = Ink;
+                t.AutoSize = true;
+                t.MaximumSize = new Size(textW, 0);
+                t.Location = new Point(230, y + 1);
+                list.Controls.Add(t);
+                h = Math.Max(h, t.PreferredHeight);
+                y += h + 10;
+            }
+            list.ResumeLayout();
+        };
+        Func<string, string[][]> parse = output =>
+        {
+            var rows = new System.Collections.Generic.List<string[]>();
+            foreach (var line in output.Replace("\r", "").Split('\n'))
+            {
+                var c = line.Split('\t');
+                if (c.Length == 3) rows.Add(c);
+                else if (line.Trim().Length > 0) rows.Add(new[] { "", "", line.Trim() });
+            }
+            return rows.ToArray();
+        };
+
+        apply.Click += (s, e) =>
+        {
+            if (!AskYesNo(f, "A P P L Y",
+                    "Apply these settings? Your settings files are backed up first (in state\\backups), " +
+                    "and only the settings listed are changed.", "Yes, apply", "Not now")) return;
+            apply.Enabled = false;
+            sub.Text = "Applying...";
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                string o = RunSpecs("--apply");
+                try
+                {
+                    f.BeginInvoke((Action)(() =>
+                    {
+                        sub.Text = "Done. Backups are in state\\backups.";
+                        var rows = new System.Collections.Generic.List<string[]>();
+                        foreach (var line in o.Replace("\r", "").Split('\n'))
+                        {
+                            if (line.Trim().Length == 0) continue;
+                            int colon = line.IndexOf(": ");
+                            rows.Add(colon > 0 && colon < 24
+                                ? new[] { "", line.Substring(0, colon), line.Substring(colon + 2) }
+                                : new[] { "", "", line.Trim() });
+                        }
+                        fill(rows.ToArray());
+                    }));
+                }
+                catch { }
+            });
+        };
+        f.Shown += (s, e) => ThreadPool.QueueUserWorkItem(_ =>
+        {
+            string o = RunSpecs("--read --rows");
+            try
+            {
+                f.BeginInvoke((Action)(() =>
+                {
+                    var rows = parse(o);
+                    var rest = new System.Collections.Generic.List<string[]>();
+                    string pc = "";
+                    foreach (var r in rows) { if (r[1] == "PC" && pc.Length == 0) pc = r[2]; else rest.Add(r); }
+                    bool ok = rest.Count > 0 && rest[0][0].Length > 0;
+                    sub.Text = ok ? pc + "\nRead on this computer only. Saved in state\\system-specs.json."
+                                  : "Couldn't read this PC's specs.";
+                    fill(rest.ToArray());
+                    apply.Enabled = ok;
+                }));
+            }
+            catch { }
+        });
+        f.Show();   // not owned: the Othos window minimizes to the taskbar
+    }
+
     int btnY = 200;
 
     Button MakeButton(string text, int x)
@@ -283,7 +544,8 @@ class MainForm : Form
     protected override void OnShown(EventArgs e)
     {
         base.OnShown(e);
-        WindowState = FormWindowState.Minimized;   // lives on the taskbar
+        if (File.Exists(SpecsFile)) WindowState = FormWindowState.Minimized;   // lives on the taskbar
+        else BeginInvoke((Action)(() => { AskSpecsOnce(); WindowState = FormWindowState.Minimized; }));
         // start-othos.ps1 waits for the call page (up to ~2 minutes), so run it off the UI thread
         ThreadPool.QueueUserWorkItem(_ =>
         {

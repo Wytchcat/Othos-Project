@@ -7,7 +7,8 @@
 // has the model switcher (applies from the next task), Get models and the work log;
 // the Smithy's also has Code chat (Othos's typed code chat, http://127.0.0.1:3000/code);
 // Firestarter's also has the Site row (Joomla / WordPress, Site setup), ZOO items and WordPress drafts
-// (sends a finished article to WordPress as a draft, only when you press Send).
+// (sends a finished article to WordPress as a draft, only when you press Send), and Check my PC
+// (asked once on its first start: reads the PC's specs locally, advises worker.json settings).
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -368,6 +369,13 @@ class FirestarterForm : Form
     readonly Label title = new Label(), state = new Label(), task = new Label(), queue = new Label(), game = new Label();
     readonly List<ComboBox> boxes = new List<ComboBox>();
     Button codeChat;
+#if SMITHY
+    readonly ComboBox provider = new ComboBox();
+    readonly List<string> providerNames = new List<string>();
+    Label cloudLine;
+    bool loadingCloud;
+    int cloudTicks;
+#endif
 #if !SMITHY
     Button siteJoomla, siteWp;
     Label siteSummary;
@@ -386,9 +394,9 @@ class FirestarterForm : Form
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
 #if SMITHY
-        ClientSize = new Size(420, 176 + 36 * FirestarterApp.Tiers.Length + 128);
+        ClientSize = new Size(420, 176 + 36 * FirestarterApp.Tiers.Length + 128 + 62);
 #else
-        ClientSize = new Size(420, 176 + 36 * FirestarterApp.Tiers.Length + 116 + 166);
+        ClientSize = new Size(420, 176 + 36 * FirestarterApp.Tiers.Length + 116 + 166 + 38);
 #endif
         BackColor = Bg; ForeColor = Ink;
         Font = new Font("Segoe UI", 10f);
@@ -407,6 +415,13 @@ class FirestarterForm : Form
 
         int y2 = 176;
         foreach (var t in FirestarterApp.Tiers) { var box = new ComboBox(); boxes.Add(box); AddModelRow(t[0], box, t[1], y2); y2 += 36; }
+#if SMITHY
+        // which model provider the next tasks use (smithy.json cloud.default; worker_cloud.py).
+        // Only providers already turned on (smithy.json + a key in .env) are offered here.
+        AddProviderRow(y2); y2 += 36;
+        cloudLine = new Label(); cloudLine.ForeColor = Dim; cloudLine.SetBounds(150, y2, 250, 22);
+        Controls.Add(cloudLine); y2 += 26;
+#endif
 #if !SMITHY
         // which kind of website the next tasks are written for (worker.json "site"); Site setup...
         // holds that site's answers and extensions (worker.json "sites", site_profiles.json)
@@ -440,6 +455,8 @@ class FirestarterForm : Form
         wpButton.Click += (s, e) => { using (var d = new WordPressForm()) d.ShowDialog(this); };
         var zooButton = MakeButton("ZOO items\u2026", 150, y2 + 120, 250);
         zooButton.Click += (s, e) => { using (var d = new ZooForm()) d.ShowDialog(this); };
+        var pcButton = MakeButton("Check my PC\u2026", 150, y2 + 158, 250);
+        pcButton.Click += (s, e) => CheckPc();
 #endif
 
         timer.Interval = 2000;
@@ -498,18 +515,128 @@ class FirestarterForm : Form
         Controls.Add(box);
     }
 
+#if SMITHY
+    void AddProviderRow(int y)
+    {
+        var l = new Label(); l.Text = "Provider"; l.ForeColor = Dim; l.SetBounds(22, y + 4, 120, 22); Controls.Add(l);
+        provider.SetBounds(150, y, 250, 28);
+        provider.DropDownStyle = ComboBoxStyle.DropDownList;
+        provider.FlatStyle = FlatStyle.Flat;
+        provider.BackColor = PurpleFill; provider.ForeColor = Ink;
+        provider.DrawMode = DrawMode.OwnerDrawFixed;       // as the model row: Windows paints it white otherwise
+        provider.ItemHeight = 22;
+        provider.DrawItem += (s, e) =>
+        {
+            bool sel = (e.State & DrawItemState.Selected) != 0 && (e.State & DrawItemState.ComboBoxEdit) == 0;
+            using (var bg = new SolidBrush(sel ? PurpleLine : PurpleFill)) e.Graphics.FillRectangle(bg, e.Bounds);
+            if (e.Index >= 0)
+                TextRenderer.DrawText(e.Graphics, provider.Items[e.Index].ToString(), provider.Font,
+                    new Rectangle(e.Bounds.X + 4, e.Bounds.Y, e.Bounds.Width - 4, e.Bounds.Height), Ink,
+                    TextFormatFlags.VerticalCenter | TextFormatFlags.Left);
+        };
+        provider.SelectedIndexChanged += (s, e) =>
+        {
+            if (loadingCloud || provider.SelectedIndex < 0) return;
+            string name = providerNames[provider.SelectedIndex];
+            ThreadPool.QueueUserWorkItem(_ => { FirestarterApp.Run("set-provider " + name); LoadCloud(); });
+        };
+        Controls.Add(provider);
+    }
+
+    // what's turned on, the default, and today's cloud use (smithy.py cloud)
+    void LoadCloud()
+    {
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            Dictionary<string, object> m = null;
+            try { m = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(FirestarterApp.Run("cloud")); } catch { }
+            try { BeginInvoke((Action)(() => FillCloud(m))); } catch { }
+        });
+    }
+
+    void FillCloud(Dictionary<string, object> m)
+    {
+        loadingCloud = true;
+        provider.Items.Clear(); providerNames.Clear();
+        provider.Items.Add("Local (this PC)"); providerNames.Add("local");
+        var ready = m != null && m.ContainsKey("ready") ? m["ready"] as System.Collections.ArrayList : null;
+        if (ready != null)
+            foreach (Dictionary<string, object> p in ready) { provider.Items.Add(Get(p, "label")); providerNames.Add(Get(p, "name")); }
+        int i = providerNames.IndexOf(Get(m, "default"));
+        provider.SelectedIndex = i >= 0 ? i : 0;
+        loadingCloud = false;
+        var today = m != null && m.ContainsKey("today") ? m["today"] as Dictionary<string, object> : null;
+        long tokens = today != null ? Convert.ToInt64(today["tokens"]) : 0;
+        double usd = today != null ? Convert.ToDouble(today["usd"]) : 0;
+        if (m == null) cloudLine.Text = "Cloud: couldn't read the settings";
+        else if (ready == null || ready.Count == 0) cloudLine.Text = "Cloud providers: off (see smithy.json)";
+        else cloudLine.Text = "Cloud today: " + tokens.ToString("N0") + " tokens" + (usd > 0 ? ", $" + usd.ToString("0.00") : "");
+        cloudLine.ForeColor = provider.SelectedIndex > 0 ? Gold : Dim;
+    }
+
+    protected override void OnActivated(EventArgs e)
+    {
+        base.OnActivated(e);
+        LoadCloud();
+    }
+#endif
+
     protected override void OnShown(EventArgs e)
     {
         base.OnShown(e);
         StartWorker();
         LoadModels();
+#if SMITHY
+        LoadCloud();
+#endif
 #if !SMITHY
         LoadSite();
 #endif
         RefreshStatus();
         timer.Start();
+#if !SMITHY
+        // asked once (here or in Othos): the file holds the specs, or the "No"
+        if (!File.Exists(Path.Combine(FirestarterApp.AgentDir, @"state\system-specs.json"))) AskSpecs();
+#endif
         WindowState = FormWindowState.Minimized;   // lives on the taskbar
     }
+
+#if !SMITHY
+    void AskSpecs()
+    {
+        var a = MessageBox.Show(this,
+            "May I check your current system specs, so I can best advise you of settings?\n\n" +
+            "This reads your PC's hardware only. Nothing leaves this computer.\n\n" +
+            "(No: you won't be asked again. Check my PC... does it any time.)",
+            "Firestarter: first start", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+        if (a == DialogResult.Yes) CheckPc();
+        else ThreadPool.QueueUserWorkItem(_ => FirestarterApp.Run("specs-decline"));
+    }
+
+    void CheckPc()
+    {
+        bool applied;
+        using (var d = new SpecsForm()) { d.ShowDialog(this); applied = d.Applied; }
+        if (applied) RestartWorker();
+    }
+
+    // worker.json is read when the worker starts: start it again (a running task goes back in the queue)
+    void RestartWorker()
+    {
+        try
+        {
+            if (worker != null && !worker.HasExited)
+            {
+                var k = new ProcessStartInfo("taskkill", "/PID " + worker.Id + " /T /F");
+                k.CreateNoWindow = true; k.UseShellExecute = false;
+                Process.Start(k).WaitForExit(15000);
+            }
+        }
+        catch { }
+        StartWorker();
+        LoadModels();
+    }
+#endif
 
     void StartWorker()
     {
@@ -636,6 +763,9 @@ class FirestarterForm : Form
         game.Text = alive && g != "" ? "Game: " + g : "No game running";
         game.ForeColor = alive && g != "" ? Gold : Dim;
         Text = alive ? FirestarterApp.Name + ": " + st : FirestarterApp.Name;
+#if SMITHY
+        if (++cloudTicks % 15 == 0) LoadCloud();        // today's cloud use, every 30 seconds
+#endif
         if (codeChat != null && !checkingPage)
         {
             checkingPage = true;
@@ -1009,6 +1139,137 @@ class SiteSetupForm : Form
                 if (o.StartsWith("saved")) { DialogResult = DialogResult.OK; Close(); }
                 else { result.Text = "Not saved: " + (o == "" ? "try  worker.py setup-save  in PowerShell" : o); save.Enabled = true; }
             })); } catch { }
+        });
+    }
+}
+#endif
+
+#if !SMITHY
+// "Check my PC" window: reads this PC's specs (Othos's system_specs.py, locally; nothing leaves
+// the PC), shows Firestarter's advice for worker.json (worker_specs.py: local CPU models only,
+// each with whether it fits), then asks "Apply these settings?". Apply backs up worker.json in
+// state\backups first and changes only the advised settings.
+class SpecsForm : Form
+{
+    static readonly Color Bg = Color.FromArgb(2, 7, 5), Ink = Color.FromArgb(200, 230, 210),
+        Dim = Color.FromArgb(120, 140, 130), Gold = Color.FromArgb(231, 195, 104),
+        Green = Color.FromArgb(120, 200, 140), Red = Color.FromArgb(230, 110, 100),
+        PurpleFill = Color.FromArgb(14, 16, 25), PurpleLine = Color.FromArgb(64, 53, 105);
+
+    readonly Label pc = new Label(), question = new Label();
+    readonly RichTextBox text = new RichTextBox();
+    readonly Button yes = new Button(), no = new Button();
+    public bool Applied;
+
+    public SpecsForm(bool check = true)   // (false: the test harness fills it)
+    {
+        Text = "Firestarter: your PC";
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MaximizeBox = false; MinimizeBox = false;
+        StartPosition = FormStartPosition.CenterParent;
+        ClientSize = new Size(560, 520);
+        BackColor = Bg; ForeColor = Ink;
+        Font = new Font("Segoe UI", 10f);
+        pc.SetBounds(16, 12, 528, 40); pc.ForeColor = Gold; pc.Text = "Checking your PC\u2026 (this reads its hardware only)";
+        Controls.Add(pc);
+        text.SetBounds(16, 56, 528, 316);
+        text.ReadOnly = true; text.BorderStyle = BorderStyle.None;
+        text.BackColor = Bg; text.ForeColor = Ink;
+        Controls.Add(text);
+        question.SetBounds(16, 376, 528, 96); question.ForeColor = Ink;
+        Controls.Add(question);
+        Style(yes, "Yes, apply", 300, 476, 120);
+        Style(no, "Close", 428, 476, 116);
+        yes.Visible = false;
+        yes.Click += (s, e) => Apply();
+        no.Click += (s, e) => Close();
+        if (check) ThreadPool.QueueUserWorkItem(_ =>
+        {
+            string o;
+            try { o = FirestarterApp.Run("specs-check"); } catch (Exception ex) { o = ex.Message; }
+            try { BeginInvoke((Action)(() => Fill(o))); } catch { }
+        });
+    }
+
+    void Style(Button b, string t, int x, int y, int w)
+    {
+        b.Text = t; b.SetBounds(x, y, w, 32);
+        b.FlatStyle = FlatStyle.Flat;
+        b.FlatAppearance.BorderColor = PurpleLine;
+        b.BackColor = PurpleFill; b.ForeColor = Ink;
+        Controls.Add(b);
+    }
+
+    static string Get(Dictionary<string, object> d, string k)
+    {
+        return d != null && d.ContainsKey(k) && d[k] != null ? Convert.ToString(d[k]) : "";
+    }
+
+    void Add(string t, Color c, bool bold)
+    {
+        text.SelectionStart = text.TextLength;
+        text.SelectionColor = c;
+        text.SelectionFont = new Font("Segoe UI", 10f, bold ? FontStyle.Bold : FontStyle.Regular);
+        text.AppendText(t);
+    }
+
+    // (public for the test harness)
+    public void Fill(string o)
+    {
+        Dictionary<string, object> m = null;
+        try { m = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(o); } catch { }
+        if (m == null || m.ContainsKey("error"))
+        {
+            pc.Text = "Couldn't check this PC.";
+            question.Text = m != null ? Get(m, "error") : o.Trim();
+            return;
+        }
+        pc.Text = Get(m, "pc");
+        Add("Advice for Firestarter (it runs on the CPU, on this PC):\n\n", Dim, false);
+        var advice = m.ContainsKey("advice") ? m["advice"] as System.Collections.ArrayList : null;
+        if (advice != null)
+            foreach (var a in advice)
+            {
+                var d = a as Dictionary<string, object>;
+                string fit = Get(d, "fit");
+                Color c = fit == "fits" ? Green : fit == "tight" ? Gold : Red;
+                Add((fit == "fits" ? "\u2713 " : fit == "tight" ? "~ " : "\u2717 ") + Get(d, "area") + ":  ", c, true);
+                Add(Get(d, "advice") + "\n", Ink, false);
+            }
+        Add("\nModels aren't changed here: get them with Get models, then pick them in the model boxes.", Dim, false);
+        var changes = m.ContainsKey("changes") ? m["changes"] as System.Collections.ArrayList : null;
+        if (changes == null || changes.Count == 0)
+            question.Text = "Your settings already match this advice. Nothing to change.";
+        else
+        {
+            var lines = new List<string>();
+            foreach (var c in changes) lines.Add(Convert.ToString(c));
+            question.Text = "Apply these settings?\n    " + string.Join("\n    ", lines.ToArray()) +
+                "\nworker.json is backed up first (state\\backups). Firestarter then restarts its worker; a task that's running starts over.";
+            yes.Visible = true;
+            no.Text = "No";
+        }
+    }
+
+    void Apply()
+    {
+        yes.Enabled = no.Enabled = false;
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            string o;
+            try { o = FirestarterApp.Run("specs-apply"); } catch (Exception ex) { o = ex.Message; }
+            try
+            {
+                BeginInvoke((Action)(() =>
+                {
+                    Dictionary<string, object> m = null;
+                    try { m = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(o); } catch { }
+                    Applied = m != null && m.ContainsKey("applied");
+                    question.Text = Applied ? "Applied. worker.json was backed up in state\\backups." : "Not applied: " + o.Trim();
+                    yes.Visible = false; no.Text = "Close"; no.Enabled = true;
+                }));
+            }
+            catch { }
         });
     }
 }

@@ -141,6 +141,19 @@ if ($Mode -eq "offline") {
 } else {
     Warn "Mixed mode needs DEEPGRAM_API_KEY and RIME_API_KEY in .env (README says where to get them)."
 }
+# ---- 7. this PC's specs: the Othos window asks on its first start ("May I check your current
+# system specs...?") and shows the advice in its own window; "Check my PC..." does it any time
+$specsPy = Join-Path $A "system_specs.py"
+if ((Test-Path $venvPy) -and (Test-Path $specsPy)) {
+    & $venvPy $specsPy --asked
+    if ($LASTEXITCODE -ne 0) {
+        Step "This PC"
+        Write-Host "   When the Othos window first opens (build-othos-app.ps1), it offers to check this PC's"
+        Write-Host "   specs and suggest settings. Nothing leaves this computer. Without the window:"
+        Write-Host "     .venv\Scripts\python.exe system_specs.py --read --advice"
+    }
+}
+
 $npp = "C:\Program Files\Notepad++\notepad++.exe"
 foreach ($f in $toOpen) {
     if (Test-Path $npp) { Start-Process $npp "`"$f`"" } else { Start-Process notepad.exe "`"$f`"" }

@@ -58,6 +58,17 @@ if (Test-Path $pj) {
           if (-not $p.weather_latlon) { Info "personal.json has no weather_latlon (no weather at call start)" } }
     catch { Bad "personal.json isn't valid JSON: $($_.Exception.Message)" }
 } else { Bad "personal.json missing: copy personal.example.json to personal.json" }
+# this PC's saved specs (system_specs.py): reading them again takes about 10 seconds
+$specs = Join-Path $A "state\system-specs.json"
+if ((Test-Path $venvPy) -and (Test-Path (Join-Path $A "system_specs.py"))) {
+    if (-not (Test-Path $specs)) { Info "PC specs not checked yet ('Check my PC...' in the Othos window)" }
+    elseif ((Get-Content $specs -Raw) -match '"declined":\s*true') { Info "PC specs: you chose not to check ('Check my PC...' does it any time)" }
+    else {
+        $why = & $venvPy (Join-Path $A "system_specs.py") --stale
+        if ($LASTEXITCODE -eq 0) { Ok "PC specs are current" }
+        else { Info "$why Run 'Check my PC...' in the Othos window for new advice." }
+    }
+}
 if (Test-Path (Join-Path $A "profile.md")) { Ok "profile.md there" } else { Info "profile.md missing (optional): copy profile.example.md" }
 
 Head "127.0.0.1, not localhost"

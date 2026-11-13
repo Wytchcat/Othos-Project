@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Callable
 
 import gaming
+import worker_cloud
 import worker_shared
 from worker_backend import Stopped, available_models, make_backend
 from worker_queue import Queue
@@ -150,8 +151,9 @@ class TaskContext:
     """What a several-step task (run=...) gets: the model, and a chat() that keeps
     pausing, stopping and the progress figure working across all its steps."""
 
-    def __init__(self, worker: "Worker", row, model: str, threads: int, should_stop):
+    def __init__(self, worker: "Worker", row, model: str, threads: int, should_stop, backend=None):
         self.worker, self.row, self.model, self.threads = worker, row, model, threads
+        self.backend = backend or worker.backend          # a cloud provider for this task (worker_cloud.py)
         self.cfg = worker.cfg
         self.queue = worker.profile.queue
         self._should_stop = should_stop
@@ -165,7 +167,7 @@ class TaskContext:
         def stop(chars: int = 0):
             part = min(1.0, chars / (max_tokens * 3.5))
             self._should_stop(chars, frac=self.lo + (self.hi - self.lo) * part)
-        return self.worker.backend.chat(self.model, messages, self.threads, max_tokens, stop)
+        return self.backend.chat(self.model, messages, self.threads, max_tokens, stop)
 
 
 class Worker:
@@ -254,6 +256,17 @@ class Worker:
         model = models.get(tier) or models.get(jt.tier) or next(iter(models.values()))
         threads = int(self.mode_settings.get("num_thread", 2) if held else self.cfg.get("num_thread", 4))
         self.backend.set_low_priority(held and bool(self.mode_settings.get("low_priority")))
+        # a provider named for this task (off unless turned on in the settings; worker_cloud.py)
+        try:
+            cloud = worker_cloud.pick(self.cfg, json.loads(row["params"] or "{}"), row["type"])
+        except ValueError as e:
+            q.fail(row["id"], str(e), retry=False)
+            log.info("task %d not started: %s", row["id"], e)
+            return
+        backend = cloud[0] if cloud else self.backend
+        if cloud:
+            model = cloud[1] or "the loaded model"
+            log.info("task %d uses %s", row["id"], backend.name)
         start_mode = (self.mode, self.mode_why)
         title = row["title"] or jt.title(params)
         self.current = {"id": row["id"], "type": row["type"], "title": title, "model": model,
@@ -284,9 +297,9 @@ class Worker:
         artifact = None
         try:
             if jt.run:
-                summary, full, artifact = jt.run(TaskContext(self, row, model, threads, should_stop), params)
+                summary, full, artifact = jt.run(TaskContext(self, row, model, threads, should_stop, backend), params)
             else:
-                summary, full = split_result(self.backend.chat(model, jt.build(params), threads, jt.max_tokens, should_stop))
+                summary, full = split_result(backend.chat(model, jt.build(params), threads, jt.max_tokens, should_stop))
         except Stopped as s:
             if s.reason == "cancelled":
                 log.info("task %d stopped (cancelled)", row["id"])
@@ -377,10 +390,17 @@ def main(profile: Profile, argv: list[str]) -> None:
     elif cmd == "add":
         if len(argv) < 4 or argv[2] not in reg or profile.add_parse is None:
             raise SystemExit(profile.add_usage)
-        kind = argv[2]
+        kind, rest, extra = argv[2], list(argv[3:]), {}
+        for opt in ("--provider", "--model"):           # a cloud provider for this task (worker_cloud.py)
+            if opt in rest:
+                i = rest.index(opt)
+                extra[opt[2:]], rest = rest[i + 1].lower() if opt == "--provider" else rest[i + 1], rest[:i] + rest[i + 2:]
         try:
-            raw = profile.add_parse(kind, argv[3:])
+            raw = profile.add_parse(kind, rest)
             params = reg[kind].check(raw)
+            if extra:
+                worker_cloud.pick(worker_shared.load_json(profile.config_path), extra, kind)   # say no now, not later
+                params.update(extra)
         except (ValueError, IndexError) as e:
             raise SystemExit(f"can't queue that: {e or profile.add_usage}")
         pid = params.get("parent_id")

@@ -30,6 +30,11 @@ from pathlib import Path
 
 import howto_recorder
 import smithy_jobs
+try:                                             # the Smithy's check task: left out of the shared copy
+    import smithy_rea
+except ImportError:
+    smithy_rea = None
+import worker_cloud
 import worker_files
 import worker_shared
 from worker_queue import FIRESTARTER, QUEUES, SMITHY, Queue
@@ -50,7 +55,7 @@ NOTEPAD_PP = r"C:\Program Files\Notepad++\notepad++.exe"
 REGISTRIES = {"smithy": smithy_jobs.REGISTRY}
 if HAS_FIRESTARTER:
     REGISTRIES["firestarter"] = worker_jobs.REGISTRY
-CODING = {"review", "fix", "script", "build", "joomla"}      # the Smithy's
+CODING = {"review", "fix", "script", "build", "joomla", "check"}   # the Smithy's
 SITE = {"test", "article", "zoo"}                            # Firestarter's
 
 _NUMWORDS = {w: i for i, w in enumerate(
@@ -226,6 +231,9 @@ _KIND_WORDS = [
     ("zoo", re.compile(r"^(?:add|make|create|draft|write|prepare|do)\s+(?:me\s+)?(?:[\w'-]+\s+){0,3}?zoo\s+items?\b", re.I)),
     ("joomla", re.compile(r"\b(?:joomla|yoo\s*theme|template\s+override|layout\s+override|override)\b", re.I)),
     ("script", re.compile(r"^(?:write|make|create)\s+(?:me\s+)?(?:a|an)\s+(?:\w+\s+){0,2}script\b|^script\b", re.I)),
+    # a program (.exe / .dll) to study for a clean-room rebuild; "check gaming dot py" stays a review
+    ("check", re.compile(r"^(?:check|inspect|study|analy[sz]e|take\s+apart|look\s+inside)\s+(?:out\s+)?(?:the\s+|my\s+)?"
+                         r"(?:program\s+)?(?:[\w'-]+\s+){0,5}?(?:\w+(?:\.|\s+dot\s+)(?:exe|dll)\b|program\b)", re.I)),
     ("review", re.compile(r"^(?:review|check|look\s+over|go\s+over)\b", re.I)),
     ("fix", re.compile(r"^fix(?:es)?\b", re.I)),
     ("build", re.compile(r"^(?:build|make|create|write)\b", re.I)),
@@ -243,10 +251,27 @@ def _kind_of(rest: str, who: str | None = None) -> tuple[str | None, str]:
         if rx.search(r):
             if kind == "joomla" and not re.match(r"^(?:build|make|create|write|draft|do)\b", r, re.I):
                 continue                                 # "review my Joomla override" is a review
-            after = re.sub(r"^(?:review|check|look\s+over|go\s+over|fix(?:es)?|test|summari[sz]e|build|make|"
+            after = re.sub(r"^(?:review|check(?:\s+out)?|inspect|study|analy[sz]e|take\s+apart|look\s+inside|"
+                           r"look\s+over|go\s+over|fix(?:es)?|test|summari[sz]e|build|make|"
                            r"create|write|draft|do)\s+(?:me\s+)?", "", r, flags=re.I)
             return kind, after.strip()
     return None, r
+
+
+_PROVIDER_WORDS = worker_cloud.spoken_names()
+# "using / via / through" only: "a page on Claude Monet" isn't a provider
+_PROVIDER = re.compile(r"[,\s]*\b(?:using|via|through)\s+(?:the\s+)?(" +
+                       "|".join(sorted((re.escape(k).replace(r"\ ", r"\s+") for k in _PROVIDER_WORDS), key=len, reverse=True))
+                       + r")\b[,\s]*", re.I)
+
+
+def _take_provider(text: str) -> tuple[str, str | None]:
+    """'ask the Smithy, using DeepSeek, to review x' -> ('ask the Smithy to review x', 'deepseek')."""
+    m = _PROVIDER.search(text)
+    if not m:
+        return text, None
+    name = _PROVIDER_WORDS.get(re.sub(r"\s+", " ", m.group(1).lower()))
+    return (text[:m.start()] + " " + text[m.end():]).strip(), name
 
 
 # ---------------------------------------------------------------- the voice side
@@ -275,6 +300,7 @@ class WorkersVoice:
                 return f"Okay, I've left {_name(q, job_id)} as it is."
         if reading and _REST.search(text):
             return self._next_piece(*reading)
+        text, self._provider = _take_provider(text)        # "..., using DeepSeek, ..." (worker_cloud.py)
         if m := _DO.search(text):                          # "ask the Smithy to review gaming dot py"
             who, _ = _who(m.group(0))
             if who == "firestarter" and not HAS_FIRESTARTER:
@@ -413,9 +439,11 @@ class WorkersVoice:
     def _start(self, rest: str, who: str | None) -> str:
         kind, arg = _kind_of(rest, who)
         if kind is None:
-            return ("Which task? The Smithy can review, fix, write a script, build something, or make a Joomla "
-                    "override." + (" Firestarter can write an article or a page, add ZOO items, or run a test."
-                                   if HAS_FIRESTARTER else ""))
+            return ("Which task? The Smithy can review, fix, write a script, build something" +
+                    (", make a Joomla override, or check a program." if smithy_rea else ", or make a Joomla override.") +
+                    (" Firestarter can write an article or a page, add ZOO items, or run a test." if HAS_FIRESTARTER else ""))
+        if kind == "check" and (smithy_rea is None or "check" not in REGISTRIES["smithy"]):
+            return "Checking programs isn't part of this copy of Othos."
         target = "smithy" if kind in CODING else "firestarter"
         if target == "firestarter" and not HAS_FIRESTARTER:
             return NO_FIRESTARTER
@@ -430,6 +458,11 @@ class WorkersVoice:
             if problem:
                 return problem
             raw = {"path": path, "request": request}
+        elif kind == "check":
+            path, problem = self._program(arg)
+            if problem:
+                return problem
+            raw = {"path": path}
         elif kind in ("script", "build", "joomla"):
             raw = {"request": arg}          # "a PowerShell script to ...": the language stays in
         elif kind == "article":
@@ -439,12 +472,33 @@ class WorkersVoice:
         else:
             raw = {"text": arg}
         jt = REGISTRIES[target][kind]
+        provider, self._provider = getattr(self, "_provider", None), None
         try:
             params = jt.check(raw)
+            if provider:                                   # checked now, so she hears why straight away
+                cfg = worker_shared.load_json(Path(__file__).parent / ("smithy.json" if target == "smithy" else "worker.json"))
+                worker_cloud.pick(cfg, {"provider": provider}, kind)
+                params["provider"] = provider
         except ValueError as e:
             return f"I can't start that: {e}."
         job_id = q.add(kind, params, requested_by="voice", title=jt.title(params))
-        return f"{_name(q, job_id)}, {jt.title(params)}, is queued for {q.name}."
+        via = f", using {worker_cloud.PROVIDERS[provider].spoken}" if provider else ""
+        return f"{_name(q, job_id)}, {jt.title(params)}, is queued for {q.name}{via}."
+
+    def _program(self, arg: str) -> tuple[str, str]:
+        """'llama server dot exe in my downloads' -> (path, ''), or ('', what to say)."""
+        cfg = worker_shared.load_json(Path(__file__).parent / "smithy.json")
+        words = re.sub(r"^(?:the\s+|my\s+)?(?:program\s+)?(?:called\s+)?", "", arg, flags=re.I)
+        words = re.sub(r"\s+(?:in|from)\s+(?:my\s+|the\s+)?downloads?\b.*$", "", words, flags=re.I).split()
+        for n in range(min(len(words), 6), 0, -1):
+            found, name = smithy_rea.find_program(" ".join(words[:n]), cfg)
+            if len(found) == 1:
+                return str(found[0]), ""
+            if len(found) > 1:
+                return "", ("I found more than one: " + "; ".join(f"{p.name} in {p.parent.name}" for p in found[:3])
+                            + ". Say the name with its folder.")
+        return "", (f"I couldn't find a program called {worker_files.spoken_to_name(' '.join(words[:4]))} in the "
+                    "folders the Smithy may check. They're listed in smithy dot json, under inspect folders.")
 
     def _file_and_request(self, arg: str, need_request: bool) -> tuple[str, str, str]:
         """'gaming dot py to stop crashing on startup' -> (path, 'stop crashing on startup', '')."""

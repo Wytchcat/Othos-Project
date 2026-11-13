@@ -56,5 +56,24 @@
     ".",
     "../Othos-ui",
     "../ui"
-  ]
+  ],
+  "_cloud": "Other model providers by API key (worker_cloud.py). OFF until a provider is listed in enabled AND its key is in .env (never here). A task uses the local model unless it names a provider ('using DeepSeek', or --provider NAME) or default is set. Local first: lmstudio is LM Studio's server on this PC. Cloud: anthropic, openrouter, deepseek, mistral, nvidia, gemini, groq, cerebras, together, fireworks, openai, huggingface; freellmapi runs on this PC but forwards to free cloud tiers (treated as cloud). Keys in .env: ANTHROPIC_API_KEY, OPENROUTER_API_KEY, DEEPSEEK_API_KEY, MISTRAL_API_KEY, NVIDIA_API_KEY, GEMINI_API_KEY, GROQ_API_KEY, CEREBRAS_API_KEY, TOGETHER_API_KEY, FIREWORKS_API_KEY, OPENAI_API_KEY, HF_TOKEN, FREELLMAPI_KEY (from its dashboard).",
+  "_cloud_safety": "accept_data_use: providers whose free tier may train on what's sent (gemini, openrouter :free models, freellmapi) are refused unless listed here. Limits: tokens per task and per day; prices (dollars per million tokens, [input, output]) turn on max_usd_per_day. Today's use: state\\cloud-usage.json.",
+  "cloud": {
+    "enabled": [],
+    "default": "",
+    "models": {
+      "anthropic": "claude-opus-5-5",
+      "deepseek": "deepseek-chat",
+      "mistral": "codestral-latest"
+    },
+    "accept_data_use": [],
+    "max_tokens_per_task": 200000,
+    "max_tokens_per_day": 1000000,
+    "prices": {},
+    "max_usd_per_day": 2.0,
+    "local_urls": {
+      "lmstudio": "http://127.0.0.1:1234/v1"
+    }
+  }
 }

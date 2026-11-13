@@ -35,28 +35,6 @@ it and copy what you want into place yourself, on screen.
 | `build` | A project from scratch | its own folder |
 | `followup` | A question about an earlier result; **on a build, a new version of it** | `.md`, or a new folder |
 
-### Builds from scratch (`build`, `joomla`)
-
-1. **Plan first:** the model lists the files and what each does (saved as
-   `drafts\smithy\NNNNN-plan.json`). If the plan comes back unreadable it's asked once more.
-2. **Then each file in turn**, with the plan and the files written so far as context.
-3. **README.md last:** what it is, what each file does, where it goes, how to use it.
-4. Output: `drafts\smithy\NNNNN-<name>\`, laid out like the real project.
-5. The spoken summary says what was built and how many files; "show me Smithy task N"
-   opens the folder.
-6. **A follow-up on a build makes a new version** in its own folder
-   (`NNNNN-<name>-v2\`): unchanged files are copied, changed ones rewritten with the old
-   version as context. The earlier version is left as it was.
-7. **Paused for a game or stopped?** It carries on from the next unwritten file.
-
-**Where files may go (checked in code, `smithy_jobs.safe_rel` / `inside`):** only inside
-the build's own folder. A planned path must be relative, with no `..`, no drive letter,
-no Windows device names (CON, NUL...), no hidden or private names (`.env*`, keys), at
-most 8 folders deep, and a text file (no programs, archives or images). It is checked
-again after resolving. A path that fails is left out and listed in the result as
-"Left out (not allowed)". Builds get `max_build_minutes` (180) and at most
-`max_build_files` (20) files, in `smithy.json`.
-
 ## What voice Othos may do (`workers_voice.py`, recognised in code)
 
 Coding requests go to the Smithy automatically. Task numbers are the Smithy's own
@@ -99,12 +77,74 @@ back (fewer threads, low priority) for gpu-heavy / light, as Firestarter.
 | `smithy.py` | The Smithy (its command line, on the shared engine `worker_engine.py`) |
 | `smithy_jobs.py` | Its task types, prompts and the build steps; where build files may go |
 | `worker_files.py` | Which files it may read |
+| `worker_cloud.py` | Other model providers by API key: off until turned on, with the safeguards (shared) |
 | `worker_shared.py`, `worker_queue.py`, `worker_backend.py` | Shared with Firestarter |
 | `app\WorkerApp.cs`, `build-smithy.ps1` | The app (built with `/define:SMITHY`), icon, shortcuts |
 | `state\smithy.db`, `state\smithy-status.json` | Its queue and heartbeat |
 | `drafts\smithy\` | Results and build folders |
 | `workers\Smithy.md` | Its work log (git-ignored) |
 | `logs\smithy.log` | Log (older runs in `logs\old`) |
+
+## Other model providers, by API key (`worker_cloud.py`, shared with Firestarter)
+
+**Off until you turn one on.** This is an exception to Othos's "only Deepgram, Rime and
+Tavily get data" rule, approved Nov 12 with these safeguards, all checked in code.
+
+**Local first.**
+- **lmstudio:** LM Studio's server on this PC. Nothing leaves the PC; the address must
+  be 127.0.0.1.
+- **Ollama and llama.cpp:** the Smithy's own back ends (above).
+
+**Cloud:**
+- **anthropic:** Claude (an API key, billed separately from a Claude subscription).
+- **openrouter:** one key for many models.
+- **deepseek, mistral (Codestral), nvidia, gemini, groq, cerebras, together, fireworks,
+  openai, huggingface.**
+- **freellmapi:** [FreeLLMAPI](https://github.com/tashfeenahmed/freellmapi), a program you
+  run yourself (default `127.0.0.1:3001`) that pools many providers' free tiers behind one
+  address.
+  - **Treated as cloud:** it runs on this PC but passes everything on to free cloud tiers,
+    which may train on what's sent. So it needs `cloud.accept_data_use`.
+  - **Setting it up:** its key comes from its own dashboard (`FREELLMAPI_KEY` in `.env`), and
+    the model goes in `cloud.models.freellmapi`.
+  - Its authors call it for personal experimentation.
+
+xAI isn't offered.
+
+**To turn one on:**
+1. Put its key in `.env`, for example `DEEPSEEK_API_KEY=...`. Keys never go in
+   `smithy.json`. The key names are in `_cloud` in `smithy.json`.
+2. Add it to `cloud.enabled` in `smithy.json`, for example `"enabled": ["deepseek"]`.
+3. Set its model under `cloud.models` if it has no default. The defaults are Claude Opus
+   5.5, deepseek-chat and codestral-latest.
+
+**Using one:**
+- **In the window:** the **Provider** row under Coding model. It offers "Local (this PC)"
+  and only the providers already turned on. Picking one makes it the default for the next
+  tasks (`cloud.default`; `smithy.py set-provider NAME|local`). The line below shows "Cloud
+  today: N tokens, $X" (`smithy.py cloud`), and turns gold while a cloud provider is selected.
+- **By voice:** "ask the Smithy, using DeepSeek, to review gaming dot py". It also works with
+  "via" or "through".
+- **On the command line:** `smithy.py add review PATH --provider deepseek [--model NAME]`.
+- **Every task:** set `cloud.default`. Otherwise every task uses the local model.
+
+**Safeguards:**
+- **Keys:** read from `.env` only, sent only to that provider's fixed address (written in
+  the code), and never logged. Errors have the key blanked out.
+- **What's sent:** everything passes the redaction filter again, on top of each task's own.
+  It's only what the task would send to the local model (files the Smithy may read).
+- **Free tiers that may train on what you send:** Gemini, and OpenRouter's `:free` models.
+  They're refused unless listed in `cloud.accept_data_use`.
+- **Limits:**
+  - `max_tokens_per_task` (200,000) and `max_tokens_per_day` (1,000,000).
+  - With `prices` set (dollars per million tokens, `[input, output]` per provider),
+    `max_usd_per_day` ($2) applies.
+  - Today's use is in `state\cloud-usage.json`.
+- **Claude** uses Anthropic's own SDK. If Claude declines a request, its server-side fallback
+  model takes over (fallbacks "default").
+
+Firestarter can use the same providers, with its own `cloud` section in `worker.json`.
+It has none, so it's off.
 
 ## Models: a small PC or a big one
 

@@ -8,6 +8,8 @@
             out like the real project in its own folder, with a README
 - followup  a question about an earlier result; on a build or Joomla task it
             makes a new version of the build, in its own folder
+- check     study a Windows program with REA and Ghidra and write FEATURES.md,
+            SPECS.md and AGENT.md for a clean-room rebuild (smithy_check.py)
 
 Rules, enforced here in code, not in the prompt:
 - Files are only read through worker_files (allowlisted folders, private files
@@ -25,6 +27,10 @@ import re
 import shutil
 from pathlib import Path, PurePosixPath
 
+try:                                             # the check task: left out of the shared copy of Othos
+    import smithy_check
+except ImportError:
+    smithy_check = None
 import worker_files
 from worker_engine import FORMAT, JobType, plain_summary, split_result
 from worker_queue import SMITHY
@@ -461,3 +467,8 @@ REGISTRY: dict[str, JobType] = {
                                    else f"the answer about Smithy task {p['parent_id']}"),
                         max_tokens=1000, run=_run_followup, minutes_key="max_build_minutes", coding=True),
 }
+if smithy_check is not None:                     # not in the shared copy of Othos
+    REGISTRY["check"] = JobType(
+        "check", "Study a program with REA/Ghidra: FEATURES, SPECS and AGENT for a clean-room rebuild.",
+        "code", None, smithy_check.check_params, lambda p: f"the check of {Path(p['path']).name}",
+        max_tokens=1500, run=smithy_check.run_check, minutes_key="max_check_minutes", coding=True)

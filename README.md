@@ -56,6 +56,10 @@ Othos\
    Press **Start call** and say hello.
    - For a taskbar app instead: `agent\build-othos-app.ps1` builds `agent\app\Othos.exe` and
      adds an Othos shortcut. Click it to start Othos; close its window to stop Othos.
+     The first time it opens, it asks whether it may check your PC's specs. If you say
+     yes, it shows which models and settings fit your PC, local options first, and can
+     apply them (backing up first). Nothing leaves your computer. **Check my PC…** in the
+     window does this again any time.
    - To stop Othos without the app, run `agent\stop-othos.bat`.
 
 ## Setup modes
@@ -230,7 +234,8 @@ a separate add-on with its own repository, **published later**; it isn't availab
 ## Privacy: what goes where
 
 - **On your computer only:** the conversation model, your notes and their search, webcam
-  pictures (taken only when you ask; never streamed), code chat, The Smithy, `.env`,
+  pictures (taken only when you ask; never streamed), code chat, The Smithy (unless you
+  turn on another model provider, below), `.env`,
   `personal.json`, `profile.md` and the logs.
 - **How-to screenshots** are taken only while you're recording a how-to: one per step you
   say, or when you say "take a picture". There's no timer and no background capture.
@@ -242,6 +247,16 @@ a separate add-on with its own repository, **published later**; it isn't availab
 - **Deepgram** (mixed mode) hears your voice during a call. **Rime** gets Othos's replies to
   speak. In offline mode neither is used.
 - **Tavily** gets search questions. Personal questions are never sent to it.
+- **Other model providers for The Smithy** (Anthropic, DeepSeek, Mistral and others, by API
+  key) are **off until you turn one on** in `smithy.json`, with its key in `.env`. Even
+  then, a task uses them only when you name the provider, or when you set it as the
+  default.
+  - **What's sent:** that task's request, after the same filter that removes personal
+    details.
+  - **Refused:** providers whose free tiers may train on what you send, unless you allow
+    them.
+  - **Limits:** daily token and spending limits. LM Studio on this computer works the
+    same way and sends nothing out. See `agent\SMITHY.md`, "Other model providers".
 - **The free sources** get only search words, a game or channel name, or your town's map
   point: the National Weather Service, Wikipedia (it also sees your `contact_url`), Stack
   Exchange, GitHub, RSS feeds, and, with your keys, Ravelry, YouTube, Twitch, The Guardian
