@@ -35,6 +35,8 @@ Othos\
    - [Node.js LTS](https://nodejs.org/).
    - [Ollama](https://ollama.com/download).
    - [Git](https://git-scm.com/download/win) (optional, for updates).
+   - Prefer a window? `installer\` has the source for an optional `OthosSetup.exe`
+     (see `installer\README.md`). `setup.ps1` below does the same thing.
 2. Open PowerShell in this folder and run:
    ```powershell
    powershell -ExecutionPolicy Bypass -File setup.ps1
