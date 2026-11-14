@@ -15,6 +15,11 @@ The "it's ready" announcer: between turns (never mid-reply) Othos says "Smithy t
 your gaming.py review, is ready" and the summary; results that finished while the user
 was away are mentioned at the start of the next call.
 
+Task Mode (the user's idea, Nov 13): "task mode on" and Othos reads each step of the
+workers' tasks aloud as it happens ("Planning the build.", "Cerebras asked to slow down:
+waiting 60 seconds.", "OthosSetup.cs: 10 edits in."), between turns, from the same steps file
+the app's Progress window shows (worker_engine.StepFile). "Task mode off" stops it.
+
 The how-to recorder (howto_recorder.py) is checked first: "start a how-to", then
 every turn is a step with a picture and Othos says nothing, until "finish the
 how-to", which queues Firestarter's write-up (when Firestarter is installed and open).
@@ -26,6 +31,7 @@ import json
 import logging
 import re
 import subprocess
+import time
 from pathlib import Path
 
 import howto_recorder
@@ -35,6 +41,7 @@ try:                                             # the Smithy's check task: left
 except ImportError:
     smithy_rea = None
 import worker_cloud
+import worker_engine
 import worker_files
 import worker_shared
 from worker_queue import FIRESTARTER, QUEUES, SMITHY, Queue
@@ -284,10 +291,31 @@ class WorkersVoice:
         self._asked_out: set[tuple[str, int]] = set()                # asked once per task
         self._announcer: asyncio.Task | None = None
         self.howto = howto_recorder.Recorder()                      # picks up a recording left running
+        self.task_mode = False                                      # read each step aloud as it happens
+        self.tm_target = None                                       # (worker, task) | "next" | None = every task
+        self.tm_asking = False                                      # asked "a particular task or the current one?"
+        self._step_pos: dict[str, int] = {}                         # how far each steps file has been read
+        # "While you were away, N tasks finished. Want to hear about them?" (the user, Nov 14: not read
+        # out unasked). The tasks asked about, and when; they're marked heard on her answer.
+        self.away: list | None = None
+        self._away_ts = 0.0
+        self._away_skip: set[tuple[str, int]] = set()               # not read this call (she moved on)
 
     # -- one turn: a reply from code ('' = say nothing), or None for "not about the workers"
     def handle(self, text: str) -> str | None:
         if (said := self._howto(text)) is not None:
+            return said
+        if self.away is not None and (said := self._away_answer(text)) is not None:
+            return said
+        asking, self.tm_asking = self.tm_asking, False   # the question is for the very next turn only
+        if _TASK_MODE.search(text):
+            if _TASK_MODE_OFF.search(text):
+                return self._task_mode_off()
+            if _TASK_MODE_ON.search(text):
+                return self._task_mode_request(text)
+            return ("Task mode reads each step of a task aloud as it happens. "
+                    "Say task mode on to start it, and task mode off to stop.")
+        if asking and (said := self._task_mode_answer(text)) is not None:
             return said
         reading, self.reading = self.reading, None   # "read the rest" only right after a read
         if (said := self._out_answer(text)) is not None:
@@ -733,6 +761,40 @@ class WorkersVoice:
         word = "Keep" if verdict == "kept" else "Discard"
         return f"{word} {_name(q, job_id)}, {_title(q, job)}? Say yes or no."
 
+    # -- "While you were away...": asked first, read only if she wants it. Conversational, not a
+    # code-checked gate (it only reads a list; nothing is sent or applied). Her next reply answers it,
+    # or it's dropped: something else is just carried on with, and it isn't asked again this call.
+    def _away_reply_text(self, jobs) -> str:
+        if len(jobs) == 1:
+            q, j = jobs[0]
+            return f"{_name(q, j['id'])}, {_title(q, j)}, finished. {_summary(j)}"
+        names = "; ".join(f"{_name(q, j['id'])}, {_title(q, j)}" for q, j in jobs[:5])
+        more = f", and {len(jobs) - 5} more" if len(jobs) > 5 else ""
+        return f"{len(jobs)} tasks finished: {names}{more}. Say read me, and the task."
+
+    def _away_drop(self) -> None:
+        """The question lapses: those tasks aren't read or marked; not asked again this call."""
+        self._away_skip.update((q.key, int(j["id"])) for q, j in (self.away or []))
+        self.away = None
+
+    def _away_answer(self, text: str) -> str | None:
+        jobs = self.away or []
+        if _AWAY_NO.search(text):
+            ans = "no"
+        elif _AWAY_YES.search(text) or worker_shared.answer(text) == "yes":
+            ans = "yes"
+        else:
+            self._away_drop()                          # something else: carry on with what she said
+            return None
+        self.away = None
+        for q, j in jobs:                              # heard (or skipped): still there by "list" / "read me task N"
+            q.mark_announced(j["id"])
+        log.info("workers: away list %s for %s", "read" if ans == "yes" else "skipped",
+                 [_name(q, j["id"]) for q, j in jobs])
+        if ans == "no" and len(re.findall(r"\w+", text)) > 4:
+            return None                                # "no, what's the time?": skipped, and her question answered
+        return self._away_reply_text(jobs).strip() if ans == "yes" else "Okay."
+
     # -- "it's ready" announcements, between turns only
     # -- a task waiting for free tokens (worker_cloud.Chain): "finish on this PC, or wait?"
     def _waiting_out(self) -> list[tuple[Queue, dict]]:
@@ -776,6 +838,140 @@ class WorkersVoice:
             return f"Okay, {_name(q, n)} carries on with this PC's model. It's slower, but nothing more is sent out."
         return f"Okay, {_name(q, n)} waits, and carries on by itself {_spoken_time(st.get('free_tokens_back_ts') or 0)}."
 
+    # -- Task Mode: each step read aloud as it happens
+    # "task mode on" without a task: "Do you want a particular task or the current one?" (the user,
+    # Nov 13). A particular task: only its steps, and task mode ends when it does. The current one:
+    # the task running now (or, with none running, the next one to start), the same way.
+    def _task_mode_request(self, text: str) -> str:
+        who, t = _who(text)
+        if m := _TM_TASK.search(t):
+            return self._tm_follow(who, _num(m.group(1)))
+        if _TM_CURRENT.search(t):
+            return self._tm_current()
+        self.tm_asking = True
+        return "Do you want a particular task or the current one?"
+
+    def _task_mode_answer(self, text: str) -> str | None:
+        """Her answer to "a particular task or the current one?" (None: not an answer; the question lapses)."""
+        if _TM_NEVER.search(text) or worker_shared.answer(text) == "no":
+            return "Okay, task mode stays off."
+        who, t = _who(text)
+        # "the current one" / "a particular one": that "one" isn't task 1
+        bare = re.sub(r"\b(?:the|a|this|that|current|particular|specific|certain|another|different)\s+one\b", " ", t,
+                      flags=re.I)
+        if m := _TM_NUMBER.search(bare):
+            return self._tm_follow(who, _num(m.group(1)))
+        if _TM_CURRENT.search(t) or worker_shared.answer(text) == "yes":
+            return self._tm_current()
+        if _TM_PARTICULAR.search(t):
+            self.tm_asking = True
+            return "Which task? Say its number, like Smithy task 21."
+        return None
+
+    def _tm_on(self, target) -> None:
+        """target: (worker key, task number), "next" (the next task to start), or None (every task)."""
+        self.task_mode, self.tm_target = True, target
+        for q in INSTALLED:                            # from now on: only steps that happen after this
+            try:
+                self._step_pos[q.key] = worker_engine.steps_path(q.status_path).stat().st_size
+            except OSError:
+                self._step_pos[q.key] = 0
+
+    def _tm_follow(self, who: str | None, job_id: int) -> str:
+        got = self._pick(who, job_id)
+        if isinstance(got, str):
+            return got
+        q, row = got
+        name = _name(q, job_id)
+        if row["status"] in ("review", "kept", "discarded"):
+            return f"{name} has already finished. Say read me {name} to hear it."
+        if row["status"] in ("failed", "cancelled"):
+            return f"{name} has already {'failed' if row['status'] == 'failed' else 'been stopped'}, so there are no steps to read."
+        self._tm_on((q.key, job_id))
+        st = q.read_status()
+        if q.running() and st.get("task_id") == job_id:
+            last = _last_step(worker_engine.steps_path(q.status_path), job_id)
+            now = f" Right now: {last}" if last else ""
+            return f"Task mode is on for {name}. I'll read each step as it happens. Say task mode off to stop.{now}"
+        where = "" if q.running() else f" {q.name} isn't open, so it won't start until you open {q.app}."
+        return f"Task mode is on for {name}. It's waiting in the queue; I'll read its steps when it starts.{where}"
+
+    def _tm_current(self) -> str:
+        running = [(q, int(st["task_id"])) for q in INSTALLED
+                   if q.running() and (st := q.read_status()).get("task_id")]
+        if len(running) == 1:
+            return self._tm_follow(running[0][0].key, running[0][1])
+        if len(running) > 1:                           # both workers busy: both
+            self._tm_on(None)
+            names = " and ".join(_name(q, n) for q, n in running)
+            return f"Task mode is on for {names}. I'll read each step as it happens. Say task mode off to stop."
+        self._tm_on("next")
+        return "Nothing is running right now. Task mode is on for the next task that starts."
+
+    def _task_mode_off(self) -> str:
+        self.task_mode, self.tm_target, self.tm_asking = False, None, False
+        return "Task mode is off. I'll still tell you when a task is ready."
+
+    def _new_steps(self) -> list[tuple[Queue, int | None, str]]:
+        """(worker, task, text) for the step lines written since the last look that Task Mode
+        follows, oldest first."""
+        out = []
+        for q in INSTALLED:
+            path = worker_engine.steps_path(q.status_path)
+            try:
+                size = path.stat().st_size
+                pos = self._step_pos.get(q.key, size)
+                if size < pos:                         # the file was trimmed: start again from its end
+                    pos = size
+                if size > pos:
+                    with path.open("rb") as f:
+                        f.seek(pos)
+                        chunk = f.read(size - pos)
+                    keep = chunk.rfind(b"\n") + 1     # whole lines only; a half-written one waits
+                    self._step_pos[q.key] = pos + keep
+                    for line in chunk[:keep].decode("utf-8", errors="replace").splitlines():
+                        try:
+                            d = json.loads(line)
+                        except ValueError:
+                            continue
+                        task, text = d.get("task"), str(d.get("text", ""))
+                        if self.tm_target == "next" and task is not None:
+                            self.tm_target = (q.key, task)          # the next task: this one
+                        if isinstance(self.tm_target, tuple) and self.tm_target != (q.key, task):
+                            continue
+                        if text:
+                            out.append((q, task, text))
+                else:
+                    self._step_pos[q.key] = size
+            except OSError:
+                continue
+        return out
+
+    def _say_steps(self) -> bool:
+        if self.howto.recording and not self.howto.paused:
+            return False                               # never over her how-to narration: held until it pauses or ends
+        new = self._new_steps()
+        if not new:
+            return False
+        parts, ended = [], None
+        for q in [q for q in INSTALLED if any(x[0] is q for x in new)]:
+            mine = [(task, t) for q2, task, t in new if q2 is q]
+            if isinstance(self.tm_target, tuple) and any(_END_STEP.match(t) for _, t in mine):
+                ended = (q, mine[-1][0])
+            texts = [t for _, t in mine if not _DONE_STEP.match(t)]   # "is ready" is said by the announcer
+            if len(texts) > 4:                          # a burst: the count, then the latest few
+                parts.append(f"{q.name}, {len(texts)} steps. The latest: " + " ".join(texts[-3:]))
+            elif texts:
+                parts.append(f"{q.name}: " + " ".join(texts))
+        if ended:                                       # the task it followed is over: task mode ends with it
+            q, task = ended
+            self.task_mode, self.tm_target = False, None
+            parts.append(f"That's the end of {_name(q, task)}, so task mode is off.")
+        if not parts:
+            return False
+        self.session.say(speakable(" ".join(parts)), allow_interruptions=True)
+        return True
+
     def start_announcer(self) -> None:
         if self.session is not None and self._announcer is None:
             self._announcer = asyncio.create_task(self._announce_loop())
@@ -790,7 +986,12 @@ class WorkersVoice:
         await asyncio.sleep(2)
         while True:
             try:
-                if self._between_turns():
+                if self.away is not None and time.time() - self._away_ts > AWAY_ANSWER_SECONDS:
+                    log.info("workers: no answer to the away question; dropped for this call")
+                    self._away_drop()
+                if self.away is not None:
+                    pass                                # waiting for her answer: nothing else is announced
+                elif self._between_turns():
                     for q, st in await asyncio.to_thread(self._waiting_out):
                         key = (q.key, int(st["task_id"]))
                         if key in self._asked_out or st.get("out_choice"):
@@ -803,16 +1004,22 @@ class WorkersVoice:
                                          f"now? Or say wait, and it carries on by itself {when}.", allow_interruptions=True)
                         log.info("workers: asked about free tokens for %s", _name(q, key[1]))
                         break
-                    jobs = [(q, j) for q in INSTALLED for j in await asyncio.to_thread(q.unannounced)]
+                    # Task Mode: the steps first, so "is ready" comes after the task's last step
+                    if self.task_mode and await asyncio.to_thread(self._say_steps):
+                        await asyncio.sleep(5)
+                        continue
+                    jobs = [(q, j) for q in INSTALLED for j in await asyncio.to_thread(q.unannounced)
+                            if (q.key, int(j["id"])) not in self._away_skip]
                     if jobs:
-                        if first:   # finished while the user was away
-                            if len(jobs) == 1:
-                                q, j = jobs[0]
-                                text = f"While you were away, {_name(q, j['id'])}, {_title(q, j)}, finished. {_summary(j)}"
-                            else:
-                                names = "; ".join(f"{_name(q, j['id'])}, {_title(q, j)}" for q, j in jobs[:5])
-                                text = f"While you were away, {len(jobs)} tasks finished: {names}. Say read me, and the task."
-                            done = jobs
+                        if first:   # finished while the user was away: ask first (the user, Nov 14)
+                            first = False
+                            self.away, self._away_ts = jobs, time.time()
+                            text = ("While you were away, a task finished. Want to hear about it?" if len(jobs) == 1
+                                    else f"While you were away, {len(jobs)} tasks finished. Want to hear about them?")
+                            log.info("workers: asked about the away list %s", [_name(q, j["id"]) for q, j in jobs])
+                            self.session.say(text, allow_interruptions=True)
+                            await asyncio.sleep(5)
+                            continue
                         else:
                             q, j = jobs[0]
                             text, done = f"{_name(q, j['id'])}, {_title(q, j)}, is ready. {_summary(j)}", [jobs[0]]
@@ -833,6 +1040,51 @@ _OUT_LOCAL = re.compile(r"\b(?:finish|carry\s+on|continue|do)\b(?:\s+(?:task\s+)
                         r"[\w\s,]{0,30}?\b(?:on|with)\s+(?:this|the|my)\s+(?:pc|computer|laptop|machine|local\s+model)\b"
                         r"|\blocally\b", re.I)
 _OUT_WAIT = re.compile(r"\b(?:wait|later|hold\s+on|leave\s+it)\b", re.I)
+
+# Her answer to "While you were away, N tasks finished. Want to hear about them?" A reply that's
+# neither (another question, a new topic) is carried on with, and the question is dropped.
+AWAY_ANSWER_SECONDS = 60                                 # no reply this long: dropped, nothing read
+_AWAY_YES = re.compile(r"^\W*(?:(?:othos|osos|um+|uh+|oh|well)\W+)*(?:yes|yeah|yep|yup|sure|ok(?:ay)?|go\s+ahead|"
+                       r"please|tell\s+me(?=\W*$|\s+about\s+(?:them|it|those)|\s+more)|read\s+(?:them|it)|"
+                       r"let'?s\s+hear|i'?d\s+like\s+that|go\s+on|"
+                       r"absolutely|of\s+course|definitely|what\s+(?:are|were)\s+they|what\s+(?:is|was)\s+it|"
+                       r"which\s+ones?|what\s+finished)\b", re.I)
+_AWAY_NO = re.compile(r"^\W*(?:(?:othos|osos|um+|uh+|oh|well)\W+)*(?:no|nope|nah|not\s+(?:now|yet|right\s+now)|"
+                      r"later|maybe\s+later|skip|never\s*mind|don'?t\s+(?:bother|worry)|i'?m\s+good|pass)\b"
+                      r"|\b(?:not\s+now|later|no\s+thanks?)\W*$", re.I)
+
+# "task mode on", "turn on task mode", "go into task mode"; off: "task mode off", "stop task mode", "leave task mode"
+_TASK_MODE = re.compile(r"\btask\s*-?\s*mode\b", re.I)
+_TASK_MODE_OFF = re.compile(r"\b(?:off|stop|end|leave|exit|quit|out\s+of|disable|cancel|no\s+more)\b", re.I)
+# on: "task mode on", "open / start / enter / go into / assume / switch to / turn on / use task mode",
+# "put yourself in task mode"
+_TASK_MODE_ON = re.compile(r"\b(?:on|open|start|enter|into|assume|begin|use|activate|switch\s+to|go\s+to|"
+                           r"put\s+(?:\w+\s+)?in)\b", re.I)
+_TM_TASK = re.compile(r"\btask\s+(?:number\s+)?" + _N + r"\b", re.I)          # "task mode for Smithy task 21"
+_TM_NUMBER = re.compile(r"(?:\btask\s+)?(?:\bnumber\s+)?\b" + _N + r"\b", re.I)   # the answer: "21", "task 21"
+_TM_CURRENT = re.compile(r"\b(?:current|this\s+one|the\s+one\s+(?:that'?s\s+)?running|running|"
+                         r"whatever'?s\s+running|that\s+one|the\s+one\s+going)\b", re.I)
+_TM_PARTICULAR = re.compile(r"\b(?:particular|specific|a\s+certain|another|different)\b", re.I)
+_TM_NEVER = re.compile(r"\b(?:never\s*mind|cancel|forget\s+it|neither|none)\b", re.I)
+# the end of a task, as the engine writes it (worker_engine.run_task)
+_END_STEP = re.compile(r"^Task \d+ (?:is done\b|was cancelled\b|couldn't start\b|stopped:|failed:(?!.*once more))")
+_DONE_STEP = re.compile(r"^Task \d+ is done\b")
+
+
+def _last_step(path: Path, task_id: int) -> str:
+    """The latest step line of that task in a steps file ('' if none)."""
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-200:]
+    except OSError:
+        return ""
+    for line in reversed(lines):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if d.get("task") == task_id:
+            return str(d.get("text", ""))
+    return ""
 
 
 def _spoken_time(ts) -> str:

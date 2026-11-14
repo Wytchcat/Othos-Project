@@ -174,6 +174,26 @@ Othos after editing (refreshing is enough for the call page).
 ## The Smithy (coding worker)
 
 The Smithy is a background coding helper with its own taskbar app.
+
+### Quick start
+
+1. Finish the Othos quick start above first: `setup.ps1` makes the Python environment The
+   Smithy uses, and Ollama must be installed.
+2. Build the app (it also adds a Desktop and Start-menu shortcut). `setup.ps1` doesn't do this:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File agent\build-smithy.ps1
+   ```
+3. Open **The Smithy** from the shortcut. Opening it starts the worker; closing it stops it.
+4. Click **Get models...** and fetch the default coding model (`qwen2.5-coder:3b`) if setup
+   didn't already pull it. Ollama must be running.
+5. Try one small job from the window's command line, or by voice once Othos is running:
+   "ask the Smithy to review gaming dot py". The result waits in `agent\drafts\smithy\`.
+   Nothing is ever applied or run for you.
+6. Optional: **Providers...** lets you add a free cloud model's key (saved encrypted) and turn it
+   on. Nothing leaves your PC until you turn a provider on; `cloud.enabled` is empty by default.
+
+More below.
+
 - **Build the app:** `agent\build-smithy.ps1`.
 - **Start and stop:** opening the app starts the worker; closing it stops it.
 - **Ask by voice:** "ask the Smithy to review gaming dot py", "ask the Smithy to write a

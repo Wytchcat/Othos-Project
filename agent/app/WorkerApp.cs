@@ -488,11 +488,11 @@ class ProvidersForm : Form
         body.SetBounds(10, 66, 740, 484); body.AutoScroll = true; body.BackColor = Bg;
         Controls.Add(body);
 
-        AddLabel(this, "Cloud limit per day:", 16, 564, 140, Dim);
+        AddLabel(this, "Limit per day:", 16, 564, 140, Dim);
         tokensDay.SetBounds(160, 561, 100, 24); StyleBox(tokensDay); Controls.Add(tokensDay);
-        AddLabel(this, "tokens   and", 264, 564, 90, Dim);
+        AddLabel(this, "tokens each,", 264, 564, 90, Dim);
         usdDay.SetBounds(356, 561, 60, 24); StyleBox(usdDay); Controls.Add(usdDay);
-        AddLabel(this, "dollars (dollars count once prices are set)", 420, 564, 330, Dim);
+        AddLabel(this, "dollars in all (dollars count once prices are set)", 420, 564, 330, Dim);
         var saveLimits = MakeButton(this, "Save limits", 16, 596, 120);
         saveLimits.Click += (s, e) => SaveLimits();
         var close = MakeButton(this, "Close", 624, 596, 120);
@@ -765,6 +765,7 @@ class FirestarterForm : Form
     Process worker;
     bool loadingModels, stopping;
     string askedOut = "";      // the task already asked about free tokens (worker_cloud.Chain)
+    ProgressForm progress;     // the live steps window (one at a time)
 
     public FirestarterForm()
     {
@@ -826,8 +827,15 @@ class FirestarterForm : Form
 
         var get = MakeButton("Get models…", 150, y2 + 6, 250);
         get.Click += (s, e) => { using (var d = new DownloaderForm()) d.ShowDialog(this); LoadModels(); };
-        var logButton = MakeButton("Work log", 150, y2 + 44, 250);
+        var logButton = MakeButton("Work log", 150, y2 + 44, 122);
         logButton.Click += (s, e) => OpenWorkLog();
+        // each step of the running task, live, in a small window to keep in a corner
+        var progressButton = MakeButton("Progress", 278, y2 + 44, 122);
+        progressButton.Click += (s, e) =>
+        {
+            if (progress == null || progress.IsDisposed) { progress = new ProgressForm(); progress.Show(this); }
+            else { progress.WindowState = FormWindowState.Normal; progress.Activate(); }
+        };
 #if SMITHY
         // Othos's code chat: needs Othos's page server (port 3000), so it's off until Othos runs
         codeChat = MakeButton("Code chat", 150, y2 + 82, 250);
@@ -1230,6 +1238,162 @@ class FirestarterForm : Form
             catch { }
         }
         base.OnFormClosing(e);
+    }
+}
+
+// "Progress" window: each step of the running task as it happens (Nov 13, the user: "a running step by
+// step as it progresses thru the task", to keep in a corner). Reads state\<worker>-status-steps.jsonl,
+// which the worker writes (worker_engine.StepFile); Othos's Task Mode reads the same lines aloud.
+// Only reads files; it starts and stops nothing.
+class ProgressForm : Form
+{
+    static readonly Color Bg = Color.FromArgb(2, 7, 5), Ink = Color.FromArgb(200, 230, 210),
+        Dim = Color.FromArgb(120, 140, 130), Accent = FirestarterApp.Accent, Gold = Color.FromArgb(231, 195, 104),
+        PurpleFill = Color.FromArgb(14, 16, 25), PurpleLine = Color.FromArgb(64, 53, 105), Panel = Color.FromArgb(5, 12, 8);
+    static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
+    static readonly string StepsFile = Path.Combine(Path.GetDirectoryName(FirestarterApp.StatusFile),
+        Path.GetFileNameWithoutExtension(FirestarterApp.StatusFile) + "-steps.jsonl");
+
+    readonly Label task = new Label();
+    readonly Panel bar = new Panel();
+    readonly RichTextBox lines = new RichTextBox();
+    readonly CheckBox onTop = new CheckBox();
+    readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
+    double frac;
+    long pos;
+    string lastTask = "";
+
+    public ProgressForm()
+    {
+        Text = FirestarterApp.Name + ": progress";
+        try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
+        FormBorderStyle = FormBorderStyle.Sizable; MaximizeBox = false; MinimizeBox = true;
+        BackColor = Bg; ForeColor = Ink; Font = new Font("Segoe UI", 9.5f);
+        ClientSize = new Size(440, 340); MinimumSize = new Size(320, 220);
+        ShowInTaskbar = false; TopMost = true;
+        // the bottom-right corner of the screen, out of the way
+        StartPosition = FormStartPosition.Manual;
+        Rectangle wa = Screen.PrimaryScreen.WorkingArea;
+        Location = new Point(wa.Right - Width - 12, wa.Bottom - Height - 12);
+
+        var title = new Label(); title.Text = "P R O G R E S S"; title.ForeColor = Accent;
+        title.Font = new Font("Segoe UI Semibold", 11f); title.SetBounds(12, 8, 300, 22);
+        task.ForeColor = Ink; task.SetBounds(12, 32, 416, 20); task.AutoEllipsis = true;
+        task.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+        bar.SetBounds(12, 56, 416, 8); bar.BackColor = PurpleFill;
+        bar.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+        bar.Paint += (s, e) =>
+        {
+            int w = (int)(bar.Width * Math.Max(0, Math.Min(1, frac)));
+            using (var b = new SolidBrush(Accent)) e.Graphics.FillRectangle(b, 0, 0, w, bar.Height);
+        };
+        lines.SetBounds(12, 72, 416, 228); lines.ReadOnly = true; lines.BorderStyle = BorderStyle.None;
+        lines.BackColor = Panel; lines.ForeColor = Ink; lines.DetectUrls = false; lines.WordWrap = true;
+        lines.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+        onTop.Text = "Keep on top"; onTop.Checked = true; onTop.ForeColor = Dim; onTop.FlatStyle = FlatStyle.Flat;
+        onTop.SetBounds(12, 308, 140, 24); onTop.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
+        onTop.CheckedChanged += (s, e) => TopMost = onTop.Checked;
+        var close = new Button(); close.Text = "Close"; close.FlatStyle = FlatStyle.Flat;
+        close.FlatAppearance.BorderColor = PurpleLine; close.FlatAppearance.MouseOverBackColor = Color.FromArgb(25, 24, 43);
+        close.BackColor = PurpleFill; close.ForeColor = Ink; close.SetBounds(338, 306, 90, 28);
+        close.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
+        close.Click += (s, e) => Close();
+        CancelButton = close;
+        Controls.AddRange(new Control[] { title, task, bar, lines, onTop, close });
+
+        LoadRecent();
+        timer.Interval = 1000;
+        timer.Tick += (s, e) => Tick();
+        timer.Start();
+        Tick();
+    }
+
+    protected override void OnFormClosed(FormClosedEventArgs e) { timer.Stop(); base.OnFormClosed(e); }
+
+    static string Get(Dictionary<string, object> s, string k)
+    {
+        return s != null && s.ContainsKey(k) && s[k] != null ? Convert.ToString(s[k]) : "";
+    }
+
+    static string ReadShared(string path, long from, out long end)
+    {
+        using (var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+        {
+            end = f.Length;
+            if (from > end) from = end;
+            f.Seek(from, SeekOrigin.Begin);
+            var buf = new byte[end - from];
+            int n = 0;
+            while (n < buf.Length) { int r = f.Read(buf, n, buf.Length - n); if (r <= 0) break; n += r; }
+            int keep = Array.LastIndexOf(buf, (byte)'\n') + 1;   // whole lines only
+            end = from + keep;
+            return System.Text.Encoding.UTF8.GetString(buf, 0, keep);
+        }
+    }
+
+    // the last 40 steps already there, so it isn't empty when opened part way through a task
+    void LoadRecent()
+    {
+        try
+        {
+            string all = ReadShared(StepsFile, 0, out pos);
+            string[] ls = all.Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            for (int i = Math.Max(0, ls.Length - 40); i < ls.Length; i++) AddLine(ls[i]);
+        }
+        catch { AddText(DateTime.Now.ToString("HH:mm:ss"), "No steps yet. They appear here as a task runs.", Dim); }
+    }
+
+    void AddLine(string json)
+    {
+        Dictionary<string, object> d;
+        try { d = Json.Deserialize<Dictionary<string, object>>(json); } catch { return; }
+        string t = Get(d, "task"), text = Get(d, "text");
+        if (t != "" && t != lastTask)
+        {
+            if (lastTask != "") AddText("", "", Dim);
+            lastTask = t;
+        }
+        string when = "";
+        try { when = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(Convert.ToDouble(d["ts"])).ToLocalTime().ToString("h:mm:ss"); } catch { }
+        string low = text.ToLowerInvariant();
+        Color c = low.StartsWith("started task") || low.Contains(" is done") ? Accent
+                : low.Contains("wait") || low.Contains("slow down") || low.Contains("couldn't") || low.Contains("failed")
+                  || low.Contains("cut off") || low.Contains("left out") || low.Contains("can't") || low.Contains("cancelled") ? Gold
+                : Ink;
+        AddText(when, text, c);
+    }
+
+    void AddText(string when, string text, Color c)
+    {
+        lines.SelectionStart = lines.TextLength; lines.SelectionLength = 0;
+        if (when != "") { lines.SelectionColor = Dim; lines.AppendText(when + "  "); }
+        lines.SelectionColor = c; lines.AppendText(text + "\n");
+        lines.SelectionStart = lines.TextLength; lines.ScrollToCaret();
+    }
+
+    void Tick()
+    {
+        Dictionary<string, object> s = null;
+        try { s = Json.Deserialize<Dictionary<string, object>>(File.ReadAllText(FirestarterApp.StatusFile)); } catch { }
+        string tid = Get(s, "task_id"), st = Get(s, "state");
+        double p = 0;
+        if (tid != "" && Get(s, "progress") != "") double.TryParse(Get(s, "progress"), System.Globalization.NumberStyles.Float,
+                                                                    System.Globalization.CultureInfo.InvariantCulture, out p);
+        frac = tid != "" ? p : 0;
+        string el = Get(s, "elapsed");
+        task.Text = tid != "" ? "Task " + tid + ": " + Get(s, "task_title") + "   " + (int)(p * 100) + "%" + (el != "" ? ", " + el + " s" : "")
+                  : st == "" ? FirestarterApp.Name + " isn't running" : "No task running (" + st + ")";
+        task.ForeColor = st == "waiting for free tokens" || st == "paused" || st == "held back" ? Gold : Ink;
+        bar.Invalidate();
+        try
+        {
+            if (new FileInfo(StepsFile).Length < pos) { lines.Clear(); lastTask = ""; pos = 0; }   // trimmed
+            long end;
+            string more = ReadShared(StepsFile, pos, out end);
+            pos = end;
+            foreach (string l in more.Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries)) AddLine(l);
+        }
+        catch { }
     }
 }
 

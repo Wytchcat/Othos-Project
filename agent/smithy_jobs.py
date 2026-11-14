@@ -18,13 +18,21 @@ Rules, enforced here in code, not in the prompt:
   path the model plans is checked (relative, no "..", no drive, no hidden or key
   files, no programs) and checked again after resolving. Nothing is run or
   installed; the user copies what they want into place themselves.
+- A build is checked before its README: C# files are compiled together (Windows' own csc.exe,
+  into a temporary folder that's deleted), PowerShell, Python and JSON files are parsed. The
+  result is never run. On a new version, each numbered change asked for is checked off.
 """
 from __future__ import annotations
 
+import base64
+import difflib
 import json
 import logging
+import os
 import re
 import shutil
+import subprocess
+import tempfile
 from pathlib import Path, PurePosixPath
 
 try:                                             # the check task: left out of the shared copy of Othos
@@ -32,11 +40,12 @@ try:                                             # the check task: left out of t
 except ImportError:
     smithy_check = None
 import worker_files
-from worker_engine import FORMAT, JobType, plain_summary, split_result
+from worker_engine import FORMAT, NOT_COMPLETE, JobType, plain_summary, save_artifact, split_result
 from worker_queue import SMITHY
 from worker_shared import RULES, USER, USERS, redact
 
 log = logging.getLogger("worker")
+steps = logging.getLogger("worker.step")     # plain step lines (Progress window, Othos's Task Mode)
 
 SYSTEM = (f"You are the Smithy, a careful coding assistant for Othos on {USERS} Windows 11 PC. "
           "You review code, draft fixes, write scripts, and build small projects from scratch. " + RULES)
@@ -102,6 +111,145 @@ def _script(p):
                 "language is asked for), with short comments. Then say how to run it. It will be saved as a "
                 "draft; it will not be run.")},
             {"role": "user", "content": redact(p["request"])}]
+
+
+_BLOCK = re.compile(r"```([\w#+.-]*)[^\n]*\n([\s\S]*?)```")
+_LANG_EXT = {"powershell": ".ps1", "ps1": ".ps1", "pwsh": ".ps1", "python": ".py", "py": ".py", "json": ".json",
+             "csharp": ".cs", "cs": ".cs", "c#": ".cs"}
+
+
+def _script_problems(full: str) -> list[str]:
+    """Parse problems in a script answer's first code block (PowerShell, Python, JSON, C#). Never run."""
+    m = _BLOCK.search(full)
+    if not m:
+        return ["the answer has no code block"]
+    ext = _LANG_EXT.get(m.group(1).lower(), ".ps1" if not m.group(1) else "")
+    if not ext:
+        return []                                             # a language that can't be checked here
+    with tempfile.TemporaryDirectory(prefix="smithy-check-") as tmp:
+        (Path(tmp) / f"script{ext}").write_text(m.group(2), encoding="utf-8")
+        problems, _ = build_problems(Path(tmp), [f"script{ext}"])
+    return problems
+
+
+def _diff_problems(path: str, full: str) -> list[str]:
+    """Does the fix's diff apply cleanly to a copy of the file? (`git apply --check`; nothing is changed.)"""
+    blocks = [c for l, c in _BLOCK.findall(full) if l.lower() in ("diff", "patch")] or [c for _, c in _BLOCK.findall(full)]
+    if not blocks:
+        return ["the answer has no diff block"]
+    if shutil.which("git") is None:
+        return []                                             # can't check here: say nothing rather than guess
+    with tempfile.TemporaryDirectory(prefix="smithy-check-") as tmp:
+        shutil.copyfile(path, Path(tmp) / Path(path).name)
+        # the diff's line ends as the file's (Nov 14: written with Windows' \r\n, a diff for a \n file never applied)
+        crlf = b"\r\n" in Path(path).read_bytes()
+        (Path(tmp) / "fix.diff").write_text(blocks[0], encoding="utf-8", newline="\r\n" if crlf else "\n")
+        last = ""
+        for strip in ("-p1", "-p0"):
+            r = subprocess.run(["git", "apply", "--check", "--recount", "--unsafe-paths", strip, "fix.diff"], cwd=tmp,
+                               capture_output=True, text=True, timeout=60, creationflags=_NO_WINDOW)
+            if r.returncode == 0:
+                return []
+            last = (r.stderr or r.stdout).strip().replace(tmp, "")
+    return [f"the diff doesn't apply to {Path(path).name}: {last[:400]}"]
+
+
+_BARE_HUNK = re.compile(r"(?m)^@@[ \t]*(?:@@)?[ \t]*$")
+
+
+def repair_diff(path: str, full: str) -> str:
+    """A diff whose hunks have no line numbers (a bare "@@"; Nov 14, task 27: right changes, three rounds, still
+    no numbers) rebuilt by The Smithy itself: each hunk's old lines (context and "-") are found exactly once
+    in the file, the new lines ("+" and context) put in their place, and a real diff is written from the
+    result. Anything it can't place exactly leaves the answer as it was, for the check to report."""
+    m = next((b for b in _BLOCK.finditer(full) if b.group(1).lower() in ("diff", "patch")), None) or _BLOCK.search(full)
+    if not m or not _BARE_HUNK.search(m.group(2)):
+        return full
+    try:
+        lines = Path(path).read_text(encoding="utf-8-sig").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return full
+    new = list(lines)
+    for hunk in re.split(r"(?m)^@@[^\n]*\n", m.group(2))[1:]:
+        old_part, new_part = [], []
+        for l in hunk.split("\n"):
+            if l.startswith("-"):
+                old_part.append(l[1:])
+            elif l.startswith("+"):
+                new_part.append(l[1:])
+            elif l.startswith(" ") or l == "":
+                if l == "" and not (old_part or new_part):
+                    continue
+                old_part.append(l[1:]), new_part.append(l[1:])
+        while old_part and new_part and old_part[-1] == "" and new_part[-1] == "":   # the block's trailing newline
+            old_part.pop(), new_part.pop()
+        if not old_part:
+            return full                                  # nothing to find it by
+        at = [i for i in range(len(new) - len(old_part) + 1) if new[i:i + len(old_part)] == old_part]
+        if len(at) != 1:
+            return full
+        new[at[0]:at[0] + len(old_part)] = new_part
+    name = Path(path).name
+    diff = "\n".join(difflib.unified_diff(lines, new, f"a/{name}", f"b/{name}", lineterm="")) + "\n"
+    log.info("fix: the diff had no line numbers; rebuilt from its lines")
+    steps.info("The diff had no line numbers; The Smithy rebuilt it from its lines.")
+    return full[:m.start(2)] + diff + full[m.end(2):]
+
+
+def _checked_answer(ctx, msgs: list[dict], max_tokens: int, problems_of, what: str,
+                    repair=None) -> tuple[str, str, list[str]]:
+    """One answer, checked; asked again with the problems (up to build_check_rounds) until it checks clean.
+    `repair(full) -> full`: a fix The Smithy can make itself first (a diff with no line numbers).
+    Returns (summary, full, problems left)."""
+    rounds = max(1, int(ctx.cfg.get("build_check_rounds", 3)))
+    text = ctx.chat(msgs, max_tokens)
+    summary, full = split_result(text)
+    if repair:
+        full = repair(full)
+    problems = problems_of(full)
+    for rnd in range(1, rounds + 1):
+        if not problems:
+            steps.info("The %s checks clean.", what)
+            break
+        steps.info("Check round %d of %d: the %s has %d problem%s; asking for a fixed one.", rnd, rounds, what,
+                   len(problems), "" if len(problems) == 1 else "s")
+        text = ctx.chat(msgs + [{"role": "assistant", "content": text},
+                                {"role": "user", "content": f"That {what} doesn't check clean:\n- " + "\n- ".join(problems[:20])
+                                 + f"\n\nSend the whole {what} again, fixed, with the same two headings."}], max_tokens)
+        summary, full = split_result(text)
+        if repair:
+            full = repair(full)
+        problems = problems_of(full)
+    return summary, full, problems
+
+
+def _not_complete(what: str, summary: str, full: str, problems: list[str]) -> tuple[str, str]:
+    if not problems:
+        return summary, full
+    return (f"The {what} is NOT complete: it still doesn't check clean ({len(problems)} problem"
+            f"{'s' if len(problems) != 1 else ''}). It's saved as a draft for your review; nothing was run.",
+            f"**{NOT_COMPLETE}:**\n- " + "\n- ".join(problems[:20]) + "\n\n" + full)
+
+
+def _run_script(ctx, p):
+    steps.info("Writing the script.")
+    summary, full, problems = _checked_answer(ctx, _script(p), 1500, _script_problems, "script")
+    summary, full = _not_complete("script", summary, full, problems)
+    return summary, full, save_artifact(SMITHY.results_dir, ctx.row["id"], "script", full)
+
+
+def _run_fix(ctx, p):
+    steps.info("Writing the fix.")
+    summary, full, problems = _checked_answer(ctx, _fix(p), 1500, lambda f: _diff_problems(p["path"], f), "fix",
+                                              repair=lambda f: repair_diff(p["path"], f))
+    summary, full = _not_complete("fix", summary, full, problems)
+    # saved with the file's own line ends, so `git apply` takes it as it is (as the check above did)
+    try:
+        crlf = b"\r\n" in Path(p["path"]).read_bytes()
+    except OSError:
+        crlf = False
+    return summary, full, save_artifact(SMITHY.results_dir, ctx.row["id"], "diff", full,
+                                        newline="\r\n" if crlf else "\n")
 
 
 def _followup_messages(p):
@@ -203,7 +351,9 @@ def _plan_messages(p: dict, max_files: int, parent: dict | None) -> list[dict]:
                      f"This is a new version of an earlier build, \"{parent['plan'].get('name')}\". Its files:\n{files}\n\n"
                      f"Its README:\n{parent['readme'][:6000]}\n\nThe change wanted: {redact(p['change'])}\n\n"
                      "Plan the new version. For each file also add \"change\": \"same\" (copy it unchanged), "
-                     "\"changed\" or \"new\". Keep the same name."})
+                     "\"changed\" or \"new\". Keep the same name. Keep the same files: don't add a new file or "
+                     "move code into one unless the change asks for that (Nov 14: a new file copied classes that "
+                     "stayed in the old one, so it didn't compile, and the build script never used it)."})
     msgs.append({"role": "user", "content": ask})
     return msgs
 
@@ -243,7 +393,7 @@ def parse_plan(text: str, max_files: int) -> tuple[str, str, dict]:
     return summary, desc, {"name": slug(plan.get("name") or ""), "files": files}
 
 
-_REFUSAL = re.compile(r"^\W*(?:I[’']?m sorry|I am sorry|Sorry[,!]?\s+(?:but|I)\b|I can[’']?t|I cannot|I'm unable|I am unable|"
+_REFUSAL = re.compile(r"^\W*(?:I[â€™']?m sorry|I am sorry|Sorry[,!]?\s+(?:but|I)\b|I can[â€™']?t|I cannot|I'm unable|I am unable|"
                       r"Unfortunately,? I|As an AI)", re.I)
 
 
@@ -330,14 +480,434 @@ def _file_messages(p: dict, desc: str, plan: dict, rel: str, written: dict[str, 
     return msgs
 
 
-def _readme_messages(p: dict, desc: str, plan: dict, written: dict[str, str]) -> list[dict]:
+# ---------------------------------------------------------------- builds: editing a long file
+# A long file in a new version is changed by find/replace pairs that the Smithy applies itself, so
+# lines the model wasn't asked to change can't change (Nov 13: installer v7, v8 and v9, about 1,000
+# lines each, came back rewritten; v9 was given 11 exact edits and still dropped whole methods).
+EDIT_FORMAT = ("Reply with only the edits, each one in exactly this form:\n"
+               "<<<<<<< FIND\n(lines copied exactly from the current file, enough to be found only once)\n"
+               "=======\n(the lines that replace them; nothing here deletes them)\n>>>>>>> REPLACE\n"
+               "Copy the FIND lines character for character, with their indentation. Keep each edit small. "
+               "To add new lines, FIND the line just before where they go and REPLACE it with that same line "
+               "followed by the new ones. Don't send the whole file.")
+_EDIT = re.compile(r"<<<<<<< FIND[ \t]*\n([\s\S]*?)\n=======[ \t]*\n([\s\S]*?)\n?>>>>>>> REPLACE")
+
+
+def parse_edits(text: str) -> list[tuple[str, str]]:
+    """The (find, replace) pairs in a reply, in order."""
+    return [(m.group(1), m.group(2)) for m in _EDIT.finditer(text.replace("\r\n", "\n"))]
+
+
+def _find_once(body: str, find: str) -> tuple[int, int] | str:
+    """Where `find` is in `body`, as (start, end); or why it can't be used. Exact first; then line by
+    line ignoring spaces at the ends of lines (models often get indentation or trailing spaces wrong).
+    It has to be found exactly once."""
+    if not find.strip():
+        return "the FIND part is empty"
+    if len(re.sub(r"[^A-Za-z0-9]", "", find)) < 3:              # Nov 13, v13: a bare ``` fence as the anchor
+        return "its FIND text is too short to be sure where it goes (include the line above it)"
+    lines = body.split("\n")
+
+    def twice(line_nums: list[int]) -> str:
+        # say where each copy is, with the line above it, so the next try can pick the right one (Nov 14,
+        # installer v14: the 3 edits that missed were the window-size ones, "this.MaximizeBox = false;" twice)
+        where = "; ".join(f"line {i + 1}, below \"{next((l.strip() for l in reversed(lines[:i]) if l.strip()), '')[:70]}\""
+                          for i in line_nums[:4])
+        return (f"its FIND text is in the file {len(line_nums)} times ({where}): start the FIND with the line "
+                "above the one you mean")
+
+    n = body.count(find)
+    if n == 1:
+        i = body.index(find)
+        return i, i + len(find)
+    if n > 1:
+        return twice([body.count("\n", 0, m.start()) for m in re.finditer(re.escape(find), body)])
+    want = [l.strip() for l in find.strip("\n").split("\n")]
+    starts = [0]
+    for l in lines:
+        starts.append(starts[-1] + len(l) + 1)
+    hits = [i for i in range(len(lines) - len(want) + 1)
+            if all(lines[i + k].strip() == want[k] for k in range(len(want)))]
+    if len(hits) == 1:
+        i = hits[0]
+        return starts[i], starts[i + len(want)] - 1                 # whole lines, without the last newline
+    if len(hits) > 1:
+        return twice(hits)
+    return "its FIND text isn't in the file"
+
+
+def _reindent(repl: str, indent: str, first_has_it: bool) -> str:
+    """REPLACE lines that came back at the left margin get the indentation of the line they replace
+    (brace languages only; Nov 14, installer v14: every inserted line lost its indentation).
+    C# / C preprocessor lines (#if, #region) stay at the margin."""
+    out = []
+    for i, l in enumerate(repl.split("\n")):
+        if l.strip() and not l[:1].isspace() and not l.startswith("#") and not (i == 0 and first_has_it):
+            l = indent + l
+        out.append(l)
+    return "\n".join(out)
+
+
+def apply_edits(body: str, edits: list[tuple[str, str]], brace: bool = False) -> tuple[str, int, list[str]]:
+    """Apply the pairs in order. Returns (new body, how many applied, problems for the ones that weren't).
+    A pair that can't be found exactly once is skipped, never guessed. brace: a brace language (C#, JS,
+    PHP, PowerShell, CSS...), where lines that lost their indentation get it back."""
+    done, problems = 0, []
+    for k, (find, repl) in enumerate(edits, 1):
+        where = _find_once(body, find)
+        if isinstance(where, str):
+            first = next((l.strip() for l in find.split("\n") if l.strip()), "")[:80]
+            problems.append(f"edit {k} (FIND starting \"{first}\"): {where}")
+            continue
+        a, b = where
+        line_start = body.rfind("\n", 0, a) + 1
+        if brace and repl.strip():
+            line_end = body.find("\n", line_start)
+            here = body[line_start:line_end if line_end >= 0 else len(body)]
+            indent = here[:len(here) - len(here.lstrip())]
+            if indent and not body[line_start:a].strip():
+                # the first REPLACE line already sits after the file's own indentation when FIND began after it
+                repl = _reindent(repl, indent, first_has_it=a > line_start)
+        if not body[line_start:a].strip() and repl[:1] in (" ", "\t"):
+            a = line_start              # FIND left out the indentation but REPLACE has it: don't double it
+        if not repl and a == line_start and body[b:b + 1] == "\n":
+            b += 1                      # deleting whole lines: take their line break too
+        body = body[:a] + repl + body[b:]
+        done += 1
+    return body, done, problems
+
+
+def _edit_messages(p: dict, desc: str, plan: dict, rel: str, written: dict[str, str], old: str,
+                   what: str = "", cap: int = 8000) -> list[dict]:
+    """`cap`: characters of each file already written to show (a README needs to see the code)."""
+    flavour = ("\n\n" + JOOMLA) if p.get("joomla") else ""
+    listing = "\n".join(f"- {f['path']}: {f['purpose']}" for f in plan["files"])
+    others = "\n\n".join(f"--- {path} ---\n{body[:cap]}" + ("\n(... cut here)" if len(body) > cap else "")
+                         for path, body in written.items())
+    csharp = CSHARP5 if rel.lower().endswith(".cs") and _WINDOWS_CSC.search(
+        " ".join([str(p.get("request", "")), str(p.get("change", "")), desc, old] + list(written.values()))) else ""
+    msgs = [{"role": "system", "content": SYSTEM + flavour},
+            {"role": "user", "content": f"The project: {redact(p['request'])}\n\nThe design:\n{desc[:4000]}\n\n"
+                                        f"All its files:\n{listing}"}]
+    if others:
+        msgs.append({"role": "user", "content": "Files already written for this version:\n" + others})
+    msgs.append({"role": "user", "content": f"The current {rel} (the whole file):\n```\n{old}\n```"})
+    msgs.append({"role": "user", "content": f"The change wanted: {redact(p.get('change', ''))}\n\n"
+                                            + (what or f"Change {rel} only where the change needs it")
+                                            + f"; every other line stays exactly as it is.{csharp}\n\n{EDIT_FORMAT}"})
+    return msgs
+
+
+def _edit_file(ctx, job_id: int, msgs: list[dict], rel: str, old: str,
+               none_ok: bool = True) -> tuple[str, str]:
+    """A long file changed by find/replace pairs. Returns (new body, a note for the result).
+    No edits at all: the file is kept as it was (the plan can call a file "changed" that the change
+    doesn't touch; Nov 13, task 18 failed on that), or with none_ok=False, ValueError."""
+    steps.info("Editing %s: asking for the changes as edits.", rel)
+    reply = ctx.chat(msgs, 6000)
+    edits = parse_edits(reply)
+    if not edits:
+        if none_ok:
+            log.info("build %d: %s, no edits sent; kept as it was", job_id, rel)
+            steps.info("%s needs no change; kept exactly as it was.", rel)
+            return old, f"`{rel}`: no edits sent, so kept exactly as it was"
+        raise ValueError(f"the changes to {rel} didn't come back as edits I could apply")
+    brace = Path(rel).suffix.lower() in _BRACES
+    body, done, problems = apply_edits(old, edits, brace)
+    if problems:                                          # one more try for the ones that missed
+        log.info("build %d: %s, %d of %d edits applied; asking again for %d", job_id, rel, done, len(edits),
+                 len(problems))
+        steps.info("%s: %d of %d edits went in; %d couldn't be found, asking again for %s.", rel, done, len(edits),
+                   len(problems), "it" if len(problems) == 1 else "them")
+        again = ctx.chat(msgs + [{"role": "assistant", "content": reply},
+                                 {"role": "user", "content":
+                                  "These edits couldn't be applied, so they weren't:\n- " + "\n- ".join(problems)
+                                  + f"\n\nThe others are already in. Here is {rel} now:\n```\n{body}\n```\n\n"
+                                  "Send only the missed edits again, with the FIND lines copied exactly from it. "
+                                  + EDIT_FORMAT}], 6000)
+        more = parse_edits(again)
+        body, done2, problems = apply_edits(body, more, brace)
+        done += done2
+    note = f"`{rel}`: changed by {done} edit{'s' if done != 1 else ''}; every other line kept as it was"
+    if problems:
+        note += ". **Not applied (couldn't be found exactly once):** " + "; ".join(problems)
+    log.info("build %d: %s, %d edits applied, %d not", job_id, rel, done, len(problems))
+    steps.info("%s: %d edit%s in%s; every other line kept.", rel, done, "" if done == 1 else "s",
+               f", {len(problems)} left out" if problems else "")
+    return body, note
+
+
+# ---------------------------------------------------------------- builds: checking before the README
+# Nov 14, installer v14: 11 numbered changes asked, 4 made, it didn't compile, and the README said
+# all of it was done. So a build is now compiled / parsed (never run), the numbered changes are
+# checked off, one round of edits goes to whatever failed, and the README is told the truth.
+_CSC = [Path(os.environ.get("SystemRoot", r"C:\Windows")) / "Microsoft.NET" / fw / "v4.0.30319" / "csc.exe"
+        for fw in ("Framework64", "Framework")]
+_CSC_REFS = ["System.dll", "System.Core.dll", "System.Data.dll", "System.Drawing.dll",
+             "System.Windows.Forms.dll", "System.Xml.dll"]
+_CSC_ERR = re.compile(r"^(.*?)\((\d+),\d+\): error (CS\d+): (.*)$")
+_NO_WINDOW = 0x08000000                                     # CREATE_NO_WINDOW
+_BRACES = {".cs", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".php", ".ps1", ".psm1", ".css", ".scss", ".java", ".c", ".h"}
+
+
+_SCRIPT_EXT = (".ps1", ".bat", ".cmd", ".sh")
+_CS_NAME = re.compile(r"[\w.\\/*-]*\.cs\b", re.I)
+_CS_TARGET = re.compile(r"[/-](?:target|t):(winexe|exe|library)\b", re.I)
+_CS_REF = re.compile(r"[/-](?:r|reference):[\"'`]?([\w.-]+\.dll)", re.I)
+
+
+def csc_script(folder: Path, rels: list[str]) -> dict | None:
+    """The build's own script that runs csc (a .ps1 / .bat / .cmd that names csc), and what it compiles:
+    {"script": rel, "files": [the .cs rels it names], "missing": [.cs names it names that aren't in the
+    build], "target": "winexe" | "exe" | "library", "refs": [dlls]}. None when there's no such script.
+    Nov 14: a new file the script never compiled still passed the check, which compiled every .cs."""
+    cs = [r for r in rels if r.lower().endswith(".cs")]
+    for rel in rels:
+        if not rel.lower().endswith(_SCRIPT_EXT):
+            continue
+        text = (folder / rel).read_text(encoding="utf-8-sig", errors="replace")
+        if not re.search(r"\bcsc(?:\.exe)?\b", text, re.I):
+            continue
+        named = {Path(n.replace("\\", "/")).name.lower() for n in _CS_NAME.findall(text)}
+        if any("*" in n for n in named):                # "*.cs": everything
+            files = cs
+        else:
+            files = [r for r in cs if Path(r).name.lower() in named]
+        have = {Path(r).name.lower() for r in cs}
+        missing = sorted(n for n in named if "*" not in n and n not in have)
+        t = _CS_TARGET.search(text)
+        return {"script": rel, "files": files, "missing": missing, "target": t.group(1).lower() if t else "library",
+                "refs": sorted({m.lower() for m in _CS_REF.findall(text)})}
+    return None
+
+
+def _cs_errors(folder: Path, rels: list[str], target: str = "library", refs=()) -> list[str] | None:
+    """Errors from compiling the build's C# files together, or None when there's no compiler."""
+    csc = next((c for c in _CSC if c.exists()), None)
+    if csc is None:
+        return None
+    with tempfile.TemporaryDirectory(prefix="smithy-check-") as tmp:
+        out_name = "check.dll" if target == "library" else "check.exe"
+        all_refs = list(dict.fromkeys([r.lower() for r in _CSC_REFS] + [r.lower() for r in refs]))
+        args = [str(csc), "/nologo", "/target:" + target, "/out:" + str(Path(tmp) / out_name)] + \
+               ["/r:" + r for r in all_refs] + [str(folder / r) for r in rels]
+        try:
+            out = subprocess.run(args, capture_output=True, text=True, timeout=120, cwd=tmp,
+                                 creationflags=_NO_WINDOW).stdout
+        except Exception as e:
+            return [f"the C# compiler couldn't be run ({e})"]
+    errors = []
+    for line in out.splitlines():
+        m = _CSC_ERR.match(line.strip())
+        if m:
+            try:
+                where = Path(m.group(1)).resolve().relative_to(folder.resolve()).as_posix()
+            except ValueError:
+                where = Path(m.group(1)).name
+            errors.append(f"{where} line {m.group(2)}: {m.group(3)}: {m.group(4)}")
+    return errors
+
+
+_PS_PARSE = ("$ErrorActionPreference = 'SilentlyContinue'\n"
+             "foreach ($p in $env:SMITHY_PARSE.Split('|')) { $e = $null\n"
+             "  [void][System.Management.Automation.Language.Parser]::ParseFile($p, [ref]$null, [ref]$e)\n"
+             "  foreach ($x in $e) { '{0}|{1}|{2}' -f $p, $x.Extent.StartLineNumber, $x.Message } }")
+
+
+def _ps_errors(folder: Path, rels: list[str]) -> list[str] | None:
+    """Parse errors in the build's PowerShell files (Windows PowerShell 5.1's own parser; nothing is run)."""
+    paths = {str((folder / r).resolve()): r for r in rels}
+    try:
+        out = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand",
+             base64.b64encode(_PS_PARSE.encode("utf-16-le")).decode()],
+            capture_output=True, text=True, timeout=120, creationflags=_NO_WINDOW,
+            env={**os.environ, "SMITHY_PARSE": "|".join(paths)}).stdout
+    except Exception:
+        return None
+    errors = []
+    for line in out.splitlines():
+        path, _, rest = line.partition("|")
+        num, _, msg = rest.partition("|")
+        if num.strip().isdigit():
+            errors.append(f"{paths.get(path, Path(path).name)} line {num}: {msg.strip()}")
+    return errors
+
+
+def build_problems(folder: Path, rels: list[str]) -> tuple[list[str], list[str]]:
+    """(problems, what was checked). C# compiled together, PowerShell / Python / JSON parsed. Nothing runs."""
+    problems, checked = [], []
+    cs = [r for r in rels if r.lower().endswith(".cs")]
+    script = csc_script(folder, rels) if cs else None
+    if script:                                          # exactly what the build's own script compiles
+        for r in cs:
+            if r not in script["files"]:
+                problems.append(f"{script['script']} line 1: it doesn't compile {r}, so none of that file's code "
+                                "is in the program: add it to the files this script compiles")
+        for n in script["missing"]:
+            problems.append(f"{script['script']} line 1: it compiles {n}, which isn't in the build")
+        cs = script["files"]
+    if cs:
+        errs = _cs_errors(folder, cs, script["target"] if script else "library", script["refs"] if script else ())
+        if errs is None:
+            checked.append("C# not checked (no compiler on this PC)")
+        else:
+            problems += errs
+            checked.append(f"C# compiled together ({len(cs)} file{'s' if len(cs) != 1 else ''}"
+                           + (f", as {script['script']} compiles it: /target:{script['target']}" if script else "")
+                           + ")")
+    ps = [r for r in rels if r.lower().endswith((".ps1", ".psm1"))]
+    if ps:
+        errs = _ps_errors(folder, ps)
+        if errs is None:
+            checked.append("PowerShell not checked")
+        else:
+            problems += errs
+            checked.append(f"PowerShell parsed ({len(ps)})")
+    for r in rels:
+        low = r.lower()
+        if not low.endswith((".py", ".json")):
+            continue
+        text = (folder / r).read_text(encoding="utf-8-sig", errors="replace")
+        try:
+            if low.endswith(".py"):
+                compile(text, r, "exec")                    # parsed only, never run
+            else:
+                json.loads(text)
+        except SyntaxError as e:
+            problems.append(f"{r} line {e.lineno}: {e.msg}")
+        except json.JSONDecodeError as e:
+            problems.append(f"{r} line {e.lineno}: {e.msg}")
+    if any(r.lower().endswith((".py", ".json")) for r in rels):
+        checked.append("Python / JSON parsed")
+    return problems, checked
+
+
+_ITEM = re.compile(r"(?m)^\s*(\d{1,2})[.)]\s+(\S.*)$")
+_TICK = re.compile(r"(?mi)^[^\w\n]*(?:item[ \t]*)?(\d{1,2})[ \t]*[:.)\-][ \t]*\**(DONE|MISSING)\**\b[ \t:\-â€“]*([^\n]*)$")
+
+
+def numbered_items(change: str) -> dict[int, str]:
+    """The numbered changes in a request ("1. ...", "2) ..."), each with its following lines."""
+    items, marks = {}, list(_ITEM.finditer(change or ""))
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(change)
+        items[int(m.group(1))] = change[m.start():end].strip()
+    return items
+
+
+def _checklist(ctx, p: dict, desc: str, plan: dict, written: dict[str, str], items: dict[int, str],
+               cap: int) -> dict[int, tuple[str, str]]:
+    """{item number: ("DONE" | "MISSING" | "NOT SAID", note)} for the numbered changes, from the files as they are."""
+    files = "\n\n".join(f"--- {path} ---\n{body[:cap]}" + ("\n(... cut here)" if len(body) > cap else "")
+                        for path, body in written.items() if not path.lower().endswith(".md"))
+    reply = ctx.chat([{"role": "system", "content": SYSTEM},
+                      {"role": "user", "content": f"The project: {redact(p['request'])}\n\nIts files now:\n\n{files}"},
+                      {"role": "user", "content":
+                       "These changes were asked for:\n\n" + redact("\n".join(items.values())) +
+                       "\n\nCheck the files above, not the request: for each numbered change, reply with one line, "
+                       "exactly \"N: DONE\" or \"N: MISSING - the file and what's missing\". Only DONE when the code "
+                       "above really does it. No other text."}], 1500)
+    got = {int(m.group(1)): (m.group(2).upper(), m.group(3).strip()[:200]) for m in _TICK.finditer(reply)}
+    return {n: got.get(n, ("NOT SAID", "")) for n in items}
+
+
+def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path, written: dict[str, str],
+                  cap: int, only: dict[int, str] | None = None,
+                  rounds: int | None = None) -> tuple[list[str], str, list[str]]:
+    """Check the build before its README, and keep fixing until it checks clean (the user, Nov 14: nothing
+    passes as complete until it does). Each round: the numbered changes checked off, then compile / parse;
+    edits for whatever failed; up to `build_check_rounds` rounds (default 3).
+    Returns (notes for the result, the truth for the README, what's still wrong: empty = checks clean)."""
+    notes = []
+    code = [r for r in written if not r.lower().endswith(".md")]
+    rounds = max(1, int(rounds or ctx.cfg.get("build_check_rounds", 3)))
+    # `only`: one stage's changes (a staged build checks each stage before the next)
+    items = only if only is not None else numbered_items(p.get("change", "")) if p.get("parent_id") else {}
+    use_list = len(items) >= (1 if only is not None else 2)
+
+    def fix(rel: str, what: str) -> None:
+        body, note = _edit_file(ctx, job_id, _edit_messages(p, desc, plan, rel, written, written[rel], what, cap),
+                                rel, written[rel])
+        if body != written[rel]:
+            inside(folder, rel).write_text(body, encoding="utf-8")
+            written[rel] = body
+        notes.append(note)
+
+    def check() -> tuple[dict[int, tuple[str, str]], list[str], list[str]]:
+        ticks = _checklist(ctx, p, desc, plan, written, items, cap) if use_list else {}
+        problems, checked = build_problems(folder, code)
+        return ticks, problems, checked
+
+    if use_list:
+        steps.info("Checking the %d changes asked for against the files.", len(items))
+    ticks, problems, checked = check()
+    for rnd in range(1, rounds + 1):
+        missing = [n for n, (state, _) in ticks.items() if state != "DONE"]
+        if not missing and not problems:
+            break
+        steps.info("Check round %d of %d: %s; asking for fixes.", rnd, rounds, ", ".join(filter(None, [
+            f"{len(missing)} change{'s' if len(missing) != 1 else ''} not in the files yet" if missing else "",
+            f"{len(problems)} build problem{'s' if len(problems) != 1 else ''}" if problems else ""])))
+        if missing:                                          # each to the file the check named, else the longest
+            by_file: dict[str, list[int]] = {}
+            for n in missing:
+                said = ticks[n][1].lower()
+                rel = next((r for r in code if r.lower() in said or Path(r).name.lower() in said),
+                           max(code, key=lambda r: len(written[r])) if code else None)
+                if rel:
+                    by_file.setdefault(rel, []).append(n)
+            for rel, nums in by_file.items():
+                fix(rel, "Make only these changes, which aren't in the file yet:\n\n" + "\n\n".join(items[n] for n in nums))
+        if problems:
+            problems, checked = build_problems(folder, code)    # again: the edits above may have changed them
+            for rel in code:
+                mine = [x for x in problems if x.startswith(rel + " ")]
+                if mine:
+                    fix(rel, "Fix only these build errors (Windows' own C# compiler / PowerShell parser); every "
+                             "other line stays exactly as it is. If a class is defined twice across files, keep "
+                             "one:\n- " + "\n- ".join(mine[:30]))
+        ticks, problems, checked = check()
+
+    # what's true now, for the result and the README
+    left, truth = [], []
+    not_done = [n for n, (s, _) in ticks.items() if s != "DONE"]
+    if problems:
+        left.append(f"{len(problems)} build problem{'s' if len(problems) != 1 else ''}")
+        notes.append(f"**Build check ({'; '.join(checked)}): {len(problems)} problem"
+                     f"{'s' if len(problems) != 1 else ''} left:** " + "; ".join(problems[:15]))
+        truth.append("It does NOT build yet. The build check found:\n- " + "\n- ".join(problems[:15]))
+    elif checked:
+        notes.append(f"**Build check passed:** {'; '.join(checked)}. Nothing was run.")
+        truth.append("Build check passed (" + "; ".join(checked) + "). Nothing has been run.")
+    else:
+        notes.append("**Build check:** none of these file types can be checked automatically here.")
+    if ticks:
+        done = [n for n in ticks if n not in not_done]
+        if not_done:
+            left.append(f"{len(not_done)} of {len(ticks)} changes not done ({', '.join(map(str, not_done))})")
+        notes.append(f"**Changes asked for:** {len(done)} of {len(ticks)} done"
+                     + (". **Not done:** " + "; ".join(f"{n} ({ticks[n][1] or ticks[n][0].lower()})" for n in not_done)
+                        if not_done else "."))
+        truth.append("Of the numbered changes asked for, these are DONE: " + (", ".join(map(str, done)) or "none")
+                     + (". These are NOT done, so don't describe them as done; list them under \"Not done yet\": "
+                        + "; ".join(items[n].split("\n")[0][:160] for n in not_done) if not_done else "."))
+    steps.info("Checks clean." if not left else "Still not clean after %d round%s: %s.", *(
+        () if not left else (rounds, "" if rounds == 1 else "s", "; ".join(left))))
+    return notes, "\n".join(truth), left
+
+
+def _readme_messages(p: dict, desc: str, plan: dict, written: dict[str, str], truth: str = "") -> list[dict]:
     flavour = ("\n\n" + JOOMLA) if p.get("joomla") else ""
     listing = "\n".join(f"- {path} ({len(body.splitlines())} lines)" for path, body in written.items())
     return [{"role": "system", "content": SYSTEM + flavour},
             {"role": "user", "content": f"The project: {redact(p['request'])}\n\nThe design:\n{desc[:4000]}\n\n"
-                                        f"Its files:\n{listing}\n\nWrite its README.md: what it is, what each file "
+                                        f"Its files:\n{listing}\n\n"
+                                        + (f"What's checked to be true now:\n{truth}\n\n" if truth else "")
+                                        + "Write its README.md: what it is, what each file "
                                         "does, where each file goes in the real project, how to install or use "
-                                        "it, and anything to check first. Plain markdown, no outer code fence."}]
+                                        "it, and anything to check first. Describe only what the files really do. "
+                                        "Plain markdown, no outer code fence."}]
 
 
 def _parent_build(parent_id: int) -> dict | None:
@@ -355,6 +925,23 @@ def _parent_build(parent_id: int) -> dict | None:
     return {"row": row, "folder": folder, "plan": saved["plan"], "desc": saved.get("desc", ""),
             "params": json.loads(row["params"] or "{}"),
             "readme": readme.read_text(encoding="utf-8", errors="replace") if readme.exists() else ""}
+
+
+def first_params(parent_id: int) -> dict:
+    """The first version's params (its request, joomla, path), found by walking back through the
+    versions (a version's own params hold only its change: from the third version on, "The project:"
+    lost what it was; Nov 14, review item 3)."""
+    seen, pid = set(), parent_id
+    while pid and pid not in seen:
+        seen.add(pid)
+        row = SMITHY.get(int(pid))
+        if row is None:
+            break
+        pp = json.loads(row["params"] or "{}")
+        if pp.get("request"):
+            return pp
+        pid = pp.get("parent_id")
+    return {}
 
 
 def run_build(ctx, p: dict):
@@ -376,8 +963,10 @@ def run_build(ctx, p: dict):
     if p.get("parent_id") and parent is None:
         raise ValueError(f"Smithy task {p['parent_id']} isn't a build I can make a new version of")
     if parent:
-        p = {**parent["params"], **p, "request": parent["params"].get("request", "") +
-             f"\n\nNew version: {p['change']}"}
+        first = {k: v for k, v in first_params(p["parent_id"]).items() if k in ("request", "joomla")}
+        p = {**first, **parent["params"], **p, "request": (first.get("request") or
+                                                          "(the first version's request wasn't found)")
+             + f"\n\nNew version {p.get('version', '')}: {p['change']}"}
 
     # 1. the plan (kept, so a paused build carries on instead of starting again)
     if plan_path.exists():
@@ -385,6 +974,7 @@ def run_build(ctx, p: dict):
         summary, desc, plan = saved["summary"], saved["desc"], saved["plan"]
     else:
         ctx.step(0.0, 0.10)
+        steps.info("Planning the %s.", "new version" if parent else "build")
         msgs = _plan_messages(p, max_files, parent)
         answer = ctx.chat(msgs, 1200)
         try:
@@ -392,6 +982,7 @@ def run_build(ctx, p: dict):
         except ValueError as problem:
             # one more try, saying what was wrong (small models sometimes drift)
             log.info("task %d: plan not usable (%s); asking again", job_id, problem)
+            steps.info("The plan couldn't be read; asking again.")
             again = ctx.chat(msgs + [{"role": "assistant", "content": answer},
                                      {"role": "user", "content": f"I can't use that plan: {problem}. Reply with only "
                                       "the corrected ```json block (name and files), with real relative paths, "
@@ -412,6 +1003,8 @@ def run_build(ctx, p: dict):
         if parent:
             plan["name"] = parent["plan"].get("name") or plan["name"]
         plan_path.write_text(json.dumps({"summary": summary, "desc": desc, "plan": plan}, indent=2), encoding="utf-8")
+        steps.info("Plan ready: %d file%s: %s, and the README.", len(plan["files"]), "" if len(plan["files"]) == 1 else "s",
+                   ", ".join(f["path"] for f in plan["files"]))
     version = int(p.get("version", 1))
     name = plan["name"] or slug(p["request"])
     folder = results / (f"{job_id:05d}-{name}" + (f"-v{version}" if version > 1 else ""))
@@ -421,6 +1014,16 @@ def run_build(ctx, p: dict):
     written: dict[str, str] = {}
     refused_files: list[str] = []
     cut_files: list[str] = []
+    edit_notes: list[str] = []
+    # an earlier file this long is changed by edits, not written again (0 turns it off)
+    edit_min = int(ctx.cfg.get("edit_min_chars", 4000)) or 10 ** 9
+    # A. a version with many numbered changes is built a few at a time (Nov 14: v14 got all 11 at once
+    # and made 4). The long files that are edited start as the earlier version; the stages edit them.
+    stage_size = max(1, int(ctx.cfg.get("build_stage_items", 3)))
+    all_items = numbered_items(p.get("change", "")) if parent else {}
+    staged = [f["path"] for f in plan["files"]
+              if len(all_items) > stage_size and f.get("change") != "same" and (parent["folder"] / f["path"]).exists()
+              and len(inside(parent["folder"], f["path"]).read_text(encoding="utf-8", errors="replace")) >= edit_min]
     n = len(plan["files"])
     for i, f in enumerate(plan["files"]):
         rel = f["path"]
@@ -431,12 +1034,25 @@ def run_build(ctx, p: dict):
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
         if f.get("change") == "same" and old_path is not None:
+            steps.info("%s stays the same: copied.", rel)
             shutil.copyfile(old_path, target)
             written[rel] = target.read_text(encoding="utf-8", errors="replace")
             continue
-        ctx.step(0.10 + 0.80 * i / n, 0.10 + 0.80 * (i + 1) / n)
+        if rel in staged:                                             # the stages below change it
+            shutil.copyfile(old_path, target)
+            written[rel] = target.read_text(encoding="utf-8", errors="replace")
+            continue
+        span = 0.40 if staged else 0.80
+        ctx.step(0.10 + span * i / n, 0.10 + span * (i + 1) / n)
         old = old_path.read_text(encoding="utf-8", errors="replace") if old_path else None
+        if old is not None and len(old) >= edit_min:
+            body, note = _edit_file(ctx, job_id, _edit_messages(p, desc, plan, rel, written, old), rel, old)
+            edit_notes.append(note)
+            target.write_text(body, encoding="utf-8")
+            written[rel] = body
+            continue
         msgs = _file_messages(p, desc, plan, rel, written, budget, old)
+        steps.info("Writing %s (file %d of %d).", rel, i + 1, n)
         text = ctx.chat(msgs, 3000)
         # a reply cut off part way (a code block opened but never closed: the model or the provider
         # hit its length limit): ask it to carry on where it stopped, a few times
@@ -449,6 +1065,7 @@ def run_build(ctx, p: dict):
             if "\n" in text and not text.endswith("\n"):
                 text = text[:text.rindex("\n") + 1]
             last = next((l for l in reversed(text.split("\n")) if l.strip()), "")
+            steps.info("%s was cut off part way; asking it to carry on.", rel)
             more = ctx.chat(msgs + [{"role": "assistant", "content": text},
                                     {"role": "user", "content": "That was cut off. The last complete line was:\n"
                                      + last + "\nContinue with the line right after it. Don't start the file over: "
@@ -457,34 +1074,111 @@ def run_build(ctx, p: dict):
             text = _join_continued(text, more)
         if not rel.lower().endswith(".md") and text.count("```") % 2:   # still cut off: say so, don't hide it
             log.warning("build %d: %s is still cut off after 4 tries to continue", job_id, rel)
+            steps.info("%s is still cut off after 4 tries; it's marked as needing finishing.", rel)
             cut_files.append(rel)
         body = _strip_outer_fence(text, rel.lower().endswith(".md"))
         if _refusal(body):                              # the model couldn't write it: leave it out, say so
             log.warning("build %d: %s left out (the model said it can't write it)", job_id, rel)
+            steps.info("%s left out: the model said it can't write it.", rel)
             refused_files.append(rel)
             continue
         target.write_text(body, encoding="utf-8")
         written[rel] = body
+        nl = len(body.splitlines())
+        steps.info("%s written: %d line%s.", rel, nl, "" if nl == 1 else "s")
 
-    # 3. the README, last
+    # 2b. the stages (A): a few numbered changes at a time, each stage checked (and fixed) before the
+    # next starts. Kept after each stage, so a paused build carries on at the next one.
+    stage_notes: list[str] = []
+    if staged:
+        stage_path = results / f"{job_id:05d}-stages.json"
+        nums = sorted(all_items)
+        chunks = [nums[k:k + stage_size] for k in range(0, len(nums), stage_size)]
+        saved_stages = json.loads(stage_path.read_text(encoding="utf-8")) if stage_path.exists() else {}
+        done_stages, stage_notes = int(saved_stages.get("done", 0)), list(saved_stages.get("notes", []))
+        for s in range(done_stages, len(chunks)):
+            ctx.step(0.50 + 0.36 * s / len(chunks), 0.50 + 0.36 * (s + 1) / len(chunks))
+            part = {k: all_items[k] for k in chunks[s]}
+            steps.info("Stage %d of %d: changes %s.", s + 1, len(chunks), ", ".join(map(str, chunks[s])))
+            ps = {**p, "change": "\n\n".join(part.values())}  # only this stage's changes
+            for rel in staged:
+                body, note = _edit_file(ctx, job_id, _edit_messages(
+                    ps, desc, plan, rel, written, written[rel],
+                    f"This is stage {s + 1} of {len(chunks)}: make only the changes above now (the others come in "
+                    f"their own stages). If none of them belong in {rel}, send no edits", budget), rel, written[rel])
+                if body != written[rel]:
+                    inside(folder, rel).write_text(body, encoding="utf-8")
+                    written[rel] = body
+                stage_notes.append(f"stage {s + 1}: {note}")
+            notes_s, _, left_s = _verify_build(ctx, job_id, ps, desc, plan, folder, written, budget, only=part,
+                                               rounds=int(ctx.cfg.get("build_stage_rounds", 2)))
+            stage_notes.append(f"stage {s + 1} (changes {', '.join(map(str, chunks[s]))}): "
+                               + ("checks clean" if not left_s else "not clean yet: " + "; ".join(left_s)))
+            stage_path.write_text(json.dumps({"done": s + 1, "notes": stage_notes}, indent=2), encoding="utf-8")
+        steps.info("All %d stages done; checking the whole version.", len(chunks))
+
+    # 3. the checks: keep fixing until it checks clean (kept, so a paused build doesn't check again)
+    check_path = results / f"{job_id:05d}-check.json"
     readme = inside(folder, "README.md")
+    if check_path.exists() and readme.exists():
+        saved_check = json.loads(check_path.read_text(encoding="utf-8"))
+        check_notes, truth, left = saved_check["notes"], saved_check["truth"], saved_check["left"]
+    else:
+        ctx.step(0.86, 0.90)
+        check_notes, truth, left = _verify_build(ctx, job_id, p, desc, plan, folder, written, budget)
+        check_path.write_text(json.dumps({"notes": check_notes, "truth": truth, "left": left}, indent=2),
+                              encoding="utf-8")
+
+    # 4. the README, last, told what's true
     if not readme.exists():
         ctx.step(0.90, 0.95)
-        readme.write_text(_strip_outer_fence(ctx.chat(_readme_messages(p, desc, plan, written), 1500), True),
-                          encoding="utf-8")
+        old_readme = parent["readme"] if parent else ""
+        text = None
+        if len(old_readme) >= edit_min:
+            # a new version: the earlier README edited, not written again (Nov 13, installer v10: the
+            # code came back exactly right by edits, the rewritten README described another program)
+            try:
+                text, note = _edit_file(ctx, job_id, _edit_messages(
+                    p, desc, plan, "README.md", written, old_readme,
+                    "Change README.md so it describes this version: what the change wanted alters, and anything "
+                    "in it that the files written for this version show is wrong. Describe only what the files "
+                    "really do" + (f".\n\nWhat's checked to be true now:\n{truth}\n\nThe README must agree with "
+                                   "this" if truth else ""), cap=budget), "README.md", old_readme, none_ok=False)
+                edit_notes.append(note)
+            except ValueError as e:                     # no usable edits: write it whole, as before
+                log.info("build %d: README edits not usable (%s); writing it whole", job_id, e)
+                steps.info("No usable README edits came back; writing it whole instead.")
+        if text is None:
+            steps.info("Writing the README.")
+            text = _strip_outer_fence(ctx.chat(_readme_messages(p, desc, plan, written, truth), 1500), True)
+        readme.write_text(text, encoding="utf-8")
 
     files = sorted(written) + ["README.md"]
+    if cut_files or refused_files:                    # incomplete files count against "checks clean" too
+        left = left + [f"{len(cut_files) + len(refused_files)} file(s) cut off or left out"]
+    if edit_notes:
+        desc += "\n\n**Edited, not rewritten:**\n" + "\n".join(f"- {n}" for n in edit_notes)
+    if stage_notes:
+        desc += "\n\n**Built in stages:**\n" + "\n".join(f"- {n}" for n in stage_notes)
+    if check_notes:
+        desc += "\n\n**Checks:**\n" + "\n".join(f"- {n}" for n in check_notes)
     if cut_files:
         desc += "\n\n**Cut off (incomplete, needs finishing):** " + ", ".join(f"`{r}`" for r in cut_files)
     if refused_files:
         desc += "\n\n**Left out (the model said it couldn't write them):** " + ", ".join(f"`{r}`" for r in refused_files)
     what = "Joomla override" if p.get("joomla") else "project"
-    spoken = (f"I built {'version ' + str(version) + ' of ' if version > 1 else ''}the {what} called "
-              f"{name.replace('-', ' ')}: {len(files)} files, in its own folder in the Smithy's drafts. "
-              "Nothing has been installed or run. " + plain_summary(summary, 2))
+    called = f"{'version ' + str(version) + ' of ' if version > 1 else ''}the {what} called {name.replace('-', ' ')}"
+    if left:                                          # never passed as complete until it checks clean
+        spoken = (f"{called[:1].upper()}{called[1:]} is NOT complete: it doesn't check clean yet ("
+                  f"{'; '.join(left)}). The draft is in its own folder in The Smithy's drafts. "
+                  "Nothing has been installed or run.")
+    else:
+        spoken = (f"I built {called}: {len(files)} files, in its own folder in The Smithy's drafts, and it checks "
+                  "clean. Nothing has been installed or run. " + plain_summary(summary, 2))
     written["README.md"] = readme.read_text(encoding="utf-8", errors="replace")
     listing = "\n".join(f"- `{rel}` ({len(written[rel].splitlines())} lines)" for rel in files)
-    full = (f"**Folder:** `{folder}`\n\n{desc}\n\n### Files\n\n{listing}\n\n"
+    full = ((f"**{NOT_COMPLETE}:** {'; '.join(left)}. Details under Checks.\n\n" if left else "")
+            + f"**Folder:** `{folder}`\n\n{desc}\n\n### Files\n\n{listing}\n\n"
             "Copy what you want into place yourself; nothing here has been installed, run or applied.")
     return spoken, full, folder
 
@@ -513,6 +1207,7 @@ def _check_followup_any(p):
 def _run_followup(ctx, p):
     if "change" in p:                                        # a new version of a build
         return run_build(ctx, p)
+    steps.info("Writing the answer.")
     summary, full = split_result(ctx.chat(_followup_messages(p), 1000))
     return summary, full, None
 
@@ -544,10 +1239,12 @@ REGISTRY: dict[str, JobType] = {
                       lambda p: f"your {Path(p['path']).name} review", max_tokens=1500, coding=True),
     "fix": JobType("fix", "Draft a fix for a code file, as a diff (never applied).", "code",
                    _fix, lambda p: {"path": _file(p), "request": _text(p, "request", "what to fix")},
-                   lambda p: f"the fix for {Path(p['path']).name}", max_tokens=1500, artifact="diff", coding=True),
+                   lambda p: f"the fix for {Path(p['path']).name}", max_tokens=1500, artifact="diff", coding=True,
+                   run=_run_fix),                     # the diff is checked to apply (git apply --check), never applied
     "script": JobType("script", "Write a script (saved as a draft, never run).", "code",
                       _script, lambda p: {"request": _text(p, "request", "what the script should do", 3)},
-                      lambda p: "the script you asked for", max_tokens=1500, artifact="script", coding=True),
+                      lambda p: "the script you asked for", max_tokens=1500, artifact="script", coding=True,
+                      run=_run_script),               # parsed until it checks clean, never run
     "joomla": JobType("joomla", "A Joomla / YOOtheme override or CSS, in its own folder.", "code",
                       None, lambda p: _check_build(p, joomla=True), _title_build,
                       max_tokens=3000, run=_with_base_file(run_build), minutes_key="max_build_minutes", coding=True),

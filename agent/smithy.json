@@ -50,6 +50,8 @@
   "max_build_minutes": 180,
   "_max_build_files": "The most files one build may plan (the README is extra).",
   "max_build_files": 20,
+  "_edit_min_chars": "In a new version of a build, an earlier file at least this long (characters) is changed by find/replace edits that the Smithy applies itself, so lines it wasn't asked to change stay exactly as they were. Shorter files are written again. 0 turns edits off.",
+  "edit_min_chars": 4000,
   "max_attempts": 2,
   "_code_folders": "Folders the review, fix and Joomla tasks may read files from; private files inside them stay blocked (worker_files.py). Relative paths start from this folder; missing ones are skipped (../ui is the shared copy's layout).",
   "code_folders": [

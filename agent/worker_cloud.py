@@ -16,7 +16,10 @@ data", with these safeguards, all enforced here in code:
   unless "cloud.accept_data_use" lists them.
 - Token limits per task and per day ("max_tokens_per_task", "max_tokens_per_day"), and
   optional prices ("prices": {"deepseek": [input, output] dollars per million tokens}) with
-  "max_usd_per_day". The running total is in state\\cloud-usage.json.
+  "max_usd_per_day". The running total is in state\\cloud-usage.json. max_tokens_per_task
+  counts the whole task (every step, every provider; Nov 14), not each call.
+- A step too long for this PC's model (context_tokens) never goes to it: Ollama would drop the
+  start of it without a word. Switching keeps waiting for free tokens instead (Nov 14).
 
 Switching (approved Nov 13 2026): "cloud.switch_order" lists providers to use one after another.
 A task for provider "auto" (or for a provider on that list) starts with the first ready one and,
@@ -46,6 +49,7 @@ from dotenv import dotenv_values
 import worker_shared
 
 log = logging.getLogger("worker")
+steps = logging.getLogger("worker.step")      # plain step lines (worker_engine.StepFile: Progress window, Task Mode)
 HERE = Path(__file__).parent
 USAGE_PATH = HERE / "state" / "cloud-usage.json"
 
@@ -523,7 +527,7 @@ def pick(cfg: dict, raw_params: dict, task_type: str, local=None):
                 log.info("switch order: no provider ready; using the local model")
                 return None
             raise ValueError("no provider in the switch order is ready (Providers...: On, a key and a model)")
-        return Chain(links, local), "switching"
+        return Chain(links, local, int(cfg.get("context_tokens", 8192))), "switching"
     p = PROVIDERS.get(name)
     if p is None:
         raise ValueError(f"'{name}' isn't a provider I know (known: {', '.join(PROVIDERS)})")
@@ -559,9 +563,27 @@ def _usage() -> dict:
 def _today(u: dict) -> dict:
     day = time.strftime("%Y-%m-%d")
     if u.get("day") != day:
+        tasks = u.get("tasks") or {}                   # a task's own total outlasts the day
         u.clear()
-        u.update({"day": day, "providers": {}})
+        u.update({"day": day, "providers": {}, "tasks": tasks})
     return u
+
+
+# max_tokens_per_task counts the whole task, every step and every provider (Nov 14, review item 5:
+# it counted each call on its own, so a build's automatic fix rounds had no limit at all). The
+# running total is kept in the usage file under "tasks", so a pause or a retry carries it on.
+_TASK = {"key": ""}
+
+
+def begin_task(key: str) -> None:
+    """The task this worker is on now: "smithy:26" (worker and task number; each worker numbers its own)."""
+    _TASK["key"] = str(key or "")
+
+
+def task_tokens(key: str | None = None) -> int:
+    """Cloud tokens (in + out) the task has used so far."""
+    k = _TASK["key"] if key is None else key
+    return int(((_usage().get("tasks") or {}).get(k)) or 0) if k else 0
 
 
 def _cost(cc: dict, name: str, tin: int, tout: int) -> float:
@@ -571,6 +593,11 @@ def _cost(cc: dict, name: str, tin: int, tout: int) -> float:
 
 class BudgetOut(ValueError):
     """One of the user's own cloud limits is used up (no provider can help; the local model can)."""
+
+
+class ProviderCapOut(ValueError):
+    """One provider reached today's token cap (max_tokens_per_day counts each provider on its own,
+    Nov 13: as one total it stopped switching while Cerebras still had tokens). The next one can help."""
 
 
 class Refused(RuntimeError):
@@ -589,12 +616,17 @@ def _retry_after(headers) -> float:
 
 def _check_budget(cc: dict, name: str, task_tokens: int) -> None:
     u = _today(_usage())
-    used = sum(v.get("in", 0) + v.get("out", 0) for v in u["providers"].values())
-    usd = sum(v.get("usd", 0.0) for v in u["providers"].values())
-    if task_tokens > int(cc.get("max_tokens_per_task", 200_000)):
-        raise BudgetOut(f"this task went over max_tokens_per_task ({cc.get('max_tokens_per_task', 200_000):,})")
-    if used + task_tokens > int(cc.get("max_tokens_per_day", 1_000_000)):
-        raise BudgetOut(f"today's cloud limit is used up (max_tokens_per_day {cc.get('max_tokens_per_day', 1_000_000):,})")
+    mine = u["providers"].get(name) or {}
+    used = mine.get("in", 0) + mine.get("out", 0)                  # this provider's tokens today
+    usd = sum(v.get("usd", 0.0) for v in u["providers"].values())  # dollars: all providers together
+    so_far = int((u.get("tasks") or {}).get(_TASK["key"], 0)) if _TASK["key"] else 0
+    if so_far + task_tokens > int(cc.get("max_tokens_per_task", 200_000)):
+        raise BudgetOut(f"this task used its limit of {int(cc.get('max_tokens_per_task', 200_000)):,} cloud tokens "
+                        f"(max_tokens_per_task, the whole task; {so_far + task_tokens:,} so far)")
+    cap = int(cc.get("max_tokens_per_day", 1_000_000))
+    if used + task_tokens > cap:
+        who = PROVIDERS[name].spoken if name in PROVIDERS else name
+        raise ProviderCapOut(f"{who} reached today's limit of {cap:,} tokens (max_tokens_per_day, each provider)")
     if cc.get("max_usd_per_day") is not None and usd > float(cc["max_usd_per_day"]):
         raise BudgetOut(f"today's cloud spending limit is used up (${cc['max_usd_per_day']})")
 
@@ -606,6 +638,11 @@ def _record(cc: dict, name: str, tin: int, tout: int) -> None:
     v["out"] += tout
     v["calls"] += 1
     v["usd"] = round(v["usd"] + _cost(cc, name, tin, tout), 6)
+    if _TASK["key"]:
+        tasks = u.setdefault("tasks", {})
+        tasks[_TASK["key"]] = int(tasks.get(_TASK["key"], 0)) + tin + tout
+        for old in list(tasks)[:-50]:                  # only the last 50 tasks are kept
+            tasks.pop(old, None)
     USAGE_PATH.parent.mkdir(exist_ok=True)
     USAGE_PATH.write_text(json.dumps(u, indent=2), encoding="utf-8")
 
@@ -624,6 +661,12 @@ def _mark_out(name: str, seconds: float) -> None:
     u.setdefault("out", {})[name] = time.time() + seconds
     USAGE_PATH.parent.mkdir(exist_ok=True)
     USAGE_PATH.write_text(json.dumps(u, indent=2), encoding="utf-8")
+
+
+def _to_midnight() -> float:
+    """Seconds until the next day here (when today's usage is forgotten)."""
+    t = time.localtime()
+    return max(60.0, 24 * 3600 - (t.tm_hour * 3600 + t.tm_min * 60 + t.tm_sec))
 
 
 def _rest_for(e: Exception) -> float:
@@ -656,13 +699,50 @@ def out_choice(status_path: Path, task_id: int) -> str:
         return ""
 
 
+class TooLongForLocal(ValueError):
+    """A step too long for this PC's model: refused, and the task fails without a retry (it would be
+    the same again)."""
+
+
+def prompt_tokens(messages: list[dict]) -> int:
+    """About how many tokens the messages are (3.5 characters a token, as elsewhere here)."""
+    return int(sum(len(str(m.get("content", ""))) for m in messages) / 3.5)
+
+
+def too_long_for_local(messages: list[dict], cfg_or_ctx) -> str:
+    """Why this step can't go to this PC's model, or "" when it fits. The local model reads
+    context_tokens at most; Ollama drops the start of a longer prompt without a word (Nov 14,
+    review item 4: the installer, about 11,000 tokens, against this laptop's 8,192). 512 tokens are
+    kept for the answer to start in."""
+    ctx = int(cfg_or_ctx.get("context_tokens", 8192)) if isinstance(cfg_or_ctx, dict) else int(cfg_or_ctx or 8192)
+    need = prompt_tokens(messages)
+    if need <= ctx - 512:
+        return ""
+    return (f"this step is about {need:,} tokens and this PC's model reads about {ctx:,} at most "
+            "(context_tokens), so it would be cut off")
+
+
+def check_fits(messages: list[dict], max_tokens: int, cfg: dict) -> None:
+    """For a task on this PC's model: ValueError (the task fails, saying why) instead of a cut-off prompt."""
+    why = too_long_for_local(messages, cfg)
+    if why:
+        log.warning("step refused for this PC's model: %s", why)
+        steps.info("This step is too long for this PC's model: %s. To fix it: ask for less at once (fewer "
+                   "steps, items or files), or use a cloud provider, or a model with more context.",
+                   why.split(", so")[0])
+        raise TooLongForLocal("this task's prompt was too long for this PC's model, so it wasn't sent (it would have "
+                         f"been cut off): {why.split(', so')[0]}. Ask for less at once (fewer steps, items or "
+                         "files), or use a cloud provider (Switching), or a model with more context (context_tokens)")
+
+
 class Chain:
     """The switch order as one back end: each step goes to the first provider that still has free
     tokens; when one says it's out, the same step goes to the next, and last to this PC's model.
     A step always carries the whole job so far, so switching loses nothing."""
 
-    def __init__(self, links: list, local=None):
+    def __init__(self, links: list, local=None, local_ctx: int = 8192):
         self.links, self.local = links, local          # links: [(name, spoken, backend, model)]
+        self.local_ctx = local_ctx                     # what this PC's model reads at most (context_tokens)
         self.used: list[str] = []                      # who did each step, in order (for the result)
         self.ask = None                                # set by the engine: ask(free_again_ts) -> "local" | "retry"
         names = [l[1] for l in links] + (["this PC"] if local else [])
@@ -676,6 +756,7 @@ class Chain:
 
     def _did(self, who: str) -> None:
         if not self.used or self.used[-1] != who:
+            steps.info("%s %s.", "Now on" if self.used else "Working on", who)   # the first, and each switch
             self.used.append(who)
 
     def chat(self, model: str, messages: list[dict], threads: int, max_tokens: int, should_stop) -> str:
@@ -683,10 +764,16 @@ class Chain:
             out = self._try_links(messages, threads, max_tokens, should_stop)
             if out is not None:
                 return out
+            too_long = too_long_for_local(messages, self.local_ctx) if self.local else ""
             if self.ask is None:
                 return self._local(None, messages, threads, max_tokens, should_stop)
             back = min(_out_until(l[0]) for l in self.links)
             if self.ask(back) == "local":
+                if too_long:                           # it can't hold this step: keep waiting instead
+                    log.info("switching: 'this PC' chosen, but %s; waiting for free tokens", too_long)
+                    steps.info("This PC's model can't take this step: %s. So it keeps waiting for free tokens "
+                               "instead.", too_long.split(", so")[0])
+                    continue
                 return self._local(None, messages, threads, max_tokens, should_stop)
             # "retry": free tokens should be back; go round the order again
 
@@ -700,13 +787,20 @@ class Chain:
                     out = backend.chat(m, messages, threads, max_tokens, should_stop)
                     self._did(f"{spoken} ({m})")
                     return out
-                except BudgetOut as e:                 # the user's own daily limit: no provider can help
+                except BudgetOut as e:                 # the user's own limit (dollars, one task): no provider can help
                     log.warning("switching: %s; going to this PC's model", e)
+                    steps.info("%s. Going to this PC's model.", str(e)[:1].upper() + str(e)[1:])
                     return self._local(e, messages, threads, max_tokens, should_stop)
+                except ProviderCapOut as e:            # this provider's own day is used up: the next one
+                    _mark_out(name, _to_midnight())
+                    log.warning("switching: %s; trying the next", e)
+                    steps.info("%s; trying the next provider.", e)
+                    break
                 except (Refused, RuntimeError, httpx.HTTPError, ValueError) as e:
                     wait = e.retry_after if isinstance(e, Refused) and e.status == 429 else 0
                     if attempt == 1 and 0 < wait <= 60:           # just "slow down": wait, same provider
                         log.info("switching: %s asked to wait %.0f s", spoken, wait)
+                        steps.info("%s asked to slow down: waiting %.0f seconds.", spoken, wait)
                         end = time.monotonic() + wait
                         while time.monotonic() < end:
                             should_stop(0)
@@ -714,12 +808,19 @@ class Chain:
                         continue
                     _mark_out(name, _rest_for(e))
                     log.warning("switching: %s can't take this step (%s); trying the next", spoken, str(e)[:160])
+                    steps.info("%s can't take this step; trying the next provider.", spoken)
                     break
         return None
 
     def _local(self, why, messages, threads, max_tokens, should_stop) -> str:
         if not self.local:
             raise RuntimeError(str(why) if why else "every provider in the switch order is out of free tokens for now")
+        too_long = too_long_for_local(messages, self.local_ctx)
+        if too_long:                                   # never a silent cut-off on this PC's model
+            log.warning("switching: not going to this PC's model: %s", too_long)
+            steps.info("This PC's model can't take this step: %s.", too_long.split(", so")[0])
+            raise TooLongForLocal((f"{why}; and " if why else "every provider in the switch order is out of free "
+                                   "tokens, and ") + too_long)
         self._did("this PC's model")
         backend, model = self.local
         return backend.chat(model, messages, threads, max_tokens, should_stop)

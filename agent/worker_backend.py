@@ -80,12 +80,18 @@ class OllamaBackend:
                 log.info("started the worker's own CPU-only Ollama on port %d (pid %d)", port, self.own.pid)
         elif not _wait_http(f"{self.url}/api/version", 1):
             # the worker runs without voice Othos: start the shared Ollama hidden, like
-            # Start Othos does, and leave it running (voice Othos uses it too)
+            # Start Othos does, and leave it running (voice Othos and the other worker use it too)
             exe = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "ollama.exe"
-            logf = open(log_dir / "ollama.log", "ab")
-            subprocess.Popen([str(exe), "serve"], stdout=logf, stderr=logf,
-                             creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS)
-            log.info("Ollama wasn't running: started it hidden")
+            # a hidden console that its helpers (llama-server, gpu-discover) share. Not DETACHED_PROCESS:
+            # that gives Ollama no console at all, Windows then ignores CREATE_NO_WINDOW, and every helper
+            # opened its own Terminal window when The Smithy started (Nov 14).
+            # Started through a short-lived cmd ("start /B"), so it is not a child of this worker: the apps
+            # stop a worker with "taskkill /T" (the whole family), which used to take the shared Ollama
+            # down too, for the other worker and voice Othos (Nov 14). Once that cmd has exited, taskkill
+            # can't find Ollama through it.
+            subprocess.Popen(f'cmd.exe /d /s /c "start "" /B "{exe}" serve >> "{log_dir / "ollama.log"}" 2>&1"',
+                             stdin=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+            log.info("Ollama wasn't running: started it hidden, apart from this worker")
         if not _wait_http(f"{self.url}/api/version", 30):
             raise RuntimeError(f"Ollama isn't answering at {self.url}")
 

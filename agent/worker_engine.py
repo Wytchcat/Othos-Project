@@ -38,6 +38,45 @@ HERE = Path(__file__).parent
 LOG_DIR = HERE / "logs"
 
 log = logging.getLogger("worker")
+# One plain sentence per step of a task, as it happens ("Planning the build.", "Cerebras asked to
+# wait 60 seconds."): also in the worker's log, and written to state\<worker>-status-steps.jsonl for
+# the app's Progress window and Othos's Task Mode (Nov 13: the user wants to watch a task step by step).
+steps = logging.getLogger("worker.step")
+steps.setLevel(logging.INFO)          # its own level: a quieter "worker" log mustn't drop the steps
+
+
+def steps_path(status_path: Path) -> Path:
+    return status_path.with_name(status_path.stem + "-steps.jsonl")
+
+
+class StepFile(logging.Handler):
+    """Writes each worker.step line, with the time and the running task, to the steps file.
+    Kept short: past about 300 KB only the last 400 lines are kept. Step lines say what the engine
+    is doing (task type, step, file name, provider, wait), never the task's text or the model's
+    output, and each is redacted (worker_shared.redact) before it's written."""
+
+    def __init__(self, path: Path, worker: str):
+        super().__init__(logging.INFO)
+        self.path, self.worker, self.task = path, worker, None
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            line = json.dumps({"ts": round(record.created, 1), "worker": self.worker, "task": self.task,
+                               "text": worker_shared.redact(record.getMessage())}, ensure_ascii=False)
+            self.path.parent.mkdir(exist_ok=True)
+            with self.path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+            if self.path.stat().st_size > 300_000:
+                keep = self.path.read_text(encoding="utf-8", errors="replace").splitlines()[-400:]
+                self.path.write_text("\n".join(keep) + "\n", encoding="utf-8")
+        except Exception:
+            pass                                       # the steps are for watching; never stop a task
+
+
+def _seconds(s: float) -> str:
+    s = round(s)
+    return f"{s} seconds" if s < 120 else f"{s // 60} minutes {s % 60} seconds"
+
 
 FORMAT = (
     "Answer in exactly two parts, with these two headings on their own lines:\n"
@@ -132,8 +171,10 @@ EXT = {"powershell": "ps1", "ps1": "ps1", "pwsh": "ps1", "python": "py", "py": "
        "csharp": "cs", "cs": "cs", "html": "html", "css": "css", "php": "php", "sql": "sql", "json": "json"}
 
 
-def save_artifact(results_dir: Path, job_id: int, kind: str, full: str) -> Path | None:
-    """A fix's diff or a script as its own draft file (never applied or run)."""
+def save_artifact(results_dir: Path, job_id: int, kind: str, full: str, newline: str | None = None) -> Path | None:
+    """A fix's diff or a script as its own draft file (never applied or run).
+    newline: the line ends to write ("\\n" or "\\r\\n"); None = Windows' default. A diff gets its file's own
+    (Nov 14: a diff saved with \\r\\n didn't apply to the \\n file it was for)."""
     blocks = re.findall(r"```([\w#+.-]*)[^\n]*\n([\s\S]*?)```", full)
     if not kind or not blocks:
         return None
@@ -143,11 +184,13 @@ def save_artifact(results_dir: Path, job_id: int, kind: str, full: str) -> Path 
     else:
         lang, code = blocks[0]
         path = results_dir / f"{job_id:05d}-script.{EXT.get(lang.lower(), 'txt')}"
-    path.write_text(code, encoding="utf-8")
+    path.write_text(code, encoding="utf-8", newline=newline)
     return path
 
 
 FREE_TOKENS_GRACE = 300   # carry on 5 minutes after free tokens are back (the user's resume rule)
+# A result that starts with this didn't check clean (The Smithy's build checks): never reported as done
+NOT_COMPLETE = "NOT COMPLETE, doesn't check clean"
 
 
 class TaskContext:
@@ -170,6 +213,8 @@ class TaskContext:
         def stop(chars: int = 0):
             part = min(1.0, chars / (max_tokens * 3.5))
             self._should_stop(chars, frac=self.lo + (self.hi - self.lo) * part)
+        if self.backend is self.worker.backend:        # this PC's model: never a step it can't hold
+            worker_cloud.check_fits(messages, max_tokens, self.cfg)
         return self.backend.chat(self.model, messages, self.threads, max_tokens, stop)
 
 
@@ -185,6 +230,8 @@ class Worker:
         self._last_game_check = 0.0
         self.current: dict | None = None
         self.paused_task: dict | None = None   # task sent back to the queue for a game
+        self.step_file = StepFile(steps_path(self.q.status_path), self.q.key)
+        steps.addHandler(self.step_file)
 
     def load_cfg(self) -> dict:
         # utf-8-sig: Notepad++ (and PowerShell) can save with a BOM at the start
@@ -263,12 +310,15 @@ class Worker:
         threads = int(self.mode_settings.get("num_thread", 2) if held else self.cfg.get("num_thread", 4))
         self.backend.set_low_priority(held and bool(self.mode_settings.get("low_priority")))
         # a provider named for this task (off unless turned on in the settings; worker_cloud.py)
+        task_key = f"{q.key}:{row['id']}"
+        worker_cloud.begin_task(task_key)              # max_tokens_per_task counts this whole task
         try:
             cloud = worker_cloud.pick(self.cfg, json.loads(row["params"] or "{}"), row["type"],
                                       local=(self.backend, model))   # this PC's model: the last stop when switching
         except ValueError as e:
             q.fail(row["id"], str(e), retry=False)
             log.info("task %d not started: %s", row["id"], e)
+            steps.info("Task %d couldn't start: %s.", row["id"], str(e).rstrip("."))
             return
         backend = cloud[0] if cloud else self.backend
         if cloud:
@@ -276,6 +326,17 @@ class Worker:
             log.info("task %d uses %s", row["id"], backend.name)
         start_mode = (self.mode, self.mode_why)
         title = row["title"] or jt.title(params)
+        if isinstance(backend, worker_cloud.Chain):
+            names = [l[1] for l in backend.links] + (["this PC"] if backend.local else [])
+            where = "switching: " + names[0] + " first" + (", then " + ", ".join(names[1:]) if len(names) > 1 else "")
+        elif cloud:
+            where = f"{getattr(getattr(backend, 'p', None), 'spoken', 'the cloud')} ({model})"
+        else:
+            where = f"this PC's model ({model})"
+        # the task type, not its title: a title can hold a brief's details, and Task Mode reads
+        # these aloud (Firestarter, Nov 13). The Progress window shows the title from the status.
+        steps.info("Started task %d (%s). Using %s%s.", row["id"], row["type"], where,
+                   f"; held back for {self.mode_why}" if held else "")
         self.current = {"id": row["id"], "type": row["type"], "title": title, "model": model,
                         "threads": threads, "started": time.time(), "progress": 0.0,
                         "requested_by": row["requested_by"], "coding": jt.coding}
@@ -309,21 +370,36 @@ class Worker:
             if jt.run:
                 summary, full, artifact = jt.run(TaskContext(self, row, model, threads, should_stop, backend), params)
             else:
+                steps.info("Writing the answer.")
+                if backend is self.backend:           # one-call types too (Firestarter, Nov 14: a followup
+                    # on a long earlier result is about 8,900 tokens)
+                    worker_cloud.check_fits(jt.build(params), jt.max_tokens, self.cfg)
                 summary, full = split_result(backend.chat(model, jt.build(params), threads, jt.max_tokens, should_stop))
         except Stopped as s:
             if s.reason == "cancelled":
                 log.info("task %d stopped (cancelled)", row["id"])
+                steps.info("Task %d was cancelled.", row["id"])
             elif s.reason == "games":
                 q.requeue(row["id"], paused_for=self.mode_why or "")
                 self.paused_task = {"id": row["id"], "title": title, "game": self.mode_why}
                 log.info("task %d back to the front of the queue (%s)", row["id"], self.mode_why or "game closed")
+                steps.info("Paused for %s: task %d goes back to the front of the queue.", self.mode_why or "a game",
+                           row["id"])
             else:
                 q.fail(row["id"], f"took longer than {jt.minutes_key}", retry=False)
+                steps.info("Task %d stopped: it took longer than its time limit.", row["id"])
+            return
+        except worker_cloud.TooLongForLocal as e:      # the same next time: no retry (Firestarter, Nov 14)
+            q.fail(row["id"], str(e), retry=False)
+            log.warning("task %d failed (%s), not retried", row["id"], e)
+            steps.info("Task %d failed: %s.", row["id"], str(e).rstrip("."))
             return
         except Exception as e:
             retry = row["attempts"] < int(self.cfg.get("max_attempts", 2))
             q.fail(row["id"], str(e), retry=retry)
             log.warning("task %d failed (%s)%s", row["id"], e, ", will retry" if retry else "")
+            steps.info("Task %d failed: %s.%s", row["id"], str(e).rstrip("."),
+                       " It will try once more." if retry else "")
             time.sleep(5)
             return
         finally:
@@ -335,6 +411,8 @@ class Worker:
             log.info("task %d: the result mostly repeats the file", row["id"])
         if getattr(backend, "used", None):            # switching: who did the steps (worker_cloud.Chain)
             model = "providers used: " + ", then ".join(backend.used)
+        spent = worker_cloud.task_tokens(task_key)
+        spent_note = f", {spent:,} cloud tokens" if spent else ""   # the whole task (max_tokens_per_task)
         q.results_dir.mkdir(parents=True, exist_ok=True)
         path = q.results_dir / f"{row['id']:05d}-{row['type']}.md"
         if artifact is None:
@@ -344,13 +422,20 @@ class Worker:
             where = (f"Built in its own folder (not installed or run): `{Path(artifact)}`\n\n" if Path(artifact).is_dir()
                      else f"Saved separately (not applied): `{Path(artifact).name}`\n\n")
         path.write_text(
-            f"<!-- {q.name} task {row['id']} ({row['type']}): {title}. {model}, {threads} threads, "
+            f"<!-- {q.name} task {row['id']} ({row['type']}): {title}. {model}{spent_note}, {threads} threads, "
             f"{time.monotonic() - t0:.0f} s, {time.strftime('%Y-%m-%d %H:%M')}. Waiting for review; "
             f"nothing has been applied. -->\n\n# {q.spoken.capitalize()} {row['id']}: {title}\n\n"
             f"## Summary\n\n{summary}\n\n{where}## Full result\n\n{full}\n", encoding="utf-8")
         q.finish(row["id"], str(path), model, summary, str(artifact) if artifact else "")
         self.paused_task = None if (self.paused_task or {}).get("id") == row["id"] else self.paused_task
+        if full.startswith(f"**{NOT_COMPLETE}"):
+            log.info("task %d stopped NOT complete in %.0f s -> %s (doesn't check clean; waiting for review)",
+                     row["id"], time.monotonic() - t0, path.name)
+            steps.info("Task %d is NOT complete: it doesn't check clean. Its draft is waiting for your review.",
+                       row["id"])
+            return
         log.info("task %d done in %.0f s -> %s (waiting for review)", row["id"], time.monotonic() - t0, path.name)
+        steps.info("Task %d is done, in %s. It's waiting for your review.", row["id"], _seconds(time.monotonic() - t0))
 
     def _wait_for_tokens(self, row, back: float, deadline: list) -> str:
         """Every provider in the switch order is out of free tokens: wait here (nothing lost) and
@@ -364,6 +449,8 @@ class Worker:
         self.current.update({"free_tokens_back": resume, "out_choice": ""})
         log.info("task %d: every provider in the switch order is out; waiting (asking: this PC, or wait until %s)",
                  row["id"], time.strftime("%H:%M", time.localtime(resume)))
+        steps.info("Every provider is out of free tokens. Waiting: it carries on by itself at %s, or finish it "
+                   "on this PC.", time.strftime("%I:%M %p", time.localtime(resume)).lstrip("0"))
         try:
             while True:
                 if q.status_of(row["id"]) != "running":
@@ -371,13 +458,16 @@ class Worker:
                 choice = worker_cloud.out_choice(q.status_path, row["id"])
                 if choice == "local":
                     log.info("task %d: finishing on this PC's model (her choice)", row["id"])
+                    steps.info("Finishing on this PC's model, as you asked.")
                     result = "local"
                     break
                 if choice == "wait" and self.current.get("out_choice") != "wait":
                     self.current["out_choice"] = "wait"
                     log.info("task %d: waiting for free tokens (her choice)", row["id"])
+                    steps.info("Waiting for free tokens, as you asked.")
                 if time.time() >= resume:
                     log.info("task %d: free tokens should be back; carrying on", row["id"])
+                    steps.info("Free tokens should be back; carrying on.")
                     result = "retry"
                     break
                 self.write_status("waiting for free tokens")
@@ -426,7 +516,11 @@ class Worker:
                 try:
                     row = self.q.claim_next()
                     if row is not None:
-                        self.run_task(row)
+                        self.step_file.task = row["id"]
+                        try:
+                            self.run_task(row)
+                        finally:
+                            self.step_file.task = None
                 finally:
                     self.cpu.release()
         finally:

@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 load_dotenv()  # must run before anything reads environment variables
 
 from livekit import agents, rtc
-from livekit.agents import llm
+from livekit.agents import inference, llm
 from livekit.agents import (
     Agent,
     APIConnectOptions,
@@ -1293,6 +1293,7 @@ _ASKS_LOOK = re.compile(
     r"what am i (?:holding|wearing|showing you|doing|pointing at)|what(?:'s| is) in my hand|"
     r"am i holding (?:anything|something)|"
     r"read (?:this|that|it|the label)|what colou?r is (?:this|that|it)|how many fingers|look again|"
+    r"what colou?rs? (?:is|are) my (?:shirt|top|t-?shirt|jumper|sweater|hoodie|jacket|coat|hat|glasses|mug|cup|nails)|"
     r"what does (?:it|this|that|the (?:bag|label|sign|box|can|bottle|package|packet|paper|card|note|"
     r"screen|book|jar|tin|carton|letter|envelope|cover|shirt|mug)) say|what(?:'s| is) written)\b|"
     r"\bwhat(?:'s| is) (?:this|that)(?: thing)?\W*$",  # the whole question, not "what is this song"
@@ -3656,6 +3657,9 @@ async def entrypoint(ctx: JobContext):
         # speakers, the mic hears Othos's own voice, and that echo alone paused
         # it, then it resumed 2 s later (the "stutter").
         turn_handling=TurnHandlingOptions(
+            # Local turn detector only. The default is the cloud one in "dev" mode
+            # (sends audio to LiveKit's gateway); "v1-mini" runs on this PC.
+            turn_detection=inference.TurnDetector(version="v1-mini"),
             preemptive_generation={"enabled": False},
             interruption={"min_words": 2},
         ),

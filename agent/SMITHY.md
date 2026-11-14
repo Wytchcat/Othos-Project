@@ -16,6 +16,17 @@ it and copy what you want into place yourself, on screen.
   the **model switcher** (Coding model), **Get models...**, **Work log** and **Code chat**
   (Othos's typed code chat, `http://127.0.0.1:3000/code`, in a private browser window; it
   needs Othos running, so until then the button says "Code chat (start Othos first)").
+- **Progress** (next to Work log): a small window, in The Smithy's steel blue, that opens in the
+  bottom-right corner and stays on top (untick **Keep on top** to let it go behind). It shows the
+  running task with its progress bar and time, and below that **each step as it happens**, with
+  the time: "Started task 20 (followup). Using switching: Cerebras first, then ...", "Planning the new
+  version.", "Plan ready: 3 files: ...", "Editing OthosSetup.cs: asking for the changes as edits.",
+  "OthosSetup.cs: 10 edits in; every other line kept.", "Cerebras asked to slow down: waiting 60
+  seconds.", "Now on Groq (...)", "Task 20 is done, in 2 minutes 12 seconds." Waits and problems
+  are gold; the start and the end are blue. Opened part way, it shows the last 40 steps first.
+  The steps are in `state\smithy-status-steps.jsonl` (the last 400 lines are kept), written by
+  the worker (`worker_engine.StepFile`); the window only reads them. Firestarter's app has the
+  same window, in its own colours.
 - **Stop:** right-click its taskbar button -> **Close window** (or the X). A running
   task goes back in the queue; a build carries on from the file it had reached.
 - **Independent** of Othos and of Firestarter.
@@ -53,6 +64,26 @@ Coding requests go to the Smithy automatically. Task numbers are the Smithy's ow
 - **Keep / discard:** "keep Smithy task 3" -> "Say yes or no." Only a clear yes marks it.
 - **Work log:** "read me the Smithy log" (latest three, "go on" for more), "show me the Smithy log".
 - **"It's ready":** "Smithy task 3, the build: small to-do list web page, is ready." between turns.
+- **Task Mode** (the user's idea): Othos reads each new step of a task aloud as it happens,
+  between turns, from the same steps file as the Progress window: "The Smithy: Planning the new
+  version. Plan ready: 3 files ..."
+  - **Turning it on:** "open / go into / assume / switch to / start / enter task mode", "task mode
+    on", "put yourself in task mode". With no task named, Othos asks "Do you want a particular
+    task or the current one?":
+    - "the current one" (or "yes"): the task running now; with none running, the next one to start.
+    - a number ("21", "Smithy task 21"), or "a particular one" and then the number when asked.
+    - "never mind" / "no": it stays off. Anything else: the question lapses.
+  - Or name it at once: "switch to task mode for Smithy task 21". A task still queued is read
+    when it starts; one already finished is offered to read instead.
+  - It follows only that task, and turns itself off when the task ends ("That's the end of Smithy
+    task 21, so task mode is off."); a failure that will be tried again keeps it on.
+  - A burst of more than four steps is said as the count and the latest three. "Task mode off"
+    stops it; the "is ready" announcement carries on either way. It lasts for the call.
+  - Steps say what the engine is doing (task type, step, file name, provider, wait), never a
+    task's text or the model's output, and each line is redacted before it's written
+    (Firestarter's briefs and ZOO rows can hold product details).
+  - While a how-to is recording, steps aren't read over the narration: they wait until it's
+    paused or finished.
 
 ## Which files it may read (`worker_files.py`, enforced in code)
 
@@ -198,7 +229,9 @@ into git or a shared copy.
   - "Slow down" with a wait of a minute or less: it waits, then tries the same provider again.
   - A provider that ran out is skipped for a while (an hour, or as long as it asks; a day for
     "no credit"); the window shows "Out of free tokens for now".
-  - Your own daily limits (tokens, dollars) going over send the job straight to this PC's model.
+  - A provider reaching your daily token limit is skipped until midnight, like one that ran out.
+  Your dollar limit (all providers together) or the per-task limit going over sends the job
+  straight to this PC's model.
 - **Recorded:** the result's first line says which providers did the work ("providers used:
   Groq (openai/gpt-oss-120b), then Hugging Face (…)"); `logs\smithy.log` has each switch.
 - **Each key in one place:** a free allowance belongs to the account, not the program, so a
@@ -208,10 +241,34 @@ into git or a shared copy.
   redaction). A provider in the order that's Off is skipped; with none ready, a job just uses
   this PC's model and nothing is sent.
 
+**New versions edit long files instead of rewriting them.** In a new version of a build, an
+earlier file of `edit_min_chars` (4,000) characters or more is shown to the model whole, and the
+model sends back only find/replace pairs (`<<<<<<< FIND` ... `=======` ... `>>>>>>> REPLACE`).
+The Smithy applies them itself:
+- Each FIND has to be in the file exactly once (exactly, or line by line ignoring spaces at the
+  ends of lines). One that's missing or in the file more than once is skipped, never guessed;
+  the model is asked once more for just those, with the file as it is now. When a FIND is in
+  the file twice, the reason names each line and the line above it, so the next try can pick the
+  right one. A FIND with fewer than 3 letters or digits (a bare ``` or `}`) is refused as too
+  vague.
+- In brace languages (C#, JavaScript, PHP, PowerShell, CSS...), REPLACE lines that come back at
+  the left margin get the indentation of the line they replace. `#if` lines stay at the margin.
+- Every other line stays exactly as it was. The result lists how many edits went in and any
+  that didn't ("Edited, not rewritten").
+- The README too: an earlier README that long is edited to describe the new version (the model
+  sees this version's files, up to the build's budget). If no usable edits come back, it's
+  written whole as before.
+- Shorter files and new files are still written whole. `"edit_min_chars": 0` turns edits off.
+- Why: installer versions 7, 8 and 9 (about 1,000 lines each) came back rewritten, losing
+  earlier fixes; version 9 was given 11 exact edits and still dropped whole methods (Nov 13).
+
 **Builds on the cloud read more.** A build on a cloud provider or the switch order is shown up to
 `cloud_build_chars` (64,000) characters of the files so far and of the earlier version, instead of
 the local model's `context_tokens` x 1.5. If the switch order ends on this PC, the local model
-reads only what fits in its own context.
+reads only what fits in its own context. **A step too long for this PC's model** (more than
+`context_tokens` less 512) never goes to it, because Ollama would drop the start of it without a word.
+When every provider is out, the task keeps waiting for free tokens, even if "this PC" is picked, and
+the step line says why. A task on this PC's model alone fails with that reason. (Nov 14.)
 
 **Using one:**
 - **In the window:** the **Provider** row under Coding model. It offers "Local (this PC)"
@@ -231,7 +288,14 @@ reads only what fits in its own context.
 - **Free tiers that may train on what you send:** Gemini, and OpenRouter's `:free` models.
   They're refused unless listed in `cloud.accept_data_use`.
 - **Limits:**
-  - `max_tokens_per_task` (200,000) and `max_tokens_per_day` (1,000,000).
+  - `max_tokens_per_task` (200,000) counts **the whole task**: every step, fix round and provider
+    (until Nov 14 it counted each call on its own). Each result's header line says how many cloud
+    tokens the task used. Over it, the task goes to this PC's model if the step fits, else it stops
+    and says why.
+  - `max_tokens_per_day` (1,000,000). The day limit counts
+    **each provider on its own**: when one reaches it, switching moves on to the next, and that
+    one is skipped until midnight. (Until Nov 13 it was one total for all providers, which
+    stopped switching while Cerebras still had tokens left.)
   - With `prices` set (dollars per million tokens, `[input, output]` per provider),
     `max_usd_per_day` ($2) applies.
   - Today's use is in `state\cloud-usage.json`.

@@ -42,6 +42,9 @@ Ok "Node $(node --version)"
 if (-not (Get-Command pnpm -ErrorAction SilentlyContinue)) {
     Warn "pnpm not found; installing it with npm"
     npm install -g pnpm | Out-Null
+    if (-not (Get-Command pnpm -ErrorAction SilentlyContinue)) {
+        Stop-Setup "pnpm couldn't be installed with npm (it needs the internet). Connect to the internet, or run: npm install -g pnpm, then run setup again."
+    }
 }
 Ok "pnpm $(pnpm --version)"
 if (-not (Get-Command ollama -ErrorAction SilentlyContinue)) { Stop-Setup "Ollama not found. Install it from https://ollama.com/download, then run setup again." }
@@ -74,12 +77,14 @@ if (-not (Test-Path $venvPy)) { & py -3.12 -m venv (Join-Path $A ".venv") }
 if ($LASTEXITCODE -ne 0) { Stop-Setup "pip couldn't install requirements.txt (see the messages above)." }
 Ok "packages installed"
 # the pre-commit check (requirements stay pinned), in this repo or the repo this folder is part of
-$top = git -C $A rev-parse --show-toplevel 2>$null
-if ($LASTEXITCODE -eq 0 -and $top) {
-    $top = (Resolve-Path $top).Path
-    $hooks = (Join-Path $A "githooks").Substring($top.Length).TrimStart([char]92).Replace([char]92, [char]47)   # \ -> /
-    git -C $top config core.hooksPath $hooks
-    Ok "pre-commit check on ($hooks)"
+if (Get-Command git -ErrorAction SilentlyContinue) {
+    $top = git -C $A rev-parse --show-toplevel 2>$null
+    if ($LASTEXITCODE -eq 0 -and $top) {
+        $top = (Resolve-Path $top).Path
+        $hooks = (Join-Path $A "githooks").Substring($top.Length).TrimStart([char]92).Replace([char]92, [char]47)   # \ -> /
+        git -C $top config core.hooksPath $hooks
+        Ok "pre-commit check on ($hooks)"
+    }
 }
 
 # ---- 4. the call page
@@ -98,12 +103,29 @@ if (-not (Test-Path $uiEnv)) {
 # ---- 5. models (Ollama)
 Step "Models"
 $models = @("llama3.2:3b", "nomic-embed-text", "moondream:1.8b", "qwen2.5-coder:3b")
+# approximate model sizes (GB); use "?" if unknown
+$sizes = @{
+    "llama3.2:3b"      = "2"
+    "nomic-embed-text" = "0.3"
+    "moondream:1.8b"   = "1.7"
+    "qwen2.5-coder:3b" = "1.9"
+}
 if ($NoModels) { Warn "skipped (-NoModels). Later: ollama pull $($models -join ', ')" }
 else {
     $have = (ollama list) -join "`n"
     foreach ($m in $models) {
         if ($have -match [regex]::Escape($m)) { Ok "$m already pulled" }
-        else { Write-Host "   pulling $m"; ollama pull $m; if ($LASTEXITCODE -eq 0) { Ok $m } else { Warn "couldn't pull $m" } }
+        else {
+            # Determine size string
+            if ($sizes.ContainsKey($m)) { $sz = $sizes[$m] } else { $sz = "?" }
+            Write-Host "   pulling $m (about $sz GB; this can take a few minutes)"
+            if ([Console]::IsOutputRedirected) {
+                cmd.exe /d /c "ollama pull $m >nul 2>&1"
+            } else {
+                ollama pull $m
+            }
+            if ($LASTEXITCODE -eq 0) { Ok $m } else { Warn "couldn't pull $m" }
+        }
     }
     if (Test-Path (Join-Path $A "make-gaming-model.ps1")) {
         & (Join-Path $A "make-gaming-model.ps1") | Out-Null; Ok "othos-gaming (CPU-only copy for gaming mode)"
@@ -156,11 +178,19 @@ if ((Test-Path $venvPy) -and (Test-Path $specsPy)) {
 
 $npp = "C:\Program Files\Notepad++\notepad++.exe"
 foreach ($f in $toOpen) {
-    if (Test-Path $npp) { Start-Process $npp "`"$f`"" } else { Start-Process notepad.exe "`"$f`"" }
+    try {
+        if (Test-Path $npp) {
+            Start-Process $npp "`"$f`""
+        } else {
+            Start-Process notepad.exe "`"$f`""
+        }
+    } catch {
+        Warn "couldn't open $f in an editor; open it yourself (Notepad++ or Notepad)"
+    }
 }
 
 Step "Done"
-if ($toOpen.Count) { Write-Host "   Fill in the files that just opened, then check everything with:" }
+if ($toOpen.Count) { Write-Host "   Fill in .env, personal.json and profile.md in the agent folder (they opened in your editor if one was found), then check everything with:" }
 else { Write-Host "   Check everything with:" }
 Write-Host "     powershell -ExecutionPolicy Bypass -File doctor.ps1"
 Write-Host "   Start Othos with start-othos.bat, or build the taskbar app: build-othos-app.ps1"
