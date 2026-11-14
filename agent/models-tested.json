@@ -1,0 +1,62 @@
+{
+  "_about": "Works with your version: the models tested with this version of Othos, per job. model_check.py (the weekly model check, 'Check models...' in the Othos window) compares this list, and newer releases in the same model families, with what's installed. It only lists; nothing is downloaded. Update this file when a new model has been tested, and give the date in tested_on.",
+  "othos_version": "0.10.1+",
+  "tested_on": "2026-11-13",
+  "_jobs": "tag = the Ollama name; download_gb = its download; memory_gb = what it needs to run with a short context; runs_on = gpu (the graphics card, CPU if there's none) or cpu (always the CPU); cpu_quick_gb = above this a model answers too slowly on a CPU for a conversation; tested = false for a model planned but not run yet; families = Ollama library names counted as the same family (regular expressions; a newer release in them is listed as 'new, not tested yet'); skip = names in those families that are a different kind of model; hf = Hugging Face searches for GGUF files (for llama-server): a trusted publisher (author) and a word in the name.",
+  "jobs": {
+    "voice": {
+      "title": "Voice Othos (conversation)",
+      "runs_on": "gpu",
+      "setting": "OLLAMA_MODEL in .env",
+      "cpu_quick_gb": 4,
+      "models": [
+        {"tag": "llama3.2:3b", "download_gb": 2.0, "memory_gb": 3.5, "note": "the default; the only one quick enough on a CPU"},
+        {"tag": "qwen2.5:7b", "download_gb": 4.7, "memory_gb": 6.5},
+        {"tag": "qwen2.5:14b", "download_gb": 9.0, "memory_gb": 11.5},
+        {"tag": "qwen2.5:32b", "download_gb": 20.0, "memory_gb": 23.0}
+      ],
+      "families": ["^llama3(\\.\\d+)?$", "^llama4$", "^qwen2\\.5$", "^qwen3(\\.\\d+)?$"],
+      "skip": ["coder", "vl$", "vision", "embed", "math", "guard"],
+      "hf": []
+    },
+    "camera": {
+      "title": "Camera (what Othos sees)",
+      "runs_on": "gpu",
+      "setting": "VISION_MODEL in .env",
+      "models": [
+        {"tag": "moondream:1.8b", "download_gb": 1.7, "memory_gb": 2.5}
+      ],
+      "families": ["^moondream\\d*$"],
+      "skip": [],
+      "hf": []
+    },
+    "notes": {
+      "title": "Notes search (meanings)",
+      "runs_on": "gpu",
+      "setting": "EMBED_MODEL in .env",
+      "models": [
+        {"tag": "nomic-embed-text:latest", "download_gb": 0.3, "memory_gb": 0.6}
+      ],
+      "families": ["^nomic-embed-text(-v\\d+(\\.\\d+)?)?$"],
+      "skip": [],
+      "hf": []
+    },
+    "coding": {
+      "title": "Coding (The Smithy)",
+      "runs_on": "cpu",
+      "setting": "models.code in smithy.json (or The Smithy window's Coding model switcher)",
+      "models": [
+        {"tag": "qwen2.5-coder:3b", "download_gb": 1.9, "memory_gb": 3.5, "note": "the stand-in for a small PC"},
+        {"tag": "qwen3-coder:30b", "download_gb": 19.0, "memory_gb": 24.0, "tested": false, "note": "planned for a big PC (64 GB RAM or more)"}
+      ],
+      "families": ["^qwen2\\.5-coder$", "^qwen3(\\.\\d+)?-coder(-next)?$", "^devstral(-small)?(-\\d+)?$", "^codestral$"],
+      "skip": [],
+      "hf": [
+        {"author": "Qwen", "search": "Coder"},
+        {"author": "unsloth", "search": "Coder"},
+        {"author": "mistralai", "search": "Devstral"},
+        {"author": "unsloth", "search": "Devstral"}
+      ]
+    }
+  }
+}

@@ -98,6 +98,18 @@ static class OthosApp
         if (wait) p.WaitForExit(waitMs);
     }
 
+    // A web page in a private window (the model check's Open page button): https on ollama.com only.
+    public static void OpenUrl(string url)
+    {
+        if (!Regex.IsMatch(url, "^https://ollama\\.com/[A-Za-z0-9/_.-]*$")) return;
+        var psi = new ProcessStartInfo("powershell.exe",
+            "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command \". '" +
+            Path.Combine(AgentDir, "open-private.ps1") + "'; Open-Private '" + url + "'\"");
+        psi.UseShellExecute = false;
+        psi.CreateNoWindow = true;
+        Process.Start(psi);
+    }
+
     public static void OpenPage(string path = "")
     {
         var psi = new ProcessStartInfo("powershell.exe",
@@ -147,6 +159,8 @@ class MainForm : Form
     readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
     readonly Label gamingRow = new Label();
     readonly Label speedRow = new Label();
+    readonly Label modelsRow = new Label();
+    Button[] buttons = new Button[0];
     bool starting = true, stopping;
 
     // A reminder for the new build: run the llama.cpp worker speed test (WORKER.md,
@@ -229,8 +243,18 @@ class MainForm : Form
         title.Text = string.Join(" ", OthosApp.Name.ToUpperInvariant().ToCharArray());
         title.Font = new Font("Segoe UI Semibold", 14f);
         title.ForeColor = Green;
-        title.SetBounds(20, 14, 300, 30);
+        title.SetBounds(20, 14, 190, 30);
         Controls.Add(title);
+
+        // the model check (model_check.py): weekly Yes/No, or any time from here
+        var models = new LinkLabel();
+        models.Text = "Check models...";
+        models.LinkColor = Gold;
+        models.ActiveLinkColor = Green;
+        models.SetBounds(212, 22, 112, 22);
+        models.TextAlign = ContentAlignment.MiddleRight;
+        models.LinkClicked += (s, e) => ShowModels();
+        Controls.Add(models);
 
         var check = new LinkLabel();
         check.Text = "Check my PC...";
@@ -260,12 +284,21 @@ class MainForm : Form
         }
 
         // Code chat moved to the call screen's control bar (the </> button) and to The Smithy's window
+        // the automatic model check's line (shown only when it found something new)
+        modelsRow.SetBounds(22, 52 + (speedDue ? 6 : 5) * 26, 410, 24);
+        modelsRow.ForeColor = Gold;
+        modelsRow.Cursor = Cursors.Hand;
+        modelsRow.Visible = false;
+        modelsRow.Click += (s, e) => { modelsRow.Visible = false; ShowModels(); };
+        Controls.Add(modelsRow);
+
         var open = MakeButton("Call page", 20);
         open.Click += (s, e) => OthosApp.OpenPage();
         var game = MakeButton("Gaming", 159);
         game.Click += (s, e) => { ToggleGaming(); Refresh_(); };
         var stop = MakeButton("Stop " + OthosApp.Name, 298);
         stop.Click += (s, e) => Close();
+        buttons = new[] { open, game, stop };
 
         timer.Interval = 3000;
         timer.Tick += (s, e) => Refresh_();
@@ -276,12 +309,14 @@ class MainForm : Form
     // ---- this PC's specs (system_specs.py): asked once on first start, "Check my PC..." any time
     static readonly string SpecsFile = Path.Combine(OthosApp.AgentDir, "state", "system-specs.json");
 
-    static string RunSpecs(string args)
+    static string RunSpecs(string args) { return RunPy("system_specs.py", args); }
+
+    static string RunPy(string script, string args)
     {
         try
         {
             var psi = new ProcessStartInfo(Path.Combine(OthosApp.AgentDir, ".venv", "Scripts", "python.exe"),
-                "\"" + Path.Combine(OthosApp.AgentDir, "system_specs.py") + "\" " + args);
+                "\"" + Path.Combine(OthosApp.AgentDir, script) + "\" " + args);
             psi.WorkingDirectory = OthosApp.AgentDir;
             psi.UseShellExecute = false;
             psi.CreateNoWindow = true;
@@ -297,15 +332,15 @@ class MainForm : Form
                 return pr.ExitCode == 0 ? o.Trim() : (o + "\r\n" + err).Trim();
             }
         }
-        catch (Exception ex) { return "Couldn't run system_specs.py: " + ex.Message; }
+        catch (Exception ex) { return "Couldn't run " + script + ": " + ex.Message; }
     }
 
     // A Yes/No question in the Othos window's own look (not Windows' grey message box).
-    internal bool AskYesNo(IWin32Window owner, string heading, string text, string yes, string no)
+    internal bool AskYesNo(IWin32Window owner, string heading, string text, string yes, string no, string caption = "this PC")
     {
         using (var d = new Form())
         {
-            d.Text = OthosApp.Name + ": this PC";
+            d.Text = OthosApp.Name + ": " + caption;
             d.Icon = Icon;
             d.StartPosition = owner == null ? FormStartPosition.CenterScreen : FormStartPosition.CenterParent;
             d.FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -524,6 +559,368 @@ class MainForm : Form
         f.Show();   // not owned: the Othos window minimizes to the taskbar
     }
 
+    // ---- the weekly model check (model_check.py). It contacts ollama.com, Hugging Face and
+    // GitHub (model names only), so it runs only on a Yes, from "Check models...", or with
+    // "model_check": "auto" in personal.json. It never downloads or changes anything.
+    void ModelCheckIfDue()
+    {
+        if (!File.Exists(Path.Combine(OthosApp.AgentDir, "model_check.py"))) return;
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            string due = RunPy("model_check.py", "--due").Trim();
+            if (due == "ask")
+            {
+                try { BeginInvoke((Action)AskModels); } catch { }
+            }
+            else if (due == "auto")
+            {
+                RunPy("model_check.py", "--rows");
+                int news = ModelNews();
+                if (news > 0) try { BeginInvoke((Action)(() => ShowModelsRow(news))); } catch { }
+            }
+        });
+    }
+
+    void AskModels()
+    {
+        // the window lives minimized on the taskbar, so the question stands on its own
+        bool min = WindowState == FormWindowState.Minimized;
+        bool yes = AskYesNo(min ? null : this, "M O D E L S",
+            "Check for updated models?\n\n" +
+            "This looks for new or updated models for " + OthosApp.Name + " and The Smithy, and whether this PC can run them. " +
+            "It asks ollama.com, Hugging Face and GitHub, sending only model names. It also re-checks the free limits of the " +
+            "model providers you turned on in The Smithy (their own account pages, with your saved keys). Nothing is downloaded.",
+            "Yes, check", "Not now", "models");
+        if (yes) ShowModels();
+        else ThreadPool.QueueUserWorkItem(_ => RunPy("model_check.py", "--snooze"));
+    }
+
+    static int ModelNews()
+    {
+        try
+        {
+            var m = Regex.Match(File.ReadAllText(Path.Combine(OthosApp.AgentDir, "state", "model-check.json")), "\"news\":\\s*(\\d+)");
+            return m.Success ? int.Parse(m.Groups[1].Value) : 0;
+        }
+        catch { return 0; }
+    }
+
+    void ShowModelsRow(int news)
+    {
+        if (modelsRow.Visible) return;
+        modelsRow.Text = "◆  Model check: " + news + " new or updated (click to see)";
+        modelsRow.Visible = true;
+        ClientSize = new Size(ClientSize.Width, ClientSize.Height + 26);
+        foreach (var b in buttons) b.Top += 26;
+    }
+
+    // The model check's window, in the same look as the PC check: a heading, then the rows
+    // grouped by job (voice, camera, notes, coding, Ollama, providers) with a coloured tag.
+    // A model this PC can run gets a Get (or Update) button: a Yes/No with its size and the
+    // free space first, then progress at the top and a Cancel button. One download at a time.
+    void ShowModels()
+    {
+        var f = new Form();
+        f.Text = OthosApp.Name + ": models";
+        f.Icon = Icon;
+        f.StartPosition = FormStartPosition.CenterScreen;
+        f.FormBorderStyle = FormBorderStyle.FixedSingle;
+        f.MaximizeBox = false;
+        f.ClientSize = new Size(760, 580);
+        f.BackColor = Bg;
+        f.ForeColor = Ink;
+        f.Font = new Font("Segoe UI", 10f);
+
+        var head = new Label();
+        head.Text = "M O D E L S";
+        head.Font = new Font("Segoe UI Semibold", 14f);
+        head.ForeColor = Green;
+        head.SetBounds(20, 14, 400, 30);
+        f.Controls.Add(head);
+        var sub = new Label();
+        sub.ForeColor = Dim;
+        sub.SetBounds(22, 46, 720, 40);
+        sub.Text = "Checking ollama.com, Hugging Face and GitHub for newer models (about 20 seconds). " +
+                   "Only model names are sent. Nothing is downloaded.";
+        f.Controls.Add(sub);
+
+        var list = new System.Windows.Forms.Panel();
+        list.AutoScroll = true;
+        list.BackColor = Panel;
+        list.BorderStyle = BorderStyle.FixedSingle;
+        list.SetBounds(20, 92, 720, 416);
+        f.Controls.Add(list);
+
+        var close = new Button();
+        close.Text = "Close";
+        close.SetBounds(20, 524, 110, 36);
+        StyleButton(close);
+        close.Click += (s, e) => f.Close();
+        f.Controls.Add(close);
+        var how = new Label();
+        how.ForeColor = Dim;
+        how.SetBounds(144, 522, 600, 40);
+        how.Text = "Get downloads a model to this PC after you say yes; it doesn't change which model is used. " +
+                   "Fits / Tight / Won't fit use this PC's RAM and graphics card (Check my PC...).";
+        f.Controls.Add(how);
+
+        Process dl = null;          // the one download running, if any
+        Button dlButton = null;
+        string checkedText = "";
+        var getButtons = new System.Collections.Generic.List<Button>();
+
+        Action<bool> enableGets = on => { foreach (var b in getButtons) if (b != dlButton && b.Tag != null) b.Enabled = on; };
+
+        // a download: model_check.py --pull TAG (Ollama library) or model_fetch.py hf REPO FILE
+        // (Hugging Face, through The Smithy's settings), both printing JSON progress lines
+        Action<Button, string[]> startDownload = (btn, a) =>
+        {
+            string name = a[0] == "pull" ? a[1] : a[1] + " (" + a[2] + ")";
+            string gb = a[a.Length - 1];
+            btn.Enabled = false;
+            sub.Text = "Looking at the free space for " + name + "...";
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                string sp = RunPy("model_check.py", "--space " + (a[0] == "pull" ? "ollama" : "hf"));
+                try
+                {
+                    f.BeginInvoke((Action)(() =>
+                    {
+                        var c = sp.Split('\t');
+                        double free = 0, need = 0;
+                        double.TryParse(c[0], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out free);
+                        double.TryParse(gb, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out need);
+                        string folder = c.Length > 1 ? c[1] : "";
+                        if (c.Length < 2) { sub.Text = "Couldn't look at the free space: " + sp; btn.Enabled = true; return; }
+                        if (need > 0 && free < need + 1)
+                        {
+                            sub.Text = "Not enough space for " + name + ": about " + gb + " GB needed, " + c[0] + " GB free in " + folder + ".";
+                            btn.Enabled = true;
+                            return;
+                        }
+                        bool yes = AskYesNo(f, "D O W N L O A D",
+                            "Download " + name + "?\n\n" +
+                            "About " + gb + " GB from " + (a[0] == "pull" ? "the Ollama library" : "Hugging Face") +
+                            ", into " + folder + " (" + c[0] + " GB free).\n\n" +
+                            "It doesn't change which model " + OthosApp.Name + " or The Smithy uses.",
+                            "Yes, download", "Not now", "models");
+                        if (!yes) { sub.Text = checkedText; btn.Enabled = true; return; }
+
+                        string script = a[0] == "pull" ? "model_check.py" : "model_fetch.py";
+                        string args = a[0] == "pull" ? "--pull " + a[1] : "--config smithy.json hf " + a[1] + " \"" + a[2] + "\"";
+                        var psi = new ProcessStartInfo(Path.Combine(OthosApp.AgentDir, ".venv", "Scripts", "python.exe"),
+                            "\"" + Path.Combine(OthosApp.AgentDir, script) + "\" " + args);
+                        psi.WorkingDirectory = OthosApp.AgentDir;
+                        psi.UseShellExecute = false;
+                        psi.CreateNoWindow = true;
+                        psi.RedirectStandardOutput = true;
+                        psi.RedirectStandardError = true;
+                        psi.StandardOutputEncoding = System.Text.Encoding.UTF8;
+                        psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8";
+                        var p = new Process();
+                        p.StartInfo = psi;
+                        p.EnableRaisingEvents = true;
+                        string error = "";
+                        bool done = false;
+                        long lastDone = 0;
+                        DateTime lastAt = DateTime.Now;
+                        double rate = 0;
+                        p.OutputDataReceived += (s2, e2) =>
+                        {
+                            if (e2.Data == null) return;
+                            string ev = JsonField(e2.Data, "event");
+                            if (ev == "error") error = JsonField(e2.Data, "message");
+                            else if (ev == "done") done = true;
+                            else if (ev == "progress")
+                            {
+                                long d = JsonNumber(e2.Data, "done"), t = JsonNumber(e2.Data, "total");
+                                string st = JsonField(e2.Data, "status");
+                                double secs = (DateTime.Now - lastAt).TotalSeconds;
+                                if (secs >= 1 && d >= lastDone) { rate = (d - lastDone) / secs; lastDone = d; lastAt = DateTime.Now; }
+                                string txt = "Downloading " + name + ": " +
+                                    (t > 0 ? (d * 100 / t) + "% (" + Gb(d) + " of " + Gb(t) + ")" + (rate > 0 ? ", " + (rate / 1e6).ToString("0.0") + " MB/s" : "")
+                                           : st);
+                                try { f.BeginInvoke((Action)(() => sub.Text = txt)); } catch { }
+                            }
+                        };
+                        p.Exited += (s2, e2) =>
+                        {
+                            try { p.WaitForExit(); } catch { }   // the last progress lines first
+                            try
+                            {
+                                f.BeginInvoke((Action)(() =>
+                                {
+                                    bool stopped = dl == null;     // Cancel cleared it
+                                    dl = null;
+                                    dlButton = null;
+                                    enableGets(true);
+                                    if (done && !stopped)
+                                    {
+                                        btn.Text = "Installed";
+                                        btn.ForeColor = Green;
+                                        btn.Enabled = false;
+                                        btn.Tag = null;
+                                        sub.Text = name + " is downloaded. To use it: Check my PC... (Apply), or The Smithy's model switcher for coding.";
+                                    }
+                                    else
+                                    {
+                                        btn.Text = a[0] == "pull" && btn.Tag is string && (string)btn.Tag == "update" ? "Update" : "Get";
+                                        btn.Enabled = true;
+                                        sub.Text = stopped ? "Stopped. What was downloaded is kept, so Get carries on where it left off."
+                                                           : "The download didn't finish" + (error.Length > 0 ? ": " + error : ".");
+                                    }
+                                }));
+                            }
+                            catch { }
+                        };
+                        try
+                        {
+                            p.Start();
+                            p.BeginOutputReadLine();
+                            p.BeginErrorReadLine();
+                            dl = p;
+                            dlButton = btn;
+                            enableGets(false);
+                            btn.Text = "Cancel";
+                            btn.Enabled = true;
+                            sub.Text = "Starting the download of " + name + "...";
+                        }
+                        catch (Exception ex) { sub.Text = "Couldn't start the download: " + ex.Message; btn.Enabled = true; }
+                    }));
+                }
+                catch { }
+            });
+        };
+
+        f.FormClosing += (s, e) =>
+        {
+            if (dl == null) return;
+            if (!AskYesNo(f, "D O W N L O A D", "A download is still running. Stop it?\n\n" +
+                    "What was downloaded is kept, so Get carries on where it left off.", "Yes, stop it", "Keep going", "models"))
+            { e.Cancel = true; return; }
+            try { var p = dl; dl = null; p.Kill(); } catch { }
+        };
+
+        f.Shown += (s, e) => ThreadPool.QueueUserWorkItem(_ =>
+        {
+            string o = RunPy("model_check.py", "--rows");
+            try
+            {
+                f.BeginInvoke((Action)(() =>
+                {
+                    list.SuspendLayout();
+                    list.Controls.Clear();
+                    int y = 10, textW = list.ClientSize.Width - 230, n = 0;
+                    string last = "";
+                    foreach (var line in o.Replace("\r", "").Split('\n'))
+                    {
+                        var c = line.Split('\t');
+                        if (c.Length < 3) { if (line.Trim().Length > 0) c = new[] { "info", "", line.Trim(), "" }; else continue; }
+                        string fit = c[0], area = c[1], text = c[2], action = c.Length > 3 ? c[3].Trim() : "";
+                        n++;
+                        if (area != last && area.Length > 0)
+                        {
+                            var a = new Label();
+                            a.Text = area;
+                            a.ForeColor = Green;
+                            a.Font = new Font("Segoe UI Semibold", 10f);
+                            a.SetBounds(10, y + (last.Length > 0 ? 6 : 0), textW + 90, 22);
+                            list.Controls.Add(a);
+                            y += last.Length > 0 ? 30 : 24;
+                            last = area;
+                        }
+                        var tag = new Label();
+                        tag.Text = fit == "fits" ? "Fits" : fit == "tight" ? "Tight" : fit == "won't fit" ? "Won't fit"
+                                 : fit == "update" ? "Update" : "Note";
+                        tag.ForeColor = fit == "fits" ? Green : fit == "tight" || fit == "update" ? Gold : fit == "won't fit" ? Red : Dim;
+                        tag.BackColor = Bg;
+                        tag.TextAlign = ContentAlignment.MiddleCenter;
+                        tag.Font = new Font("Segoe UI Semibold", 9f);
+                        tag.SetBounds(10, y, 74, 22);
+                        list.Controls.Add(tag);
+                        var t = new Label();
+                        t.Text = text;
+                        t.ForeColor = Ink;
+                        t.AutoSize = true;
+                        t.MaximumSize = new Size(textW, 0);
+                        t.Location = new Point(94, y + 1);
+                        list.Controls.Add(t);
+
+                        var act = action.Split('|');
+                        if ((act[0] == "pull" && act.Length == 3) || (act[0] == "hf" && act.Length == 4) || (act[0] == "open" && act.Length == 2))
+                        {
+                            var b = new Button();
+                            bool upd = act[0] == "pull" && text.Contains("an update is out");
+                            b.Text = act[0] == "open" ? "Open page" : upd ? "Update" : "Get";
+                            b.Tag = upd ? "update" : "get";
+                            b.SetBounds(94 + textW + 14, y - 2, 96, 28);
+                            StyleButton(b);
+                            if (act[0] == "open")
+                            {
+                                string url = act[1];
+                                b.Click += (s2, e2) => OthosApp.OpenUrl(url);
+                            }
+                            else
+                            {
+                                getButtons.Add(b);
+                                b.Click += (s2, e2) =>
+                                {
+                                    if (dl != null && dlButton == b)
+                                    {
+                                        try { var p = dl; dl = null; p.Kill(); } catch { }
+                                        return;
+                                    }
+                                    if (dl == null) startDownload(b, act);
+                                };
+                            }
+                            list.Controls.Add(b);
+                        }
+                        y += Math.Max(28, t.PreferredHeight) + 8;
+                    }
+                    list.ResumeLayout();
+                    int news = ModelNews();
+                    checkedText = n == 0 ? "The check didn't run. Is the .venv folder set up (setup.ps1)?"
+                             : "Checked " + DateTime.Now.ToString("ddd d MMM, h:mm tt") + ". " +
+                               (news > 0 ? news + " new or updated since the last check." : "Nothing new since the last check.") +
+                               " Next weekly check in 7 days.";
+                    sub.Text = checkedText;
+                    modelsRow.Visible = false;
+                }));
+            }
+            catch { }
+        });
+        f.Show();   // not owned: the Othos window minimizes to the taskbar
+    }
+
+    void StyleButton(Button b)
+    {
+        b.FlatStyle = FlatStyle.Flat;
+        b.FlatAppearance.BorderColor = PurpleLine;
+        b.FlatAppearance.MouseOverBackColor = PurpleHover;
+        b.FlatAppearance.MouseDownBackColor = PurpleHover;
+        b.BackColor = PurpleFill;
+        b.ForeColor = Ink;
+    }
+
+    static string Gb(long bytes)
+    {
+        return bytes >= 1000000000 ? (bytes / 1e9).ToString("0.0") + " GB" : (bytes / 1e6).ToString("0") + " MB";
+    }
+
+    static string JsonField(string json, string key)
+    {
+        var m = Regex.Match(json, "\"" + key + "\":\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
+        if (!m.Success) return "";
+        try { return Regex.Unescape(m.Groups[1].Value); } catch { return m.Groups[1].Value; }
+    }
+
+    static long JsonNumber(string json, string key)
+    {
+        var m = Regex.Match(json, "\"" + key + "\":\\s*(\\d+)");
+        long v;
+        return m.Success && long.TryParse(m.Groups[1].Value, out v) ? v : 0;
+    }
+
     int btnY = 200;
 
     Button MakeButton(string text, int x)
@@ -544,8 +941,8 @@ class MainForm : Form
     protected override void OnShown(EventArgs e)
     {
         base.OnShown(e);
-        if (File.Exists(SpecsFile)) WindowState = FormWindowState.Minimized;   // lives on the taskbar
-        else BeginInvoke((Action)(() => { AskSpecsOnce(); WindowState = FormWindowState.Minimized; }));
+        if (File.Exists(SpecsFile)) { WindowState = FormWindowState.Minimized; ModelCheckIfDue(); }   // lives on the taskbar
+        else BeginInvoke((Action)(() => { AskSpecsOnce(); WindowState = FormWindowState.Minimized; }));   // one question per start
         // start-othos.ps1 waits for the call page (up to ~2 minutes), so run it off the UI thread
         ThreadPool.QueueUserWorkItem(_ =>
         {

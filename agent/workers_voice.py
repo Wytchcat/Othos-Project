@@ -280,6 +280,8 @@ class WorkersVoice:
         self.session = session
         self.reading: tuple[str, list[str], int] | None = None       # (what it's from, pieces, next piece)
         self.pending: tuple[Queue, int, str] | None = None          # (queue, task, "kept"/"discarded")
+        self.pending_out: tuple[Queue, int] | None = None           # a task waiting for free tokens: asked
+        self._asked_out: set[tuple[str, int]] = set()                # asked once per task
         self._announcer: asyncio.Task | None = None
         self.howto = howto_recorder.Recorder()                      # picks up a recording left running
 
@@ -288,6 +290,8 @@ class WorkersVoice:
         if (said := self._howto(text)) is not None:
             return said
         reading, self.reading = self.reading, None   # "read the rest" only right after a read
+        if (said := self._out_answer(text)) is not None:
+            return said
         pending, self.pending = self.pending, None
         if pending:
             q, job_id, verdict = pending
@@ -730,6 +734,48 @@ class WorkersVoice:
         return f"{word} {_name(q, job_id)}, {_title(q, job)}? Say yes or no."
 
     # -- "it's ready" announcements, between turns only
+    # -- a task waiting for free tokens (worker_cloud.Chain): "finish on this PC, or wait?"
+    def _waiting_out(self) -> list[tuple[Queue, dict]]:
+        out = []
+        for q in INSTALLED:
+            st = q.read_status()
+            if st.get("state") == "waiting for free tokens" and st.get("task_id") and q.running():
+                out.append((q, st))
+        return out
+
+    def _out_answer(self, text: str) -> str | None:
+        """Her answer to the free-tokens question, or "finish task 3 on this PC" at any time.
+        This PC only on a clear yes (worker_shared.answer) or her own "finish it on this PC" with
+        no "no" word in it; anything else, or nothing, leaves it waiting. The question is used up
+        by the first reply, so a later "yes" to something else can't count."""
+        m = _OUT_LOCAL.search(text)
+        if m and worker_shared.answer(text) == "no":    # "don't finish it on this PC", "no, wait"
+            m = None
+        target = None
+        if m and m.group("n"):
+            n = _num(m.group("n"))
+            target = next(((q, st) for q, st in self._waiting_out() if int(st["task_id"]) == n), None)
+        elif self.pending_out:
+            q, n = self.pending_out
+            target = next(((q2, st) for q2, st in self._waiting_out() if q2 is q and int(st["task_id"]) == n), None)
+        if target is None:
+            if self.pending_out and not m:
+                self.pending_out = None                # that task isn't waiting any more
+            return None
+        q, st = target
+        n = int(st["task_id"])
+        asked, self.pending_out = self.pending_out, None
+        if m or (asked and worker_shared.answer(text) == "yes"):
+            choice = "local"
+        elif asked and (_OUT_WAIT.search(text) or worker_shared.answer(text) == "no"):
+            choice = "wait"
+        else:
+            return None                                # not an answer: it keeps waiting
+        worker_cloud.set_out_choice(q.status_path, n, choice)
+        if choice == "local":
+            return f"Okay, {_name(q, n)} carries on with this PC's model. It's slower, but nothing more is sent out."
+        return f"Okay, {_name(q, n)} waits, and carries on by itself {_spoken_time(st.get('free_tokens_back_ts') or 0)}."
+
     def start_announcer(self) -> None:
         if self.session is not None and self._announcer is None:
             self._announcer = asyncio.create_task(self._announce_loop())
@@ -745,6 +791,18 @@ class WorkersVoice:
         while True:
             try:
                 if self._between_turns():
+                    for q, st in await asyncio.to_thread(self._waiting_out):
+                        key = (q.key, int(st["task_id"]))
+                        if key in self._asked_out or st.get("out_choice"):
+                            continue
+                        self._asked_out.add(key)
+                        self.pending_out = (q, key[1])
+                        when = _spoken_time(st.get("free_tokens_back_ts") or 0)
+                        self.session.say(f"{_name(q, key[1])}, {st.get('task_title') or 'its task'}, has used up the free "
+                                         f"tokens on every provider in the switch order. Should I finish it on this PC "
+                                         f"now? Or say wait, and it carries on by itself {when}.", allow_interruptions=True)
+                        log.info("workers: asked about free tokens for %s", _name(q, key[1]))
+                        break
                     jobs = [(q, j) for q in INSTALLED for j in await asyncio.to_thread(q.unannounced)]
                     if jobs:
                         if first:   # finished while the user was away
@@ -768,6 +826,13 @@ class WorkersVoice:
             except Exception as e:
                 log.warning("worker announcement failed: %s", e)
             await asyncio.sleep(5)
+
+
+# "finish it on this PC", "finish task 3 on the computer", "do it locally"
+_OUT_LOCAL = re.compile(r"\b(?:finish|carry\s+on|continue|do)\b(?:\s+(?:task\s+)?(?P<n>" + _N[1:-1] + r"))?"
+                        r"[\w\s,]{0,30}?\b(?:on|with)\s+(?:this|the|my)\s+(?:pc|computer|laptop|machine|local\s+model)\b"
+                        r"|\blocally\b", re.I)
+_OUT_WAIT = re.compile(r"\b(?:wait|later|hold\s+on|leave\s+it)\b", re.I)
 
 
 def _spoken_time(ts) -> str:

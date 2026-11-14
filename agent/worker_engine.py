@@ -147,6 +147,9 @@ def save_artifact(results_dir: Path, job_id: int, kind: str, full: str) -> Path 
     return path
 
 
+FREE_TOKENS_GRACE = 300   # carry on 5 minutes after free tokens are back (the user's resume rule)
+
+
 class TaskContext:
     """What a several-step task (run=...) gets: the model, and a chat() that keeps
     pausing, stopping and the progress figure working across all its steps."""
@@ -210,6 +213,9 @@ class Worker:
                 "elapsed": round(time.time() - cur["started"]) if cur.get("started") else None,
                 "progress": cur.get("progress"),
                 "paused_task": self.paused_task if state == "paused" else None,
+                # every provider in the switch order is out (worker_cloud.Chain): when they're back, and her answer
+                "free_tokens_back_ts": cur.get("free_tokens_back") if state == "waiting for free tokens" else None,
+                "out_choice": cur.get("out_choice", "") if state == "waiting for free tokens" else "",
                 "queued": c.get("queued", 0), "review": c.get("review", 0),
                 "models": self.cfg.get("models", {}),
             }, indent=2), encoding="utf-8")
@@ -258,7 +264,8 @@ class Worker:
         self.backend.set_low_priority(held and bool(self.mode_settings.get("low_priority")))
         # a provider named for this task (off unless turned on in the settings; worker_cloud.py)
         try:
-            cloud = worker_cloud.pick(self.cfg, json.loads(row["params"] or "{}"), row["type"])
+            cloud = worker_cloud.pick(self.cfg, json.loads(row["params"] or "{}"), row["type"],
+                                      local=(self.backend, model))   # this PC's model: the last stop when switching
         except ValueError as e:
             q.fail(row["id"], str(e), retry=False)
             log.info("task %d not started: %s", row["id"], e)
@@ -275,7 +282,7 @@ class Worker:
         log.info("task %d (%s): %s, %d threads%s", row["id"], row["type"], model, threads,
                  f", held back for {self.mode_why}" if held else "")
         self.write_status("held back" if held else "working")
-        deadline = time.monotonic() + 60 * float(self.cfg.get(jt.minutes_key, self.cfg.get("max_job_minutes", 30)))
+        deadline = [time.monotonic() + 60 * float(self.cfg.get(jt.minutes_key, self.cfg.get("max_job_minutes", 30)))]
         last_check = [0.0]
 
         def should_stop(chars: int = 0, frac: float | None = None):
@@ -289,10 +296,13 @@ class Worker:
             self.check_games()
             if (self.mode, self.mode_why) != start_mode:
                 raise Stopped("games")       # paused, or held-back settings changed
-            if time.monotonic() > deadline:
+            if time.monotonic() > deadline[0]:
                 raise Stopped("timeout")
             self.write_status("held back" if held else "working")
 
+        if isinstance(backend, worker_cloud.Chain) and \
+                str((self.cfg.get("cloud") or {}).get("when_all_out", "ask")).lower() != "local":
+            backend.ask = lambda back: self._wait_for_tokens(row, back, deadline)
         t0 = time.monotonic()
         artifact = None
         try:
@@ -323,6 +333,8 @@ class Worker:
             summary = ("The model mostly copied the file instead of reviewing it; a bigger coding "
                        "model should do better. " + summary)
             log.info("task %d: the result mostly repeats the file", row["id"])
+        if getattr(backend, "used", None):            # switching: who did the steps (worker_cloud.Chain)
+            model = "providers used: " + ", then ".join(backend.used)
         q.results_dir.mkdir(parents=True, exist_ok=True)
         path = q.results_dir / f"{row['id']:05d}-{row['type']}.md"
         if artifact is None:
@@ -339,6 +351,50 @@ class Worker:
         q.finish(row["id"], str(path), model, summary, str(artifact) if artifact else "")
         self.paused_task = None if (self.paused_task or {}).get("id") == row["id"] else self.paused_task
         log.info("task %d done in %.0f s -> %s (waiting for review)", row["id"], time.monotonic() - t0, path.name)
+
+    def _wait_for_tokens(self, row, back: float, deadline: list) -> str:
+        """Every provider in the switch order is out of free tokens: wait here (nothing lost) and
+        ask. "local" = finish on this PC's model now; "retry" = 5 minutes after the earliest free
+        tokens are back (also when no one answers). Waiting doesn't count against the job's time,
+        and it gives up the CPU turn meanwhile, so the other worker isn't held up."""
+        q, start = self.q, time.monotonic()
+        self.cpu.release()                             # nothing runs here while it waits
+        resume = max(back, time.time()) + FREE_TOKENS_GRACE
+        worker_cloud.set_out_choice(q.status_path, row["id"], "")
+        self.current.update({"free_tokens_back": resume, "out_choice": ""})
+        log.info("task %d: every provider in the switch order is out; waiting (asking: this PC, or wait until %s)",
+                 row["id"], time.strftime("%H:%M", time.localtime(resume)))
+        try:
+            while True:
+                if q.status_of(row["id"]) != "running":
+                    raise Stopped("cancelled")
+                choice = worker_cloud.out_choice(q.status_path, row["id"])
+                if choice == "local":
+                    log.info("task %d: finishing on this PC's model (her choice)", row["id"])
+                    result = "local"
+                    break
+                if choice == "wait" and self.current.get("out_choice") != "wait":
+                    self.current["out_choice"] = "wait"
+                    log.info("task %d: waiting for free tokens (her choice)", row["id"])
+                if time.time() >= resume:
+                    log.info("task %d: free tokens should be back; carrying on", row["id"])
+                    result = "retry"
+                    break
+                self.write_status("waiting for free tokens")
+                time.sleep(2)
+            while not self.cpu.try_acquire():          # back in turn for the CPU before going on
+                if q.status_of(row["id"]) != "running":
+                    raise Stopped("cancelled")
+                other = self.cpu.holder()
+                self.write_status("waiting for the CPU", {"firestarter": "Firestarter", "smithy": "The Smithy"}
+                                  .get(other or "", other or "the other worker"))
+                time.sleep(2)
+            return result
+        finally:
+            deadline[0] += time.monotonic() - start
+            self.current.pop("free_tokens_back", None)
+            self.current.pop("out_choice", None)
+            self.write_status("working")
 
     def run(self) -> None:
         n = self.q.recover_running()
@@ -387,6 +443,12 @@ def main(profile: Profile, argv: list[str]) -> None:
     if worker_cloud.command(argv, profile.config_path):   # the Providers window's commands
         return
     cmd = argv[1] if len(argv) > 1 else "status"
+    if cmd == "out-choice":                             # a task waiting for free tokens: local | wait
+        if len(argv) < 4 or argv[3] not in ("local", "wait") or not argv[2].isdigit():
+            raise SystemExit("usage: out-choice TASK local|wait")
+        worker_cloud.set_out_choice(q.status_path, int(argv[2]), argv[3])
+        print("saved")
+        return
     if cmd == "run":
         Worker(profile).run()
     elif cmd == "add":

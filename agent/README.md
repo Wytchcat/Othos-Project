@@ -19,6 +19,8 @@ mixed and offline modes, the voice commands, privacy, hardware and troubleshooti
 | `worker_*.py`, `model_fetch.py`, `app\WorkerApp.cs` | the worker engine The Smithy runs on |
 | `workers_voice.py` | the workers by voice ("ask the Smithy to...") |
 | `app\Othos.cs`, `build-othos-app.ps1` | the Othos taskbar app |
+| `system_specs.py` | the PC check ("Check my PC..."): this PC's specs and the settings that fit it |
+| `model_check.py`, `models-tested.json` | the weekly model check ("Check models..."): new or updated models for voice Othos and The Smithy, and whether this PC can run them. Its window has a Get button (a Yes/No first) for each model this PC can run. `models-tested.json` lists the models tested with this version |
 | `start-othos.ps1/.bat`, `stop-othos.ps1/.bat`, `restart-agent.ps1`, `othos-tray.ps1` | starting and stopping |
 | `setup.ps1`, `doctor.ps1` | set-up and checks |
 | `requirements.txt`, `update-requirements.ps1`, `githooks\` | pinned packages and the check that keeps them pinned |

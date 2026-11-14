@@ -76,10 +76,14 @@ def _cloud(argv: list[str]) -> bool:
             if not p:
                 continue
             try:
-                worker_cloud.pick(cfg, {"provider": p.name}, "review")
+                worker_cloud.pick(cfg, {"provider": p.name, "no_switch": True}, "review")
                 ready.append({"name": p.name, "label": p.spoken + (" (this PC)" if p.local else " (this PC, then cloud)" if p.proxy else " (cloud)")})
             except ValueError as e:
                 why[p.name] = str(e)
+        order = [str(n).lower() for n in cc.get("switch_order", [])]
+        in_order = [r["label"].split(" (")[0] for n in order for r in ready if r["name"] == n]
+        if in_order:                                   # one after another as free tokens run out (worker_cloud.Chain)
+            ready.insert(0, {"name": "auto", "label": "Switching: " + ", ".join(in_order) + ", then this PC"})
         u = worker_cloud.usage_today()
         tot = {"tokens": sum(v.get("in", 0) + v.get("out", 0) for v in u["providers"].values()),
                "usd": round(sum(v.get("usd", 0.0) for v in u["providers"].values()), 4),
@@ -96,7 +100,8 @@ def _cloud(argv: list[str]) -> bool:
             raise SystemExit(f"can't use that: {e}")
     cfg.setdefault("cloud", {})["default"] = "" if name in ("", "local") else name
     path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
-    print(f"tasks now use {'the local model' if name in ('', 'local') else name} (from the next task)")
+    said = 'the local model' if name in ('', 'local') else 'switching (the switch order, then the local model)' if name == 'auto' else name
+    print(f"tasks now use {said} (from the next task)")
     return True
 
 

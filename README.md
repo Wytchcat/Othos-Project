@@ -60,6 +60,8 @@ Othos\
      yes, it shows which models and settings fit your PC, local options first, and can
      apply them (backing up first). Nothing leaves your computer. **Check my PC…** in the
      window does this again any time.
+   - Once a week the window asks **"Check for updated models?"** (see
+     [The weekly model check](#the-weekly-model-check)). **Check models…** runs it any time.
    - To stop Othos without the app, run `agent\stop-othos.bat`.
 
 ## Setup modes
@@ -140,6 +142,7 @@ for a made-up user; it's never used. Close and reopen Othos after editing.
 | `state_news.feeds`, `state_news.trigger_words` | state news feeds, and extra words that mean state news (the capital, say) | `["jefferson city"]` |
 | `pronunciations` | how the voice should say local place names (added to `pronunciations.json`, which has the tech words) | `{"Ozarks": "Oh zarks"}` |
 | `keyterms` | names speech-to-text keeps mishearing (Deepgram key terms; a hint for local Whisper) | `["Springfield"]` |
+| `model_check` | the weekly model check: `"ask"` (a Yes/No once a week, the default), `"auto"` (checks without asking and shows a line in the Othos window when something is new) or `"off"` (only from **Check models…**) | `"ask"` |
 
 `agent\profile.md` holds a few lines about you and how you like Othos to behave
 ("Keep answers to one or two sentences unless asked for more", "I'm vegetarian", "I live
@@ -263,10 +266,56 @@ a separate add-on with its own repository, **published later**; it isn't availab
   point: the National Weather Service, Wikipedia (it also sees your `contact_url`), Stack
   Exchange, GitHub, RSS feeds, and, with your keys, Ravelry, YouTube, Twitch, The Guardian
   and the NYT.
+- **The weekly model check** asks ollama.com, Hugging Face and GitHub about newer models.
+  It runs only when you say yes, click **Check models…**, or set `"model_check": "auto"`.
+  It sends only model family names (and, like any web request, your computer's internet
+  address). There's no account and no cookies. Nothing is downloaded unless you click
+  **Get** and say yes. The same check also re-reads the free limits of the model providers
+  you turned on in The Smithy (only their own free account pages, with the keys you saved
+  there, no test requests). With no provider on, that part does nothing.
 - **Othos never sends, posts or deletes anything** on your behalf. Keep or discard goes
   through a yes/no check in code. The Smithy never runs, installs or applies anything.
 - The call page and LiveKit server listen on `127.0.0.1` only, so other devices on your
   network can't reach them.
+
+## The weekly model check
+
+Once a week the Othos window asks **"Check for updated models?"** with **Yes, check** or
+**Not now**. "Not now" asks again a week later. **Check models…** at the top of the window
+checks any time. To change how it starts, set `model_check` in `personal.json` (`"ask"`,
+`"auto"` or `"off"`).
+
+**The check itself downloads nothing.** The list shows:
+
+1. **Models tested with your version** (`agent\models-tested.json`), for each job: voice
+   conversation, camera, notes search, and coding (The Smithy). Each says whether it's
+   installed, whether the Ollama library has an update for it, or how to get it.
+2. **Newer models in the same families**, marked "not tested yet": from the Ollama library,
+   plus GGUF files from trusted Hugging Face publishers for llama-server.
+3. **A newer Ollama** (and llama.cpp, if The Smithy uses llama-server), from GitHub.
+4. **The model providers you turned on** in The Smithy's **Providers…** window. These come
+   last, after the local models. Each check also quietly re-reads their free limits (their
+   own free account pages, no test requests) so the Providers window stays in the right
+   order.
+
+Each model gets **Fits**, **Tight** or **Won't fit**, from your PC's RAM and graphics card
+(the **Check my PC…** figures). Voice models too big to answer quickly on a CPU are marked
+Tight at best.
+
+**To get a model,** click **Get** (or **Update**) on its row:
+
+1. A Yes/No shows the download size and how much space is free. If there isn't enough
+   room, it tells you and doesn't start.
+2. Click **Yes, download**. Progress shows at the top of the window. **Cancel** stops it,
+   and Get carries on later where it left off.
+3. When it's done, the row says **Installed**. Downloading doesn't change which model is
+   used: switch with **Check my PC… → Apply** (voice), or The Smithy's model switcher
+   (coding).
+
+Models marked **Won't fit** get no button. **Open page** on a newer Ollama opens its
+download page. The last check is saved in `agent\state\model-check.json`.
+
+From the command line: `.venv\Scripts\python.exe model_check.py` (in `agent\`).
 
 ## Hardware
 

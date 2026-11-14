@@ -131,7 +131,12 @@ def _check_followup(p):
 _PART = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9 ._()+-]{0,79}$")
 _NO_BUILD_EXT = {".exe", ".dll", ".so", ".dylib", ".bin", ".msi", ".com", ".scr", ".sys", ".lnk", ".zip", ".7z",
                  ".rar", ".tar", ".gz", ".jar", ".class", ".pyc", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp",
-                 ".pdf", ".db", ".sqlite"}
+                 ".pdf", ".db", ".sqlite",
+                 # pictures, sound, video and fonts (a model can only write text; Nov 13: a .bmp came back
+                 # as the model's apology)
+                 ".bmp", ".tif", ".tiff", ".icns", ".cur", ".ani", ".psd", ".xcf", ".avif", ".heic",
+                 ".wav", ".mp3", ".ogg", ".flac", ".m4a", ".mp4", ".mov", ".avi", ".mkv", ".webm",
+                 ".ttf", ".otf", ".woff", ".woff2", ".eot"}
 _KEEP_DOTFILES = {".htaccess", ".gitignore", ".editorconfig"}
 _RESERVED = re.compile(r"^(?:con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\..*)?$", re.I)   # device names
 
@@ -238,6 +243,37 @@ def parse_plan(text: str, max_files: int) -> tuple[str, str, dict]:
     return summary, desc, {"name": slug(plan.get("name") or ""), "files": files}
 
 
+_REFUSAL = re.compile(r"^\W*(?:I[’']?m sorry|I am sorry|Sorry[,!]?\s+(?:but|I)\b|I can[’']?t|I cannot|I'm unable|I am unable|"
+                      r"Unfortunately,? I|As an AI)", re.I)
+
+
+def _refusal(body: str) -> bool:
+    """The model saying it can't write the file, instead of the file (short, starts like an apology)."""
+    return len(body) < 1500 and bool(_REFUSAL.match(body.strip()))
+
+
+def _join_continued(text: str, more: str) -> str:
+    """A cut-off reply plus the model's "continue". When the continuation starts the file over
+    (its first code line is the file's first code line), keep the fresh copy instead of both
+    (Nov 13: run-setup.ps1 came out twice, joined mid-word). When it repeats the last few lines,
+    drop the repeat."""
+    if more.lstrip().startswith("```"):                 # "```csharp" opening a new block: drop that whole line
+        more = more.lstrip().split("\n", 1)[1] if "\n" in more.lstrip() else ""
+    head, sep, code = text.partition("```")
+    code_lines = [l for l in code.split("\n")[1:] if l.strip()] if sep else []
+    more_lines = [l for l in more.split("\n") if l.strip()]
+    if code_lines and more_lines and more_lines[0].strip() == code_lines[0].strip():
+        fence_line = code.split("\n", 1)[0]
+        fresh = head + "```" + fence_line + "\n" + more.lstrip("\n")
+        # keep whichever got further: a fresh copy cut off at the same place again is no progress
+        # (Nov 13, installer v4: restarts in a row left the file cut off)
+        return fresh if len(fresh) > len(text) else text
+    for k in range(min(len(text), len(more), 400), 19, -1):   # the overlap: the end of text = the start of more
+        if text.endswith(more[:k]):
+            return text + more[k:]
+    return text + more
+
+
 def _strip_outer_fence(text: str, markdown: bool) -> str:
     t = text.strip()
     m = re.match(r"^```[^\n]*\n([\s\S]*)\n```\s*$", t)          # the whole answer is one block
@@ -250,6 +286,14 @@ def _strip_outer_fence(text: str, markdown: bool) -> str:
             if last > first.end():
                 return t[first.end():last] + "\n"
     return t + "\n"
+
+
+# Windows' own C# compiler (.NET Framework csc.exe, used by the Smithy's and Firestarter's apps) only
+# knows C# 5 (Nov 13: the installer's $"..." strings gave 49 errors).
+CSHARP5 = (" It's compiled with the C# compiler that comes with Windows (.NET Framework csc.exe), which only "
+           "knows C# 5: no $\"...\" strings (use string.Format or +), no ?. or ?? =, no => bodies on methods or "
+           "properties, no nameof, no tuples, no out var, no using static.")
+_WINDOWS_CSC = re.compile(r"csc(?:\.exe)?\b|\.NET Framework|Framework64|compiler that comes with Windows", re.I)
 
 
 def _file_messages(p: dict, desc: str, plan: dict, rel: str, written: dict[str, str], budget: int,
@@ -275,7 +319,12 @@ def _file_messages(p: dict, desc: str, plan: dict, rel: str, written: dict[str, 
         msgs.append({"role": "user", "content": f"The earlier version of {rel}:\n{old[:budget // 2]}\n\n"
                                                 f"The change wanted: {redact(p.get('change', ''))}"})
     msgs.append({"role": "user", "content":
-                 f"Now write the complete file {rel} ({purpose}). " +
+                 f"Now write the complete file {rel} ({purpose})."
+                 + (CSHARP5 if rel.lower().endswith(".cs") and _WINDOWS_CSC.search(
+                     # the request, this version's change, the design, the earlier version of this file
+                     # and the files written so far (a build script naming csc.exe): any of them
+                     " ".join([str(p.get("request", "")), str(p.get("change", "")), desc, old or ""]
+                              + list(written.values()))) else "") + " " +
                  ("Reply with only the file's text, no outer code fence." if md else
                   "Reply with only one fenced code block that holds the whole file, nothing before or after it.")})
     return msgs
@@ -313,6 +362,13 @@ def run_build(ctx, p: dict):
     job_id = ctx.row["id"]
     max_files = int(ctx.cfg.get("max_build_files", 20))
     budget = int(ctx.cfg.get("context_tokens", 8192)) * 3 // 2      # characters of earlier files to show
+    # a cloud model (or the switch order) reads far more than the laptop's local one: show it
+    # enough of the earlier version to keep what it's told to keep (Nov 13, installer v4 saw 6,000
+    # of v3's 27,000 characters and rewrote the rest). 64,000 characters is about 16,000 tokens,
+    # under Cerebras's 30,000 tokens a minute with the answer.
+    backend_name = str(getattr(getattr(ctx, "backend", None), "name", ""))
+    if "cloud" in backend_name or backend_name.startswith("switching"):
+        budget = max(budget, int(ctx.cfg.get("cloud_build_chars", 64000)))
     results = SMITHY.results_dir
     results.mkdir(parents=True, exist_ok=True)
     plan_path = results / f"{job_id:05d}-plan.json"
@@ -339,9 +395,15 @@ def run_build(ctx, p: dict):
             again = ctx.chat(msgs + [{"role": "assistant", "content": answer},
                                      {"role": "user", "content": f"I can't use that plan: {problem}. Reply with only "
                                       "the corrected ```json block (name and files), with real relative paths, "
-                                      "nothing else."}], 800)
+                                      "nothing else."}], 3000)   # room for models that think first
             try:
-                summary, desc, plan = parse_plan(answer + "\n\n" + again, max_files)
+                try:
+                    summary, desc, plan = parse_plan(answer + "\n\n" + again, max_files)
+                except ValueError:
+                    # the first answer's broken plan block comes first and wins: keep its words,
+                    # drop its code blocks, and read the corrected plan (Nov 13: tasks 3 and 5)
+                    words = re.sub(r"```[\s\S]*?(?:```|$)", "", answer)
+                    summary, desc, plan = parse_plan(words + "\n\n" + again, max_files)
             except ValueError:
                 # kept so it can be looked at; the task fails with the reason
                 (results / f"{job_id:05d}-plan-unreadable.txt").write_text(
@@ -357,6 +419,8 @@ def run_build(ctx, p: dict):
 
     # 2. each file in turn, with the plan and the files so far as context
     written: dict[str, str] = {}
+    refused_files: list[str] = []
+    cut_files: list[str] = []
     n = len(plan["files"])
     for i, f in enumerate(plan["files"]):
         rel = f["path"]
@@ -372,8 +436,33 @@ def run_build(ctx, p: dict):
             continue
         ctx.step(0.10 + 0.80 * i / n, 0.10 + 0.80 * (i + 1) / n)
         old = old_path.read_text(encoding="utf-8", errors="replace") if old_path else None
-        text = ctx.chat(_file_messages(p, desc, plan, rel, written, budget, old), 3000)
+        msgs = _file_messages(p, desc, plan, rel, written, budget, old)
+        text = ctx.chat(msgs, 3000)
+        # a reply cut off part way (a code block opened but never closed: the model or the provider
+        # hit its length limit): ask it to carry on where it stopped, a few times
+        for _ in range(4):
+            if rel.lower().endswith(".md") or text.count("```") % 2 == 0:
+                break
+            # cut back to the last whole line first: models resume at the next line, so a line cut
+            # in the middle lost its end (Nov 13, installer v2 and v3: "rtbOutput.ScrollTo" + the next
+            # method). Then name that line, so it carries on from just after it.
+            if "\n" in text and not text.endswith("\n"):
+                text = text[:text.rindex("\n") + 1]
+            last = next((l for l in reversed(text.split("\n")) if l.strip()), "")
+            more = ctx.chat(msgs + [{"role": "assistant", "content": text},
+                                    {"role": "user", "content": "That was cut off. The last complete line was:\n"
+                                     + last + "\nContinue with the line right after it. Don't start the file over: "
+                                     "no repeating, no explanation, and close the code block when the file is "
+                                     "done."}], 6000)                   # room for models that think first
+            text = _join_continued(text, more)
+        if not rel.lower().endswith(".md") and text.count("```") % 2:   # still cut off: say so, don't hide it
+            log.warning("build %d: %s is still cut off after 4 tries to continue", job_id, rel)
+            cut_files.append(rel)
         body = _strip_outer_fence(text, rel.lower().endswith(".md"))
+        if _refusal(body):                              # the model couldn't write it: leave it out, say so
+            log.warning("build %d: %s left out (the model said it can't write it)", job_id, rel)
+            refused_files.append(rel)
+            continue
         target.write_text(body, encoding="utf-8")
         written[rel] = body
 
@@ -385,6 +474,10 @@ def run_build(ctx, p: dict):
                           encoding="utf-8")
 
     files = sorted(written) + ["README.md"]
+    if cut_files:
+        desc += "\n\n**Cut off (incomplete, needs finishing):** " + ", ".join(f"`{r}`" for r in cut_files)
+    if refused_files:
+        desc += "\n\n**Left out (the model said it couldn't write them):** " + ", ".join(f"`{r}`" for r in refused_files)
     what = "Joomla override" if p.get("joomla") else "project"
     spoken = (f"I built {'version ' + str(version) + ' of ' if version > 1 else ''}the {what} called "
               f"{name.replace('-', ' ')}: {len(files)} files, in its own folder in the Smithy's drafts. "

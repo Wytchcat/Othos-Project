@@ -167,6 +167,74 @@ static class FirestarterApp
     }
 }
 
+// Pop-ups in the colours of the window they come from (the user, Nov 13: "All popups match the
+// color scheme of the logo/ui it is from"): the dark background, the app's own accent (the
+// Smithy's steel blue, Firestarter's ember) on a stripe and the main button, gold for a warning,
+// and the purple buttons, in place of Windows' white message box. Same calls and answers as
+// MessageBox.Show; closing it with X counts as No.
+static class ThemedBox
+{
+    static readonly Color Bg = Color.FromArgb(2, 7, 5), Ink = Color.FromArgb(200, 230, 210),
+        Gold = Color.FromArgb(231, 195, 104), PurpleFill = Color.FromArgb(14, 16, 25),
+        PurpleLine = Color.FromArgb(64, 53, 105), PurpleHover = Color.FromArgb(25, 24, 43);
+
+    public static DialogResult Show(IWin32Window owner, string text, string caption)
+    { return Show(owner, text, caption, MessageBoxButtons.OK, MessageBoxIcon.None, MessageBoxDefaultButton.Button1); }
+
+    public static DialogResult Show(IWin32Window owner, string text, string caption, MessageBoxButtons buttons, MessageBoxIcon icon)
+    { return Show(owner, text, caption, buttons, icon, MessageBoxDefaultButton.Button1); }
+
+    public static DialogResult Show(IWin32Window owner, string text, string caption, MessageBoxButtons buttons,
+                                    MessageBoxIcon icon, MessageBoxDefaultButton def)
+    {
+        bool yesNo = buttons == MessageBoxButtons.YesNo;
+        Color accent = icon == MessageBoxIcon.Warning ? Gold : FirestarterApp.Accent;
+        using (var f = new Form())
+        {
+            f.Text = caption;
+            f.FormBorderStyle = FormBorderStyle.FixedDialog; f.MaximizeBox = false; f.MinimizeBox = false;
+            f.ShowInTaskbar = false;
+            try { f.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
+            f.BackColor = Bg; f.ForeColor = Ink; f.Font = new Font("Segoe UI", 10f);
+
+            var msg = new Label(); msg.Text = text; msg.ForeColor = Ink; msg.AutoSize = true;
+            msg.MaximumSize = new Size(430, 0); msg.Location = new Point(30, 22);
+            f.Controls.Add(msg);
+            int h = Math.Max(msg.GetPreferredSize(new Size(430, 0)).Height, 22);
+            int w = 490, by = 22 + h + 22;
+
+            Func<string, DialogResult, int, bool, Button> make = (t, r, x, main) =>
+            {
+                var b = new Button(); b.Text = t; b.DialogResult = r; b.SetBounds(x, by, 100, 30);
+                b.FlatStyle = FlatStyle.Flat; b.BackColor = PurpleFill; b.ForeColor = Ink;
+                b.FlatAppearance.BorderColor = main ? accent : PurpleLine; b.FlatAppearance.MouseOverBackColor = PurpleHover;
+                f.Controls.Add(b); return b;
+            };
+            Button first, second = null;
+            if (yesNo)
+            {
+                first = make("Yes", DialogResult.Yes, w - 24 - 210, def != MessageBoxDefaultButton.Button2);
+                second = make("No", DialogResult.No, w - 24 - 100, def == MessageBoxDefaultButton.Button2);
+                f.CancelButton = second;
+            }
+            else { first = make("OK", DialogResult.OK, w - 24 - 100, true); f.CancelButton = first; }
+            f.AcceptButton = def == MessageBoxDefaultButton.Button2 && second != null ? second : first;
+            f.ClientSize = new Size(w, by + 30 + 18);
+
+            var stripe = new Panel(); stripe.BackColor = accent; stripe.SetBounds(0, 0, 6, f.ClientSize.Height);
+            f.Controls.Add(stripe);
+            f.Shown += (s, e) => ((Button)f.AcceptButton).Focus();
+
+            // the worker windows live minimized on the taskbar: then centre on the screen, in front
+            var o = owner as Form;
+            bool hidden = o == null || !o.Visible || o.WindowState == FormWindowState.Minimized;
+            f.StartPosition = hidden ? FormStartPosition.CenterScreen : FormStartPosition.CenterParent;
+            f.TopMost = hidden;
+            return hidden ? f.ShowDialog() : f.ShowDialog(owner);
+        }
+    }
+}
+
 // "Get models" window: Hugging Face (GGUF), the Ollama library, or a direct https
 // link to a .gguf. The work is done by model_fetch.py, which prints progress lines.
 class DownloaderForm : Form
@@ -189,6 +257,9 @@ class DownloaderForm : Form
     public DownloaderForm()
     {
         Text = FirestarterApp.Name + ": get models";
+        // checking for new models re-checks the providers' free allowances too (worker_cloud.py free-limits;
+        // only free account pages, no test requests), so the Providers window's order stays right
+        ThreadPool.QueueUserWorkItem(_ => { try { FirestarterApp.Run("free-limits"); } catch { } });
         try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
         FormBorderStyle = FormBorderStyle.FixedSingle; MaximizeBox = false; MinimizeBox = false;
         StartPosition = FormStartPosition.CenterParent;
@@ -393,7 +464,11 @@ class ProvidersForm : Form
     readonly Panel body = new Panel();
     readonly TextBox tokensDay = new TextBox(), usdDay = new TextBox();
     readonly Label footer = new Label();
-    bool filling;
+    bool filling, refreshed;
+    string nextFooter = "";
+    [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, string l);
+    static void Hint(TextBox b, string text) { b.HandleCreated += (s, e) => SendMessage(b.Handle, 0x1501, (IntPtr)1, text); }  // EM_SETCUEBANNER
 
     public ProvidersForm()
     {
@@ -406,10 +481,11 @@ class ProvidersForm : Form
 
         var head = new Label();
         head.Text = "Local first: these run on this PC and nothing leaves it. Cloud providers get only what a task " +
-                    "would give the local model, after the redaction filter, and only while switched On.";
-        head.ForeColor = Dim; head.SetBounds(16, 10, 728, 38);
+                    "would give the local model, after the redaction filter, and only while switched On. " +
+                    "Switch order 1, 2, 3...: used one after another as free tokens run out, then this PC.";
+        head.ForeColor = Dim; head.SetBounds(16, 8, 728, 56);
         Controls.Add(head);
-        body.SetBounds(10, 50, 740, 500); body.AutoScroll = true; body.BackColor = Bg;
+        body.SetBounds(10, 66, 740, 484); body.AutoScroll = true; body.BackColor = Bg;
         Controls.Add(body);
 
         AddLabel(this, "Cloud limit per day:", 16, 564, 140, Dim);
@@ -421,7 +497,20 @@ class ProvidersForm : Form
         saveLimits.Click += (s, e) => SaveLimits();
         var close = MakeButton(this, "Close", 624, 596, 120);
         close.Click += (s, e) => Close();
-        footer.SetBounds(146, 602, 470, 22); footer.ForeColor = Dim; Controls.Add(footer);
+        // Refresh: reads .env and the saved keys again, so a key added to .env shows here (and in the
+        // Smithy's Provider list) without closing anything; each task reads the keys fresh anyway
+        var refresh = MakeButton(this, "Refresh", 498, 596, 120);
+        refresh.Click += (s, e) =>
+        {
+            footer.Text = "Checking free allowances…";
+            ThreadPool.QueueUserWorkItem(_ => { FirestarterApp.Run("free-limits");
+                try { BeginInvoke((Action)(() => { refreshed = true; Reload(); })); } catch { } });
+        };
+        // the switch order from the ranking: providers that are On, ready and give something free
+        var sort = MakeButton(this, "Sort by free allowance", 142, 596, 180);
+        sort.Click += (s, e) => ThreadPool.QueueUserWorkItem(_ => { FirestarterApp.Run("switch-sort");
+            try { BeginInvoke((Action)(() => { nextFooter = "Switch order sorted, most free first."; Reload(); })); } catch { } });
+        footer.SetBounds(328, 602, 166, 40); footer.ForeColor = Dim; Controls.Add(footer);
         Reload();
     }
 
@@ -466,22 +555,45 @@ class ProvidersForm : Form
         foreach (Dictionary<string, object> p in (System.Collections.ArrayList)m["providers"])
         {
             string where = S(p, "where");
-            string sec = where == "local" ? "On this PC" : "Cloud (by API key)";
-            if (sec != section) { section = sec; AddLabel(body, sec.ToUpper(), 6, y, 300, Gold, true); y += 26; }
-            AddRow(p, y); y += 84;
+            string sec = where == "local" ? "On this PC" : B(p, "paid_only") ? "Cloud: paid only"
+                       : "Cloud: free allowance, most to least";
+            if (sec != section) { section = sec; AddLabel(body, sec.ToUpper(), 6, y, 400, Gold, true); y += 26; }
+            y += AddRow(p, y);
         }
-        footer.Text = "";
+        footer.Text = nextFooter != "" ? nextFooter : refreshed ? "Read .env and saved keys again at " + DateTime.Now.ToString("h:mm tt") + "." : "";
+        nextFooter = "";
+        refreshed = false;
         filling = false;
     }
 
-    void AddRow(Dictionary<string, object> p, int y)
+    // returns the row's height
+    int AddRow(Dictionary<string, object> p, int y)
     {
         string name = S(p, "name"), label = S(p, "label"), where = S(p, "where");
-        bool needsKey = B(p, "needs_key"), trains = B(p, "trains");
+        bool needsKey = B(p, "needs_key"), trains = B(p, "trains"), cloud = where == "cloud";
         var title = AddLabel(body, label + (where == "proxy" ? "  (on this PC, then cloud)" : ""), 6, y, 300, Ink, true);
+        title.AutoSize = true;
+        string exp = S(p, "key_expires");
+        if (exp != "")                                  // keys that report an end date (Cloudflare, OpenRouter, Hugging Face)
+            AddLabel(body, "key ends " + exp, title.Right + 8, y + 1, 180, B(p, "key_expires_soon") ? Gold : Dim);
+        int line = y + 20;
+        if (cloud)
+        {
+            // what it gives away (live figure when known), a link to its own limits page
+            string live = S(p, "free_live"), free = S(p, "free"), src = S(p, "free_source");
+            string text = B(p, "paid_only") ? "Paid only" + (live != "" ? ": " + live : "")
+                        : "Free: " + (live != "" ? live : free + (S(p, "free_checked") != "" ? " (checked " + Checked(S(p, "free_checked")) + ")" : ""))
+                          + (B(p, "free_stale") ? ", worth re-checking" : "");
+            var fl = new LinkLabel(); fl.Text = text; fl.SetBounds(6, line, 540, 20); fl.AutoEllipsis = true;
+            fl.LinkColor = fl.ActiveLinkColor = fl.VisitedLinkColor = B(p, "free_stale") ? Gold : B(p, "paid_only") ? Dim : Ok;
+            fl.LinkBehavior = LinkBehavior.HoverUnderline;
+            if (src != "") fl.Click += (s, e) => { try { Process.Start(src); } catch { } };
+            body.Controls.Add(fl);
+            line += 20;
+        }
         string note = S(p, "note") + (trains ? " Its free tier may use what's sent for training." : "");
-        var n = AddLabel(body, note, 6, y + 20, 690, trains ? Gold : Dim);
-        int y2 = y + 44;
+        var n = AddLabel(body, note, 6, line, 690, trains ? Gold : Dim);
+        int y2 = line + 24;
 
         var on = new CheckBox(); on.Text = "On"; on.ForeColor = Ink; on.SetBounds(6, y2 + 2, 50, 22);
         on.Checked = B(p, "on");
@@ -493,8 +605,9 @@ class ProvidersForm : Form
             key = new TextBox(); key.SetBounds(60, y2, 170, 24); StyleBox(key); key.UseSystemPasswordChar = true;
             body.Controls.Add(key);
             string shown = S(p, "key");
-            var keyState = AddLabel(body, shown == "" ? "no key" : shown + (S(p, "key_from") == ".env" ? " (.env)" : ""),
-                                    234, y2 + 3, 150, shown == "" ? Dim : Ok);
+            bool bad = B(p, "key_bad");                 // the provider itself refused it (free-limits)
+            var keyState = AddLabel(body, shown == "" ? "no key" : shown + (bad ? "  refused" : S(p, "key_from") == ".env" ? " (.env)" : ""),
+                                    234, y2 + 3, 150, shown == "" ? Dim : bad ? Gold : Ok);
             var save = MakeButton(body, "Save key", 388, y2 - 1, 72);
             var k = key;
             save.Click += (s, e) =>
@@ -502,7 +615,7 @@ class ProvidersForm : Form
                 string v = k.Text.Trim(); k.Text = "";
                 if (v == "") return;
                 ThreadPool.QueueUserWorkItem(_ => { string r = FirestarterApp.RunWithInput("set-key " + name, v);
-                    try { BeginInvoke((Action)(() => { if (r != "saved") MessageBox.Show(this, r, Text); Reload(); })); } catch { } });
+                    try { BeginInvoke((Action)(() => { if (r != "saved") ThemedBox.Show(this, r, Text); Reload(); })); } catch { } });
             };
             if (S(p, "key_from") == "saved")
             {
@@ -514,15 +627,27 @@ class ProvidersForm : Form
         else AddLabel(body, "no key needed", 60, y2 + 3, 190, Dim);
 
         var model = new TextBox(); model.SetBounds(530, y2, 112, 24); StyleBox(model); model.Text = S(p, "model");
+        Hint(model, "model name");
         body.Controls.Add(model);
-        model.Leave += (s, e) => { string v = model.Text.Trim().Replace("\"", "");
-            ThreadPool.QueueUserWorkItem(_ => FirestarterApp.Run("provider-set " + name + " \"model=" + v + "\"")); };
-        var test = MakeButton(body, "Test", 646, y2 - 1, 50);
-        var result = AddLabel(body, "", 300, y, 290, Dim);
+        var tip = new ToolTip(); tip.SetToolTip(model, "The model " + label + " runs, as its own site names it. Saved when you press Enter or leave the box.");
+        var result = AddLabel(body, "", 330, y, 266, Dim);
         result.TextAlign = ContentAlignment.TopRight;
+        string problem = S(p, "problem");
+        if (problem != "") { result.Text = "Not ready: " + problem; result.ForeColor = Gold; tip.SetToolTip(result, problem); }
+        else if (B(p, "out")) { result.Text = "Out of free tokens for now (switching skips it)"; result.ForeColor = Dim; }
+        if (cloud) AddSwitchBox(p, name, label, y + 20, tip);
+        string savedModel = model.Text;
+        Action<bool> saveModel = reload => { string v = model.Text.Trim().Replace("\"", "");
+            if (v == savedModel) return;
+            savedModel = v;
+            ThreadPool.QueueUserWorkItem(_ => { FirestarterApp.Run("provider-set " + name + " \"model=" + v + "\"");
+                if (reload) try { BeginInvoke((Action)Reload); } catch { } }); };
+        model.Leave += (s, e) => saveModel(false);   // no redraw here: it would clear a key being typed
+        model.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; saveModel(true); } };
+        var test = MakeButton(body, "Test", 646, y2 - 1, 50);
         test.Click += (s, e) =>
         {
-            if (MessageBox.Show(this, "Send " + label + " one tiny request (“Reply with the single word OK”)? " +
+            if (ThemedBox.Show(this, "Send " + label + " one tiny request (“Reply with the single word OK”)? " +
                     "Nothing of yours is sent. A cloud provider may charge a fraction of a cent.", Text,
                     MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
             result.Text = "Testing…"; result.ForeColor = Dim;
@@ -542,13 +667,13 @@ class ProvidersForm : Form
             if (filling) return;
             if (on.Checked && needsKey && S(p, "key") == "" && (keyBox == null || keyBox.Text.Trim() == ""))
             {
-                MessageBox.Show(this, "Save a key for " + label + " first.", Text);
+                ThemedBox.Show(this, "Save a key for " + label + " first.", Text);
                 filling = true; on.Checked = false; filling = false; return;
             }
             string extra = "";
             if (on.Checked && trains && !B(p, "accepted"))
             {
-                var a = MessageBox.Show(this, label + "'s free tier may use what's sent to improve its products " +
+                var a = ThemedBox.Show(this, label + "'s free tier may use what's sent to improve its products " +
                     "(training). Allow it for " + label + "?", Text, MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
                 if (a != DialogResult.Yes) { filling = true; on.Checked = false; filling = false; return; }
                 extra = " accept=yes";
@@ -557,6 +682,46 @@ class ProvidersForm : Form
             string arg = "provider-set " + name + (on.Checked ? " on" : " off") + extra;
             ThreadPool.QueueUserWorkItem(_ => { FirestarterApp.Run(arg); try { BeginInvoke((Action)Reload); } catch { } });
         };
+        return y2 + 40 - y;
+    }
+
+    // "Switch order": 1st, 2nd... for the providers to use one after another as free tokens run out
+    // (worker_cloud.py Chain; cloud.switch_order). "-" = not in it.
+    void AddSwitchBox(Dictionary<string, object> p, string name, string label, int y, ToolTip tip)
+    {
+        AddLabel(body, "Switch order", 554, y + 1, 84, Dim);
+        var box = new ComboBox(); box.SetBounds(640, y - 2, 56, 24);
+        box.DropDownStyle = ComboBoxStyle.DropDownList; box.FlatStyle = FlatStyle.Flat;
+        box.BackColor = PurpleFill; box.ForeColor = Ink; box.DrawMode = DrawMode.OwnerDrawFixed; box.ItemHeight = 18;
+        box.DrawItem += (s, e) =>
+        {
+            bool sel = (e.State & DrawItemState.Selected) != 0 && (e.State & DrawItemState.ComboBoxEdit) == 0;
+            using (var bg = new SolidBrush(sel ? PurpleLine : PurpleFill)) e.Graphics.FillRectangle(bg, e.Bounds);
+            if (e.Index >= 0)
+                TextRenderer.DrawText(e.Graphics, box.Items[e.Index].ToString(), box.Font,
+                    new Rectangle(e.Bounds.X + 4, e.Bounds.Y, e.Bounds.Width - 4, e.Bounds.Height), Ink,
+                    TextFormatFlags.VerticalCenter | TextFormatFlags.Left);
+        };
+        box.Items.Add("-");
+        for (int i = 1; i <= 9; i++) box.Items.Add(i.ToString());
+        int order = 0; int.TryParse(S(p, "order"), out order);
+        box.SelectedIndex = order >= 0 && order <= 9 ? order : 0;
+        tip.SetToolTip(box, "Use providers one after another: when " + label + " runs out of free tokens, the job " +
+                            "carries on with the next number, and last on this PC's model. \"-\" leaves it out.");
+        body.Controls.Add(box);
+        box.SelectedIndexChanged += (s, e) =>
+        {
+            if (filling) return;
+            string arg = "provider-set " + name + " order=" + box.SelectedIndex;
+            ThreadPool.QueueUserWorkItem(_ => { FirestarterApp.Run(arg); try { BeginInvoke((Action)Reload); } catch { } });
+        };
+    }
+
+    static string Checked(string ymd)
+    {
+        DateTime d;
+        return DateTime.TryParseExact(ymd, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture,
+                                      System.Globalization.DateTimeStyles.None, out d) ? d.ToString("MMM d") : ymd;
     }
 
     void SaveLimits()
@@ -599,6 +764,7 @@ class FirestarterForm : Form
     readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
     Process worker;
     bool loadingModels, stopping;
+    string askedOut = "";      // the task already asked about free tokens (worker_cloud.Chain)
 
     public FirestarterForm()
     {
@@ -825,13 +991,14 @@ class FirestarterForm : Form
 #if !SMITHY
     void AskSpecs()
     {
-        var a = MessageBox.Show(this,
+        var a = ThemedBox.Show(this,
             "May I check your current system specs, so I can best advise you of settings?\n\n" +
             "This reads your PC's hardware only. Nothing leaves this computer.\n\n" +
             "(No: you won't be asked again. Check my PC... does it any time.)",
             "Firestarter: first start", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
         if (a == DialogResult.Yes) CheckPc();
-        else ThreadPool.QueueUserWorkItem(_ => FirestarterApp.Run("specs-decline"));
+        // only a real No is remembered; closing the box (X, Alt+F4) asks again next start
+        else if (a == DialogResult.No) ThreadPool.QueueUserWorkItem(_ => FirestarterApp.Run("specs-decline"));
     }
 
     void CheckPc()
@@ -950,6 +1117,26 @@ class FirestarterForm : Form
     }
 #endif
 
+    // every provider in the switch order is out of free tokens: her choice, asked once per task
+    void AskOut(string tid, string title, string back)
+    {
+        var a = ThemedBox.Show(this, "Task " + tid + (title != "" ? " (" + title + ")" : "") + " has used up the free tokens " +
+            "on every provider in the switch order. It's waiting, and nothing is lost.\n\n" +
+            "Yes: finish it on this PC's model now (slower; nothing more is sent out).\n" +
+            "No: wait, and it carries on by itself" + (back != "" ? " about " + back : "") + " when free tokens are back.",
+            FirestarterApp.Name, MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+        string choice = a == DialogResult.Yes ? "local" : "wait";
+        ThreadPool.QueueUserWorkItem(_ => FirestarterApp.Run("out-choice " + tid + " " + choice));
+    }
+
+    static string Clock(string ts)
+    {
+        double t;
+        if (!double.TryParse(ts, out t)) return "";   // Get() wrote it in this PC's own number format
+        var when = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(t).ToLocalTime();
+        return when.Date == DateTime.Today ? when.ToString("h:mm tt") : when.ToString("ddd h:mm tt");
+    }
+
     void RefreshStatus()
     {
         Dictionary<string, object> s = null;
@@ -969,7 +1156,8 @@ class FirestarterForm : Form
             string other = Get(s, "waiting_for_cpu");
             state.Text = "\u25CF  Worker " + st + (st == "waiting for the CPU" && other != "" ? " (" + other + " has it)"
                                                     : " (" + Get(s, "backend") + ", CPU only)");
-            state.ForeColor = st == "paused" || st == "held back" || st == "waiting for the CPU" ? Gold : Ember;
+            state.ForeColor = st == "paused" || st == "held back" || st == "waiting for the CPU" ||
+                              st == "waiting for free tokens" ? Gold : Ember;
         }
         string tid = Get(s, "task_id");
         string pct = Get(s, "progress") != "" ? " " + (int)(Convert.ToDouble(Get(s, "progress")) * 100) + "%" : "";
@@ -979,6 +1167,17 @@ class FirestarterForm : Form
                                          pct + el + " (" + Get(s, "model") + ", " + Get(s, "threads") + " threads)"
                   : alive && paused != null ? "Task " + Get(paused, "id") + " paused: " + Get(paused, "title")
                   : "No task running";
+        if (alive && st == "waiting for free tokens" && tid != "")
+        {
+            string back = Clock(Get(s, "free_tokens_back_ts"));
+            task.Text = "Task " + tid + " is waiting for free tokens" + (back != "" ? " (carries on about " + back + ")" : "");
+            if (askedOut != tid && Get(s, "out_choice") == "")
+            {
+                askedOut = tid;
+                string title = Get(s, "task_title");
+                BeginInvoke((Action)(() => AskOut(tid, title, back)));
+            }
+        }
         queue.Text = "Queued: " + (alive ? Get(s, "queued") : "-") + "     Waiting for review: " + (alive ? Get(s, "review") : "-");
         string g = Get(s, "game");
         game.Text = alive && g != "" ? "Game: " + g : "No game running";
@@ -1151,7 +1350,7 @@ class WordPressForm : Form
         var d = Current();
         if (d == null) return;
         string id = Get(d, "id");
-        var ok = MessageBox.Show(this, "Send Firestarter task " + id + ", \"" + Get(d, "title") + "\", to your WordPress site as a " +
+        var ok = ThemedBox.Show(this, "Send Firestarter task " + id + ", \"" + Get(d, "title") + "\", to your WordPress site as a " +
                                  Get(d, "kind") + " DRAFT?\n\nIt won't be published. You can edit or delete it in WordPress.",
                                  "Send as WordPress draft", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
         if (ok != DialogResult.Yes) return;
@@ -1685,7 +1884,7 @@ class ZooForm : Form
         var r = Current();
         if (r == null) return;
         if (Get(r, "imported") == "True") { result.Text = "That file is already marked imported."; return; }
-        var ok = MessageBox.Show(this, "Did you import task " + Get(r, "id") + "'s file in ZOO?\n\nThis adds its " +
+        var ok = ThemedBox.Show(this, "Did you import task " + Get(r, "id") + "'s file in ZOO?\n\nThis adds its " +
                                  Get(r, "items") + " items to your " + Get(r, "app") + " list. It changes nothing on your site.",
                                  "Mark imported", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
         if (ok != DialogResult.Yes) return;
