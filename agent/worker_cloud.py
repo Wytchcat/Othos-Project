@@ -104,6 +104,15 @@ PROVIDERS: dict[str, Provider] = {p.name: p for p in [
              note="Vercel's AI Gateway: many providers' models with one key. Free models only on the free tier."),
     Provider("huggingface", "Hugging Face", "openai", "https://router.huggingface.co/v1", "HF_TOKEN", "openai/gpt-oss-120b",
              alt_env=("HUGGINGFACE_API_KEY", "HUGGINGFACEHUB_API_TOKEN", "HF_API_KEY")),
+    # Puter (added Nov 15 2026, the user: "Let's set it up"): its OpenAI-compatible address, so no Puter.js / Node.
+    # The key is the account's auth token (puter.com/dashboard, Account, API token): anyone with it can act as her
+    # on Puter. Calls are billed to that account. It passes requests on to many companies' models, and its pages
+    # don't say what they may keep, so it counts as "trains" (refused until accept_data_use lists it). No default
+    # model: none was confirmed by a real call, so one is typed in the Providers window (cloud.models.puter).
+    Provider("puter", "Puter", "openai", "https://api.puter.com/puterai/openai/v1", "PUTER_AUTH_TOKEN", trains=True,
+             alt_env=("PUTER_TOKEN", "PUTER_API_KEY", "puterAuthToken"),
+             note="Puter's AI API: your Puter account's auth token (Dashboard, Account, API token). Usage is billed "
+                  "to that account; it passes requests on to many model makers."),
 ]}
 
 
@@ -116,7 +125,7 @@ def spoken_names() -> dict[str, str]:
     out.update({"deep seek": "deepseek", "open router": "openrouter", "anthropic": "anthropic",
                 "open ai": "openai", "hugging face": "huggingface", "l m studio": "lmstudio",
                 "lm studio": "lmstudio", "codestral": "mistral",
-                "cloud flare": "cloudflare", "vercel": "vercel", "versel": "vercel", "free providers": "auto", "switching": "auto", "switch order": "auto"})   # the switch order
+                "cloud flare": "cloudflare", "vercel": "vercel", "pewter": "puter", "versel": "vercel", "free providers": "auto", "switching": "auto", "switch order": "auto"})   # the switch order
     return out
 
 
@@ -142,6 +151,8 @@ FREE_TIERS: dict[str, dict] = {
                    "checked": "2026-11-13", "source": "https://openrouter.ai/docs/api/reference/limits"},
     "vercel": {"score": 300_000, "free": "$5 of credit every 30 days on its free-tier models; needs a card on file first",
                "checked": "2026-11-13", "source": "https://vercel.com/docs/ai-gateway/pricing"},
+    "puter": {"score": 0, "free": "not stated for calls made with a token; billed per token to the Puter account",
+              "checked": "2026-11-15", "source": "https://developer.puter.com/tutorials/use-openai-sdk-with-puter/"},
     "huggingface": {"score": 0, "free": "none on a free account; $2 a month with PRO",
                     "checked": "2026-11-13", "source": "https://huggingface.co/docs/inference-providers/pricing"},
 }
@@ -339,6 +350,7 @@ KEY_PAGES = {
     "cerebras": "https://cloud.cerebras.ai", "together": "https://api.together.ai/settings/api-keys",
     "fireworks": "https://fireworks.ai/account/api-keys", "openai": "https://platform.openai.com/api-keys",
     "huggingface": "https://huggingface.co/settings/tokens", "cloudflare": "https://dash.cloudflare.com/profile/api-tokens", "vercel": "https://vercel.com/dashboard/ai-gateway",
+    "puter": "https://puter.com/dashboard#account",
 }
 
 
@@ -466,7 +478,7 @@ def command(argv: list[str], config_path: Path) -> bool:
                          lambda c=0: None)                                                          # reasoning models
             print(f"Works: {p.spoken} answered “{out.strip()[:40]}”.")
         except (RuntimeError, ValueError) as e:
-            print(f"Not working: {str(e)[:220]}")
+            print(f"Not working: {' '.join(str(e).split())[:1200]}")   # whole: the window shortens it (Nov 15)
         except Exception as e:
             print(f"Not working: couldn't reach {p.spoken} ({type(e).__name__}).")
     return True
@@ -527,7 +539,7 @@ def pick(cfg: dict, raw_params: dict, task_type: str, local=None):
                 log.info("switch order: no provider ready; using the local model")
                 return None
             raise ValueError("no provider in the switch order is ready (Providers...: On, a key and a model)")
-        return Chain(links, local, int(cfg.get("context_tokens", 8192))), "switching"
+        return Chain(links, local, int(cfg.get("context_tokens", 8192)), cc), "switching"
     p = PROVIDERS.get(name)
     if p is None:
         raise ValueError(f"'{name}' isn't a provider I know (known: {', '.join(PROVIDERS)})")
@@ -547,7 +559,7 @@ def pick(cfg: dict, raw_params: dict, task_type: str, local=None):
         key = key_for(p, _keys())
         if not key:
             raise ValueError(f"no key for {p.spoken}: save one in Providers…, or put {p.key_env} in .env")
-    _check_budget(cc, name, 0)
+    _check_budget(cc, name, 0, whole_task=False)      # the task's own limit is checked on each call, once it's set
     backend = (AnthropicCloud if p.kind == "anthropic" else OpenAICompatible)(p, key, _base_url(p, cc), cc)
     return backend, model
 
@@ -572,12 +584,31 @@ def _today(u: dict) -> dict:
 # max_tokens_per_task counts the whole task, every step and every provider (Nov 14, review item 5:
 # it counted each call on its own, so a build's automatic fix rounds had no limit at all). The
 # running total is kept in the usage file under "tasks", so a pause or a retry carries it on.
-_TASK = {"key": ""}
+_TASK = {"key": "", "limit": None, "why": ""}
 
 
 def begin_task(key: str) -> None:
     """The task this worker is on now: "smithy:26" (worker and task number; each worker numbers its own)."""
-    _TASK["key"] = str(key or "")
+    _TASK.update(key=str(key or ""), limit=None, why="")
+
+
+def set_task_limit(tokens: int, why: str = "") -> None:
+    """This task's own limit, set by the worker once it has looked at the task (The Smithy, from a build's
+    plan, when "auto_task_tokens" is on). Replaces max_tokens_per_task for this task only; the daily
+    limits still apply. begin_task clears it."""
+    _TASK.update(limit=max(1, int(tokens)), why=str(why or ""))
+
+
+def task_limit(cc: dict) -> int:
+    """The limit this task runs under: its own (set_task_limit), else max_tokens_per_task."""
+    return int(_TASK["limit"]) if _TASK.get("limit") else int(cc.get("max_tokens_per_task", 200_000))
+
+
+def reset_task_tokens(key: str) -> None:
+    """A task's running cloud-token total set back to 0 (a finished build carried on again: a new effort)."""
+    u = _today(_usage())
+    if (u.get("tasks") or {}).pop(key, None) is not None:
+        USAGE_PATH.write_text(json.dumps(u, indent=2), encoding="utf-8")
 
 
 def task_tokens(key: str | None = None) -> int:
@@ -614,15 +645,66 @@ def _retry_after(headers) -> float:
         return 0.0
 
 
-def _check_budget(cc: dict, name: str, task_tokens: int) -> None:
+# ---------------------------------------------------------------- per-minute pacing (Nov 15)
+# Free tiers that allow only a little a minute (Cerebras: 5 requests and 30,000 new tokens a minute for gpt-oss-120b).
+# Task 55's steps were about 30,000 tokens: each was sent at once, refused, waited 60 s, refused again, and went to
+# a weaker model. Now each step waits for room in that provider's minute, when the wait is short; a step bigger
+# than a whole minute's allowance goes straight to the next provider. cloud.pace overrides these, per provider:
+# {"cerebras": {"rpm": 5, "tpm": 30000}}; cloud.pace_max_wait: the longest wait for room (seconds, default 90).
+PACE: dict[str, dict] = {
+    # 30,000 new tokens a minute, 90,000 with the cached part (earlier steps' text sent again): a step over 30,000
+    # waits for an empty minute (task 55's ~30,000-token steps did go through), and only one over 90,000 never fits
+    "cerebras": {"rpm": 5, "tpm": 30_000, "tpm_total": 90_000, "checked": "2026-11-15",
+                 "source": "https://inference-docs.cerebras.ai/support/rate-limits"},
+}
+_SENT: dict[str, list] = {}                            # provider -> [(time, tokens)] sent in the last minute
+
+
+def pace_for(cc: dict, name: str) -> dict:
+    mine = dict(PACE.get(name, {}))
+    mine.update(((cc or {}).get("pace") or {}).get(name) or {})
+    return {k: int(mine[k]) for k in ("rpm", "tpm", "tpm_total") if int(mine.get(k) or 0) > 0}
+
+
+def pace_wait(cc: dict, name: str, tokens: int, now: float | None = None) -> float:
+    """Seconds until a step of this many tokens fits the provider's minute (0 = now; -1 = it never fits)."""
+    p = pace_for(cc, name)
+    if not p:
+        return 0.0
+    now = time.time() if now is None else now
+    sent = [(t, n) for t, n in _SENT.get(name, []) if now - t < 60]
+    _SENT[name] = sent
+    if p.get("tpm") and tokens > p.get("tpm_total", p["tpm"]):
+        return -1.0
+    wait = 0.0
+    if p.get("rpm") and len(sent) >= p["rpm"]:
+        wait = max(wait, sent[len(sent) - p["rpm"]][0] + 60 - now)
+    if p.get("tpm") and tokens > p["tpm"]:              # bigger than the new-token minute: only in an empty one
+        wait = max([wait] + [t + 60 - now for t, _ in sent])
+    elif p.get("tpm"):
+        used, k = sum(n for _, n in sent), 0
+        while used + tokens > p["tpm"] and k < len(sent):
+            used -= sent[k][1]
+            wait = max(wait, sent[k][0] + 60 - now)
+            k += 1
+    return max(0.0, wait)
+
+
+def paced(name: str, tokens: int) -> None:
+    _SENT.setdefault(name, []).append((time.time(), tokens))
+
+
+def _check_budget(cc: dict, name: str, task_tokens: int, whole_task: bool = True) -> None:
     u = _today(_usage())
     mine = u["providers"].get(name) or {}
     used = mine.get("in", 0) + mine.get("out", 0)                  # this provider's tokens today
     usd = sum(v.get("usd", 0.0) for v in u["providers"].values())  # dollars: all providers together
     so_far = int((u.get("tasks") or {}).get(_TASK["key"], 0)) if _TASK["key"] else 0
-    if so_far + task_tokens > int(cc.get("max_tokens_per_task", 200_000)):
-        raise BudgetOut(f"this task used its limit of {int(cc.get('max_tokens_per_task', 200_000)):,} cloud tokens "
-                        f"(max_tokens_per_task, the whole task; {so_far + task_tokens:,} so far)")
+    limit = task_limit(cc)
+    if whole_task and so_far + task_tokens > limit:
+        which = "its own limit, set from " + _TASK["why"] if _TASK.get("limit") else "max_tokens_per_task"
+        raise BudgetOut(f"this task used its limit of {limit:,} cloud tokens "
+                        f"({which}, the whole task; {so_far + task_tokens:,} so far)")
     cap = int(cc.get("max_tokens_per_day", 1_000_000))
     if used + task_tokens > cap:
         who = PROVIDERS[name].spoken if name in PROVIDERS else name
@@ -661,6 +743,28 @@ def _mark_out(name: str, seconds: float) -> None:
     u.setdefault("out", {})[name] = time.time() + seconds
     USAGE_PATH.parent.mkdir(exist_ok=True)
     USAGE_PATH.write_text(json.dumps(u, indent=2), encoding="utf-8")
+
+
+def switch_out(cfg: dict) -> dict:
+    """The switch order right now (Nov 14, suggestion 4: a big build queued while every provider was out
+    just waited): {"order": [spoken names], "out": [(spoken, back_ts)], "all_out": bool, "back_ts": the
+    first one back (0 = none out)}. Out = it said so (rests until a time) or today's max_tokens_per_day is
+    used. Only the user's own files are read; nothing is sent."""
+    cc = cfg.get("cloud") or {}
+    names = [str(n).lower() for n in cc.get("switch_order", []) if str(n).lower() in PROVIDERS]
+    on = [str(e).lower() for e in cc.get("enabled", [])]
+    names = [n for n in names if n in on and not PROVIDERS[n].local]
+    u, now, cap = usage_today(), time.time(), int(cc.get("max_tokens_per_day", 1_000_000))
+    out = []
+    for n in names:
+        mine = u["providers"].get(n) or {}
+        until = _out_until(n)
+        if until <= now and mine.get("in", 0) + mine.get("out", 0) >= cap:
+            until = now + _to_midnight()
+        if until > now:
+            out.append((PROVIDERS[n].spoken, until))
+    return {"order": [PROVIDERS[n].spoken for n in names], "out": out,
+            "all_out": bool(names) and len(out) == len(names), "back_ts": min((t for _, t in out), default=0)}
 
 
 def _to_midnight() -> float:
@@ -740,11 +844,16 @@ class Chain:
     tokens; when one says it's out, the same step goes to the next, and last to this PC's model.
     A step always carries the whole job so far, so switching loses nothing."""
 
-    def __init__(self, links: list, local=None, local_ctx: int = 8192):
+    def __init__(self, links: list, local=None, local_ctx: int = 8192, cc: dict | None = None):
         self.links, self.local = links, local          # links: [(name, spoken, backend, model)]
+        self.cc = cc or {}                             # for per-minute pacing (cloud.pace, cloud.pace_max_wait)
         self.local_ctx = local_ctx                     # what this PC's model reads at most (context_tokens)
         self.used: list[str] = []                      # who did each step, in order (for the result)
         self.ask = None                                # set by the engine: ask(free_again_ts) -> "local" | "retry"
+        # this task only (Nov 14, task 51 woke every 7 minutes for nothing): a provider that said a step is too
+        # large is skipped for steps that size; one that keeps saying no rests twice as long each time
+        self.too_big: dict[str, int] = {}              # name -> the smallest step (tokens) it refused as too large
+        self.fails: dict[str, int] = {}
         names = [l[1] for l in links] + (["this PC"] if local else [])
         self.name = "switching (" + " -> ".join(names) + ")"
 
@@ -767,7 +876,12 @@ class Chain:
             too_long = too_long_for_local(messages, self.local_ctx) if self.local else ""
             if self.ask is None:
                 return self._local(None, messages, threads, max_tokens, should_stop)
-            back = min(_out_until(l[0]) for l in self.links)
+            size = prompt_tokens(messages)
+            can = [l for l in self.links if not (l[0] in self.too_big and size >= self.too_big[l[0]])]
+            if not can:                                # none takes a step this big, today or later: say so
+                return self._local(ValueError(f"no provider in the switch order takes a step this big (about "
+                                              f"{size:,} tokens)"), messages, threads, max_tokens, should_stop)
+            back = min(_out_until(l[0]) for l in can)
             if self.ask(back) == "local":
                 if too_long:                           # it can't hold this step: keep waiting instead
                     log.info("switching: 'this PC' chosen, but %s; waiting for free tokens", too_long)
@@ -779,11 +893,34 @@ class Chain:
 
     def _try_links(self, messages, threads, max_tokens, should_stop):
         """The step's answer from the first provider with free tokens, or None when all are out."""
+        size = prompt_tokens(messages)
         for name, spoken, backend, m in self.links:
             if _out_until(name) > time.time():
                 continue
+            if name in self.too_big and size >= self.too_big[name]:
+                continue                               # it said a step this big is too large
+            room = pace_wait(self.cc, name, size)
+            if room < 0:                               # bigger than its whole minute: never fits, so the next
+                self.too_big[name] = min(size, self.too_big.get(name, size))
+                pc = pace_for(self.cc, name)
+                tpm = pc.get("tpm_total", pc.get("tpm", 0))
+                log.info("switching: %s takes about %d tokens a minute; a step of about %d won't fit", spoken, tpm, size)
+                steps.info("%s takes about %s tokens a minute, and this step is about %s; trying the next provider.",
+                           spoken, f"{tpm:,}", f"{size:,}")
+                continue
+            if room > float(self.cc.get("pace_max_wait", 90)):
+                log.info("switching: %s's minute is full for %.0f s more; this step goes to the next", spoken, room)
+                continue                               # too long to wait for this step; not marked out
+            if room > 0:
+                log.info("switching: pacing %s: waiting %.0f s for room in its per-minute limit", spoken, room)
+                steps.info("Waiting %.0f seconds for room in %s's per-minute limit.", room, spoken)
+                end = time.monotonic() + room
+                while time.monotonic() < end:
+                    should_stop(0)
+                    time.sleep(1)
             for attempt in (1, 2):
                 try:
+                    paced(name, size)
                     out = backend.chat(m, messages, threads, max_tokens, should_stop)
                     self._did(f"{spoken} ({m})")
                     return out
@@ -806,7 +943,20 @@ class Chain:
                             should_stop(0)
                             time.sleep(1)
                         continue
-                    _mark_out(name, _rest_for(e))
+                    if isinstance(e, Refused) and e.status == 413:     # too large: not a matter of waiting
+                        self.too_big[name] = min(size, self.too_big.get(name, size))
+                        log.warning("switching: %s says a step of about %d tokens is too large; skipped for steps "
+                                    "this big in this task", spoken, size)
+                        steps.info("%s can't take a step this big; trying the next provider.", spoken)
+                        break
+                    if 0 < wait <= 60:                 # still only its minute (Nov 15: Cerebras rested for hours
+                        _mark_out(name, 60.0)          # after per-minute refusals): back for the next step
+                        log.warning("switching: %s is still over its per-minute limit; trying the next", spoken)
+                        steps.info("%s is still over its per-minute limit; this step goes to the next provider.",
+                                   spoken)
+                        break
+                    self.fails[name] = self.fails.get(name, 0) + 1     # 10, 20, 40 minutes... up to midnight
+                    _mark_out(name, min(_rest_for(e) * 2 ** (self.fails[name] - 1), max(_to_midnight(), 60.0)))
                     log.warning("switching: %s can't take this step (%s); trying the next", spoken, str(e)[:160])
                     steps.info("%s can't take this step; trying the next provider.", spoken)
                     break
@@ -835,7 +985,36 @@ def _refused(who: str, status: int, body: str) -> str:
     plain = {401: "didn't accept the key (check it in .env)", 402: "says the account has no credit left (top it up "
              "on their site)", 403: "says this key may not do that", 404: "doesn't know that model (check "
              "cloud.models)", 429: "says too many requests or over its limit; try again later"}.get(status)
-    return f"{who} {plain or f'error {status}'}" + (f" ({status}: {body[:200]})" if body else "")
+    return f"{who} {plain or f'error {status}'}" + (f" ({status}: {_their_words(body)})" if body else "")
+
+
+def _their_words(body: str, limit: int = 600) -> str:
+    """The provider's own message from an error reply: the "message" inside its JSON when there is one, else the
+    start of the reply (Nov 15: 200 characters of raw JSON cut it off mid-word, "type":"too_)."""
+    return worker_shared.redact(_words_of(body, limit))     # some providers repeat the key in a 401 (a code
+                                                            # review, Nov 15): it never reaches a log or the window
+
+
+def _words_of(body: str, limit: int) -> str:
+    try:
+        d = json.loads(body)
+    except (ValueError, TypeError):
+        return " ".join(body.split())[:limit]
+    found = []
+
+    def walk(x):
+        if isinstance(x, dict):
+            for k in ("message", "detail", "error_description"):
+                if isinstance(x.get(k), str) and x[k].strip():
+                    found.append(x[k].strip())
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+    walk(d)
+    words = "; ".join(dict.fromkeys(found)) if found else json.dumps(d)
+    return " ".join(words.split())[:limit]
 
 
 def _scrub(text: str, key: str) -> str:

@@ -26,7 +26,8 @@ CODE_EXT = {".py", ".ps1", ".psm1", ".bat", ".cmd", ".cs", ".ts", ".tsx", ".js",
             ".md", ".css", ".scss", ".html", ".php", ".yml", ".yaml", ".toml", ".ini", ".txt", ".sql", ".xml", ".sh"}
 BLOCKED_DIRS = {"brain", "logs", "state", ".git", ".venv", "venv", "node_modules", ".next", "__pycache__",
                 "drafts", "old", "icons", ".claude", "workers"}
-BLOCKED_NAMES = re.compile(r"^(\.env.*|profile\.md|.*\.(db|db-wal|db-shm|sqlite|pem|key|pfx|p12|crt)|"
+# personal.json and keys.dat hold her personal details and keys (the user's private-files list; Nov 14)
+BLOCKED_NAMES = re.compile(r"^(\.env.*|profile\.md|personal\.json|keys\.dat|.*\.(db|db-wal|db-shm|sqlite|pem|key|pfx|p12|crt)|"
                            r"id_rsa.*|.*secret.*|.*credential.*|.*token.*\.json|pids\.txt)$", re.I)
 MAX_BYTES = 120_000
 

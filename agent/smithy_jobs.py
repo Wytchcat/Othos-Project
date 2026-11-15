@@ -19,11 +19,14 @@ Rules, enforced here in code, not in the prompt:
   files, no programs) and checked again after resolving. Nothing is run or
   installed; the user copies what they want into place themselves.
 - A build is checked before its README: C# files are compiled together (Windows' own csc.exe,
-  into a temporary folder that's deleted), PowerShell, Python and JSON files are parsed. The
-  result is never run. On a new version, each numbered change asked for is checked off.
+  into a temporary folder that's deleted), PowerShell, Python and JSON files are parsed, and
+  Python imports between the files are checked (with `ast`). The result is never run, so tests
+  are reported as "not run", and a request that wants them passing stays NOT COMPLETE. Each
+  numbered item asked for (a first build's request, or a new version's change) is checked off.
 """
 from __future__ import annotations
 
+import ast
 import base64
 import difflib
 import json
@@ -33,13 +36,18 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path, PurePosixPath
 
 try:                                             # the check task: left out of the shared copy of Othos
     import smithy_check
 except ImportError:
     smithy_check = None
+import smithy_sandbox
+import worker_cloud
 import worker_files
+import worker_shared
+from worker_cloud import BudgetOut, TooLongForLocal
 from worker_engine import FORMAT, NOT_COMPLETE, JobType, plain_summary, save_artifact, split_result
 from worker_queue import SMITHY
 from worker_shared import RULES, USER, USERS, redact
@@ -48,7 +56,12 @@ log = logging.getLogger("worker")
 steps = logging.getLogger("worker.step")     # plain step lines (Progress window, Othos's Task Mode)
 
 SYSTEM = (f"You are the Smithy, a careful coding assistant for Othos on {USERS} Windows 11 PC. "
-          "You review code, draft fixes, write scripts, and build small projects from scratch. " + RULES)
+          "You review code, draft fixes, write scripts, and build small projects from scratch. " + RULES
+          # task 42: a test's made-up key reached the model as [REDACTED], and it reported that the test
+          # planted the word "[REDACTED]"
+          + " Key-like values are hidden from you before you see any text: [REDACTED] stands for a value that "
+          "is really there in the file (often a made-up test key). Treat it as that value, not as the word "
+          "[REDACTED], and never report it as a bug.")
 SYSTEM_TWO_PART = SYSTEM + "\n\n" + FORMAT
 
 JOOMLA = ("This is for a Joomla 5 site using the YOOtheme Pro template (and ZOO). Never change Joomla core "
@@ -358,6 +371,86 @@ def _plan_messages(p: dict, max_files: int, parent: dict | None) -> list[dict]:
     return msgs
 
 
+_ONLY = re.compile(r"\b(?:only|no other files?|nothing else|change no other|leave (?:the )?(?:other|rest)|"
+                   r"leave (?:all )?(?:the )?(?:existing |other )?files? alone|"
+                   r"don'?t (?:change|touch) (?:any )?(?:other|anything else))\b", re.I)
+_FILES_LINE = re.compile(r"(?im)^[ \t]*(?:[-*][ \t]*)?files?\b[^:\n]{0,20}:(.*)$")
+_SENT = r"(?:[^.\n]|\.(?=\w))*"                       # within one sentence: a dot in "a.py" doesn't end it
+_LEAVE = re.compile(r"(?i)" + _SENT + r"\bleave (?:them|it|these|those)?[ \t]*(?:as (?:they|it) (?:are|is)|alone|"
+                    r"unchanged)" + _SENT)
+
+
+def _names(text: str, files: list[dict]) -> set[str]:
+    return {f["path"] for f in files if re.search(r"(?<![\w.])" + re.escape(PurePosixPath(f["path"]).name)
+                                                  + r"(?![\w])", text, re.I)}
+
+
+def _failing_files(out: str, test: str, code: list[str], same: set[str]) -> list[str]:
+    """The build files a failed test run points at, in order: the ones its tracebacks name (`File "...\\x.py"`),
+    then the ones whose name matches a failing test (FAIL: test_complex_confusion_detected ... TestConfusion ->
+    academy_confusion.py), the test file last if it's named. Files the plan keeps the same are left out (task 55:
+    the fixes went to academy_glossary.py and academy_sources.py, the most imported, while the errors were in
+    academy_readme.py, academy_query.py and academy_confusion.py)."""
+    pick = [r for r in code if r not in same]
+    found: list[str] = []
+    for m in re.finditer(r'File "([^"]+)"', out):
+        name = re.split(r"[\\/]", m.group(1))[-1].lower()
+        found += [r for r in pick if Path(r).name.lower() == name and r not in found]
+    heads = " ".join(re.findall(r"(?m)^(?:FAIL|ERROR): (.*)$", out))
+    words = set(re.findall(r"[a-z]+", re.sub(r"([a-z])([A-Z])", r"\1 \2", heads).lower().replace("_", " ")))
+    for r in pick:
+        parts = [w for w in Path(r).stem.lower().split("_") if len(w) >= 4 and w != "test"]
+        if r not in found and parts and parts[-1] in words:
+            found.append(r)
+    return [r for r in found if r != test] + ([test] if test in found else [])
+
+
+def _failing_test_code(test_path: Path, out: str, limit: int = 6000) -> str:
+    """The source of each test function the output says FAIL or ERROR, so a fix sees what was asked (task 55: the
+    fixes saw only "AssertionError: False is not true" and said the code needed no change, three times)."""
+    names = re.findall(r"(?m)^(?:FAIL|ERROR): (\w+)", out)
+    try:
+        src = test_path.read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(src)
+    except (OSError, SyntaxError):
+        return ""
+    parts = [ast.get_source_segment(src, n) or "" for n in ast.walk(tree)
+             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in names]
+    text = "\n\n".join(p for p in parts if p)
+    return text[:limit]
+
+
+def _stage_files(staged: list[str], written: dict, change: str) -> list[str]:
+    """The files one stage edits: the long earlier-version files being edited, plus any other file of this build
+    that the stage's own changes name (Nov 15, task 55: item 4 said academy_explain.py and academy_readme.py call
+    record(); both were new files, so only the old ones were offered, and the model sent their edits to
+    academy_glossary.json, where none could go in)."""
+    named = sorted(_names(change, [{"path": r} for r in written if r not in staged and not r.lower().endswith(".md")]))
+    return list(staged) + named
+
+
+def _keep_unasked(plan: dict, parent: dict, change: str) -> None:
+    """A new version's plan, checked in code (Nov 15, task 52: "Fix README.md only... Change no other file", and
+    the plan marked all 8 files "new", so the short ones were written again):
+    - a file the earlier version already has is never "new": at most "changed"
+    - when the change limits itself to the files it names ("only", "no other file"), every other file is "same".
+    Which files it names (Nov 15, task 54: "academy_sources.py and academy_fit.py ... leave them as they are" counted
+    as asking for them, and "Use only the standard library" as "only"): its "Files:" lines when it has them;
+    otherwise every name in it, less those in a "leave them as they are / alone" sentence."""
+    before = {f["path"] for f in parent["plan"]["files"]}
+    lines = _FILES_LINE.findall(change)
+    named = _names("\n".join(lines), plan["files"]) if lines else _names(change, plan["files"])
+    left = _names(" ".join(_LEAVE.findall(change)), plan["files"]) - (named if lines else set())
+    named -= left
+    limits = _STDLIB_ONLY.sub(" ", change)
+    only = bool(_ONLY.search(limits)) and (named or re.search(r"\breadme\b", change, re.I))
+    for f in plan["files"]:
+        if f["path"] in before and f.get("change") == "new":
+            f["change"] = "changed"
+        if f["path"] in before and (f["path"] in left or only and f["path"] not in named):
+            f["change"] = "same"
+
+
 def parse_plan(text: str, max_files: int) -> tuple[str, str, dict]:
     """(spoken summary, description, plan) from the planning answer. Raises ValueError."""
     summary, full = split_result(text)
@@ -498,6 +591,16 @@ def parse_edits(text: str) -> list[tuple[str, str]]:
     return [(m.group(1), m.group(2)) for m in _EDIT.finditer(text.replace("\r\n", "\n"))]
 
 
+def _unfence(part: str) -> str:
+    """A ``` fence line wrapped around an edit's FIND or REPLACE, taken off (task 40)."""
+    lines = part.split("\n")
+    if lines and re.fullmatch(r"[ \t]*```[\w#+.-]*[ \t]*", lines[0]):
+        lines = lines[1:]
+        if lines and re.fullmatch(r"[ \t]*```[ \t]*", lines[-1]):
+            lines = lines[:-1]
+    return "\n".join(lines)
+
+
 def _find_once(body: str, find: str) -> tuple[int, int] | str:
     """Where `find` is in `body`, as (start, end); or why it can't be used. Exact first; then line by
     line ignoring spaces at the ends of lines (models often get indentation or trailing spaces wrong).
@@ -533,6 +636,14 @@ def _find_once(body: str, find: str) -> tuple[int, int] | str:
         return starts[i], starts[i + len(want)] - 1                 # whole lines, without the last newline
     if len(hits) > 1:
         return twice(hits)
+    if "[REDACTED]" in find:              # the model saw the file with a value hidden: match it as shown
+        hits = [i for i in range(len(lines) - len(want) + 1)
+                if all(redact(lines[i + k]).strip() == want[k] for k in range(len(want)))]
+        if len(hits) == 1:
+            i = hits[0]
+            return starts[i], starts[i + len(want)] - 1
+        if len(hits) > 1:
+            return twice(hits)
     return "its FIND text isn't in the file"
 
 
@@ -553,8 +664,21 @@ def apply_edits(body: str, edits: list[tuple[str, str]], brace: bool = False) ->
     A pair that can't be found exactly once is skipped, never guessed. brace: a brace language (C#, JS,
     PHP, PowerShell, CSS...), where lines that lost their indentation get it back."""
     done, problems = 0, []
+    # only a file with something hidden from the model can lose a value to [REDACTED]; a file with none may
+    # use the text itself (task 51, Nov 15: a build whose own job is removing [REDACTED] couldn't be edited)
+    hidden = redact(body) != body
     for k, (find, repl) in enumerate(edits, 1):
+        if hidden and "[REDACTED]" in repl:   # it would write [REDACTED] over a value the model wasn't shown
+            first = next((l.strip() for l in find.split("\n") if l.strip()), "")[:80]
+            problems.append(f"edit {k} (FIND starting \"{first}\"): its REPLACE has [REDACTED] in it, which would "
+                            "overwrite a hidden value: leave the lines with [REDACTED] out of the edit")
+            continue
         where = _find_once(body, find)
+        if isinstance(where, str) and _unfence(find) != find and _unfence(find).strip():
+            # the model wrapped its FIND in a ``` fence (task 40): try it without, and its REPLACE too
+            unf = _find_once(body, _unfence(find))
+            if not isinstance(unf, str):
+                where, find, repl = unf, _unfence(find), _unfence(repl)
         if isinstance(where, str):
             first = next((l.strip() for l in find.split("\n") if l.strip()), "")[:80]
             problems.append(f"edit {k} (FIND starting \"{first}\"): {where}")
@@ -626,8 +750,9 @@ def _edit_file(ctx, job_id: int, msgs: list[dict], rel: str, old: str,
                                   "Send only the missed edits again, with the FIND lines copied exactly from it. "
                                   + EDIT_FORMAT}], 6000)
         more = parse_edits(again)
-        body, done2, problems = apply_edits(body, more, brace)
-        done += done2
+        if more:                                       # no edits in the reply: the missed ones stay missed
+            body, done2, problems = apply_edits(body, more, brace)
+            done += done2
     note = f"`{rel}`: changed by {done} edit{'s' if done != 1 else ''}; every other line kept as it was"
     if problems:
         note += ". **Not applied (couldn't be found exactly once):** " + "; ".join(problems)
@@ -734,8 +859,9 @@ def _ps_errors(folder: Path, rels: list[str]) -> list[str] | None:
     return errors
 
 
-def build_problems(folder: Path, rels: list[str]) -> tuple[list[str], list[str]]:
-    """(problems, what was checked). C# compiled together, PowerShell / Python / JSON parsed. Nothing runs."""
+def build_problems(folder: Path, rels: list[str], stdlib_only: bool = False) -> tuple[list[str], list[str]]:
+    """(problems, what was checked). C# compiled together, PowerShell / Python / JSON parsed, Python
+    imports between the files checked. Nothing runs."""
     problems, checked = [], []
     cs = [r for r in rels if r.lower().endswith(".cs")]
     script = csc_script(folder, rels) if cs else None
@@ -780,10 +906,162 @@ def build_problems(folder: Path, rels: list[str]) -> tuple[list[str], list[str]]
             problems.append(f"{r} line {e.lineno}: {e.msg}")
     if any(r.lower().endswith((".py", ".json")) for r in rels):
         checked.append("Python / JSON parsed")
+    py = [r for r in rels if r.lower().endswith(".py")]
+    if py:
+        found = py_import_problems(folder, py, stdlib_only)
+        if found is not None:
+            problems += found
+            checked.append("Python imports between the files checked"
+                           + (" (standard library only)" if stdlib_only else ""))
     return problems, checked
 
 
+def _py_module(rel: str) -> str:
+    """academy/lesson.py -> academy.lesson; pkg/__init__.py -> pkg."""
+    parts = list(PurePosixPath(rel.replace("\\", "/")).with_suffix("").parts)
+    if parts and parts[-1] == "__init__":
+        parts.pop()
+    return ".".join(parts)
+
+
+def _top_names(tree: ast.Module) -> set[str] | None:
+    """The names a module defines at its top level (None: it has a `from x import *`, so can't tell)."""
+    names: set[str] = set()
+
+    def walk(body):
+        for node in body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(node.name)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                for t in (node.targets if isinstance(node, ast.Assign) else [node.target]):
+                    for n in ast.walk(t):
+                        if isinstance(n, ast.Name):
+                            names.add(n.id)
+            elif isinstance(node, ast.Import):
+                names.update((a.asname or a.name).split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                if any(a.name == "*" for a in node.names):
+                    raise LookupError
+                names.update(a.asname or a.name for a in node.names)
+            elif isinstance(node, (ast.If, ast.Try, ast.With, ast.For, ast.While)):
+                for field in ("body", "orelse", "finalbody"):
+                    walk(getattr(node, field, []) or [])
+                for h in getattr(node, "handlers", []) or []:
+                    walk(h.body)
+    try:
+        walk(tree.body)
+    except LookupError:
+        return None
+    return names
+
+
+def _imported_by(folder: Path, test: str, rels: list[str]) -> list[str]:
+    """The build's own Python files a test imports, the most used first (read with ast; nothing is run)."""
+    try:
+        src = (folder / test).read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(src)
+    except (OSError, SyntaxError, ValueError):
+        return []
+    mods = {PurePosixPath(r.replace("\\", "/")).with_suffix("").as_posix().replace("/", "."): r
+            for r in rels if r.lower().endswith(".py") and r != test}
+    found = []
+    for node in ast.walk(tree):
+        names = ([a.name for a in node.names] if isinstance(node, ast.Import)
+                 else [node.module or ""] if isinstance(node, ast.ImportFrom) else [])
+        for n in names:
+            for mod, rel in mods.items():
+                if (n == mod or n.endswith("." + mod) or mod.endswith("." + n)) and rel not in found:
+                    found.append(rel)
+    return sorted(found, key=lambda r: -src.count(PurePosixPath(r.replace("\\", "/")).stem))
+
+
+def py_import_problems(folder: Path, rels: list[str], stdlib_only: bool = False) -> list[str] | None:
+    """Imports between a build's Python files, read with `ast` (nothing is run; review step 2, Nov 14).
+    - `from X import a` where X is a file in the build: X must define a.
+    - `from .X import a` when the files aren't a package (no __init__.py): it fails when run as a script.
+    - with stdlib_only: any import that's neither in the build nor in Python's standard library.
+    Imports inside a try with an except are optional, so only their names are checked."""
+    import sys
+    trees, mods = {}, {}
+    for r in rels:
+        try:
+            trees[r] = ast.parse((folder / r).read_text(encoding="utf-8-sig", errors="replace"), r)
+        except SyntaxError:
+            continue                                     # already reported by the parse check
+        mods[_py_module(r)] = r
+    defined = {m: _top_names(trees[r]) for m, r in mods.items()}
+    stdlib = set(getattr(sys, "stdlib_module_names", ())) | {"__future__"}
+    problems: list[str] = []
+
+    for r, tree in trees.items():
+        # an import of one of the build's own files, commented out: a fix round's way round a missing name
+        # (task 49: "# from academy_lesson import build_lesson"), which hides the problem instead of fixing it
+        for no, line in enumerate((folder / r).read_text(encoding="utf-8-sig", errors="replace").splitlines(), 1):
+            m = re.match(r"\s*#\s*(?:from\s+([\w.]+)\s+import\s+\w|import\s+([\w.]+)\s*(?:#|$))", line)
+            if m and (m.group(1) or m.group(2) or "").lstrip(".") in mods:
+                problems.append(f"{r} line {no}: an import of {(m.group(1) or m.group(2)).lstrip('.')} is commented "
+                                "out. Make what it imports exist and work, then put the import back")
+        here = _py_module(r).split(".")
+        is_pkg = r.replace("\\", "/").endswith("__init__.py")
+        pkg = here if is_pkg else here[:-1]                # the package this file is in
+        has_init = any(x.replace("\\", "/") == "/".join(pkg + ["__init__.py"]) for x in rels) if pkg else False
+        optional: set[int] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Try) and node.handlers:
+                for inner in node.body:
+                    optional.update(id(n) for n in ast.walk(inner))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                if node.level:
+                    if not has_init and id(node) not in optional:
+                        problems.append(f"{r} line {node.lineno}: `from {'.' * node.level}{node.module or ''} import "
+                                        f"...` is a package import, but these files aren't a package (no "
+                                        "__init__.py), so it fails when the files are run or imported as they are. "
+                                        f"Use `from {node.module or ''} import ...`")
+                        continue
+                    base = pkg[:len(pkg) - (node.level - 1)] if node.level > 1 else pkg
+                    target = ".".join(base + ([node.module] if node.module else []))
+                else:
+                    target = node.module or ""
+                if target in mods:
+                    names = defined.get(target)
+                    if names is None:
+                        continue
+                    for a in node.names:
+                        if a.name != "*" and a.name not in names and f"{target}.{a.name}" not in mods:
+                            problems.append(f"{r} line {node.lineno}: imports {a.name} from {mods[target]}, "
+                                            f"which doesn't define {a.name}")
+                elif not node.level and stdlib_only and id(node) not in optional:
+                    top = target.split(".")[0]
+                    if top and top not in stdlib and not any(m.split(".")[0] == top for m in mods):
+                        problems.append(f"{r} line {node.lineno}: imports {top}, which isn't in Python's standard "
+                                        "library (the request asks for the standard library only)")
+            elif isinstance(node, ast.Import) and id(node) not in optional and any(
+                    (a.name in mods and not a.asname) for a in node.names):
+                # `import academy_lesson` then `academy_lesson.build_lesson(...)` (task 49: the module was empty
+                # and the check didn't see it): each name used must be defined there
+                for a in node.names:
+                    if a.name not in mods or a.asname or defined.get(a.name) is None:
+                        continue
+                    used = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)
+                            and isinstance(n.value, ast.Name) and n.value.id == a.name}
+                    for name in sorted(used - defined[a.name]):
+                        problems.append(f"{r} line {node.lineno}: uses {a.name}.{name}, but {mods[a.name]} doesn't "
+                                        f"define {name}")
+            if isinstance(node, ast.Import) and stdlib_only and id(node) not in optional:
+                for a in node.names:
+                    top = a.name.split(".")[0]
+                    if top not in stdlib and not any(m.split(".")[0] == top for m in mods):
+                        problems.append(f"{r} line {node.lineno}: imports {top}, which isn't in Python's standard "
+                                        "library (the request asks for the standard library only)")
+    return problems
+
+
+_STDLIB_ONLY = re.compile(r"(?i)\bstandard[ -]library\b[^.\n]{0,20}\bonly\b|\bonly\b[^.\n]{0,30}\bstandard[ -]library\b"
+                          r"|\bno (?:third[- ]party|external) (?:packages|libraries|modules)\b")
+_WANTS_TESTS = re.compile(r"(?i)\b(?:tests?|test_\w+\.py|\w+_test\.py)\b[^.\n]{0,40}\bpass(?:es|ing)?\b")
 _ITEM = re.compile(r"(?m)^\s*(\d{1,2})[.)]\s+(\S.*)$")
+_README_ITEM = re.compile(r"(?i)^\s*\d{1,2}[.)]\s+[`*]*README(?:\.md)?\b")
 _TICK = re.compile(r"(?mi)^[^\w\n]*(?:item[ \t]*)?(\d{1,2})[ \t]*[:.)\-][ \t]*\**(DONE|MISSING)\**\b[ \t:\-â€“]*([^\n]*)$")
 
 
@@ -797,19 +1075,40 @@ def numbered_items(change: str) -> dict[int, str]:
 
 
 def _checklist(ctx, p: dict, desc: str, plan: dict, written: dict[str, str], items: dict[int, str],
-               cap: int) -> dict[int, tuple[str, str]]:
+               cap: int, log_path: Path | None = None) -> dict[int, tuple[str, str]]:
     """{item number: ("DONE" | "MISSING" | "NOT SAID", note)} for the numbered changes, from the files as they are."""
     files = "\n\n".join(f"--- {path} ---\n{body[:cap]}" + ("\n(... cut here)" if len(body) > cap else "")
                         for path, body in written.items() if not path.lower().endswith(".md"))
-    reply = ctx.chat([{"role": "system", "content": SYSTEM},
-                      {"role": "user", "content": f"The project: {redact(p['request'])}\n\nIts files now:\n\n{files}"},
-                      {"role": "user", "content":
-                       "These changes were asked for:\n\n" + redact("\n".join(items.values())) +
-                       "\n\nCheck the files above, not the request: for each numbered change, reply with one line, "
-                       "exactly \"N: DONE\" or \"N: MISSING - the file and what's missing\". Only DONE when the code "
-                       "above really does it. No other text."}], 1500)
-    got = {int(m.group(1)): (m.group(2).upper(), m.group(3).strip()[:200]) for m in _TICK.finditer(reply)}
+    msgs = [{"role": "system", "content": SYSTEM},
+            {"role": "user", "content": f"The project: {redact(p['request'])}\n\nIts files now:\n\n{files}"},
+            {"role": "user", "content":
+             "These changes were asked for:\n\n" + redact("\n".join(items.values())) +
+             "\n\nCheck the files above, not the request: for each numbered change, reply with one line, "
+             "exactly \"N: DONE\" or \"N: MISSING - the file and what's missing\". Only DONE when the code "
+             "above really does it. No other text."}]
+    # room for models that think first (Nov 14, task 38: 1,500 left no ticks for 8 items, so all 8 read as
+    # missing); one more ask when none can be read
+    reply = ctx.chat(msgs, 4000)
+    got = {int(m.group(1)): (m.group(2).upper(), m.group(3).strip()[:200]) for m in _TICK.finditer(_unbold(reply))}
+    if not got:
+        log.info("checklist: no ticks in the reply (%d characters); asking again", len(reply))
+        more = ctx.chat(msgs + [{"role": "assistant", "content": reply},
+                                {"role": "user", "content": "I couldn't read that. Reply with only one line per "
+                                 "number, like \"1: DONE\" or \"2: MISSING - file: what's missing\"."}],
+                        8000 if not reply.strip() else 4000)   # an empty reply: it thought too long (task 42)
+        got = {int(m.group(1)): (m.group(2).upper(), m.group(3).strip()[:200]) for m in _TICK.finditer(_unbold(more))}
+        reply += "\n\n--- asked again ---\n\n" + more
+    if log_path is not None:                            # kept for review: what the checklist said, each round
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(f"=== checklist ({len(got)} of {len(items)} read) ===\n{reply}\n\n")
     return {n: got.get(n, ("NOT SAID", "")) for n in items}
+
+
+def _unbold(text: str) -> str:
+    """'**1:** DONE', '| 1 | DONE |', '- 1 — DONE' -> '1: DONE' (models format a checklist their own way)."""
+    text = re.sub(r"[*`]+|(?<!\w)_+|_+(?!\w)", "", text or "")       # keeps academy_fit.py's underscore
+    return re.sub(r"(?m)^[ \t|>\-]*(\d{1,2})[ \t]*(?:[|:.)\-–—]+[ \t]*)+(DONE|MISSING)\b[ \t|]*",
+                  r"\1: \2 ", text)
 
 
 def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path, written: dict[str, str],
@@ -823,54 +1122,195 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
     code = [r for r in written if not r.lower().endswith(".md")]
     rounds = max(1, int(rounds or ctx.cfg.get("build_check_rounds", 3)))
     # `only`: one stage's changes (a staged build checks each stage before the next)
-    items = only if only is not None else numbered_items(p.get("change", "")) if p.get("parent_id") else {}
+    # a first build's numbered list is checked off too (review step 1, Nov 14: task 37's 9 items weren't)
+    items = (only if only is not None else numbered_items(p.get("change", "")) if p.get("parent_id")
+             else numbered_items(p.get("request", "")))
+    # the README is written after this check (and told what's true), so its item isn't ticked here
+    items = {n: t for n, t in items.items() if not _README_ITEM.match(t)}
     use_list = len(items) >= (1 if only is not None else 2)
+    stdlib_only = bool(_STDLIB_ONLY.search(p.get("request", "")))
+    wants_tests = only is None and bool(_WANTS_TESTS.search(p.get("request", "")))
 
     def fix(rel: str, what: str) -> None:
+        if len(written[rel].strip()) < 200 and not rel.lower().endswith(".md"):
+            # (nearly) empty: there's nothing for an edit to find (task 49), so it's written whole
+            steps.info("%s is (nearly) empty, so it's written whole, not edited.", rel)
+            text = ctx.chat(_file_messages(p, desc, plan, rel, written, cap, None)
+                            + [{"role": "user", "content": "Also make sure of this:\n\n" + what}], 6000)
+            body = _strip_outer_fence(text, False)
+            if len(body.strip()) >= 40 and not _refusal(body):
+                inside(folder, rel).write_text(body, encoding="utf-8")
+                written[rel] = body
+                notes.append(f"`{rel}`: written whole again (it was empty)")
+            else:
+                notes.append(f"`{rel}`: still empty after asking again")
+            return
         body, note = _edit_file(ctx, job_id, _edit_messages(p, desc, plan, rel, written, written[rel], what, cap),
                                 rel, written[rel])
         if body != written[rel]:
             inside(folder, rel).write_text(body, encoding="utf-8")
             written[rel] = body
+        if "**Not applied" in note and (whole := _rewrite_whole(rel, what)):
+            note += f"; the missed changes were then made by writing the file whole ({whole})"
         notes.append(note)
 
+    def _rewrite_whole(rel: str, what: str) -> str:
+        """Edits that couldn't be found (task 51: 0 of 2 went in, twice): the file is written whole instead,
+        with the current text to keep. Only kept when it's no shorter than half the old one, isn't a refusal
+        and (Python, JSON) still parses; else the old file stays. Returns how it went, or '' (not tried)."""
+        old = written[rel]
+        if len(old) > 24_000 or rel.lower().endswith(".md"):
+            return ""                                   # too long to rewrite safely: the edits stay the only way
+        if redact(old) != old:                          # something in it was hidden from the model: a rewrite
+            return "not tried: the file has a hidden value a rewrite could lose"   # could write [REDACTED] over it
+        before = py_import_problems(folder, list(written), stdlib_only) or [] if rel.endswith(".py") else []
+        steps.info("%s: the missed changes are made by writing the file whole, keeping what works.", rel)
+        msgs = (_file_messages(p, desc, plan, rel, {k: v for k, v in written.items() if k != rel}, cap, None)
+                + [{"role": "user", "content": f"The current {rel}, to keep except where it must change:\n```\n"
+                                               f"{old}\n```\n\nWhat must change:\n{what}"}])
+        try:
+            body = _strip_outer_fence(ctx.chat(msgs, 8000), False)
+        except (BudgetOut, TooLongForLocal):
+            raise
+        except Exception as e:
+            return f"not kept: {e}"
+        ok = len(body.strip()) >= len(old.strip()) // 2 and not _refusal(body)
+        if ok and rel.lower().endswith(".py"):
+            try:
+                ast.parse(body)
+            except SyntaxError:
+                ok = False
+        if ok and rel.lower().endswith(".json"):
+            try:
+                json.loads(body)
+            except ValueError:
+                ok = False
+        if not ok:
+            steps.info("%s: the whole rewrite came back short or broken, so the file was left as it was.", rel)
+            return "not kept: it came back short or broken"
+        inside(folder, rel).write_text(body, encoding="utf-8")
+        written[rel] = body
+        if rel.endswith(".py"):                         # it mustn't break what the other files import (task 51:
+            new = [x for x in (py_import_problems(folder, list(written), stdlib_only) or [])   # it dropped
+                   if x not in before]                                                          # collect())
+            if new:
+                inside(folder, rel).write_text(old, encoding="utf-8")
+                written[rel] = old
+                steps.info("%s: the whole rewrite broke an import (%s), so the file was put back.", rel, new[0])
+                return "not kept: it broke an import: " + new[0]
+        return "kept"
+
+    check_log = SMITHY.results_dir / f"{job_id:05d}-checklist.txt" if job_id else None
+
     def check() -> tuple[dict[int, tuple[str, str]], list[str], list[str]]:
-        ticks = _checklist(ctx, p, desc, plan, written, items, cap) if use_list else {}
-        problems, checked = build_problems(folder, code)
+        ticks = _checklist(ctx, p, desc, plan, written, items, cap, check_log) if use_list else {}
+        problems, checked = build_problems(folder, code, stdlib_only)
         return ticks, problems, checked
+
+    def file_for(n: int) -> str | None:
+        """The file the check named, else the file the item itself names, else the longest."""
+        for text in (ticks[n][1], items[n].split("\n")[0]):
+            low = text.lower()
+            rel = next((r for r in code if r.lower() in low or Path(r).name.lower() in low), None)
+            if rel:
+                return rel
+        return max(code, key=lambda r: len(written[r])) if code else None
 
     if use_list:
         steps.info("Checking the %d changes asked for against the files.", len(items))
-    ticks, problems, checked = check()
-    for rnd in range(1, rounds + 1):
-        missing = [n for n, (state, _) in ticks.items() if state != "DONE"]
-        if not missing and not problems:
-            break
-        steps.info("Check round %d of %d: %s; asking for fixes.", rnd, rounds, ", ".join(filter(None, [
-            f"{len(missing)} change{'s' if len(missing) != 1 else ''} not in the files yet" if missing else "",
-            f"{len(problems)} build problem{'s' if len(problems) != 1 else ''}" if problems else ""])))
-        if missing:                                          # each to the file the check named, else the longest
-            by_file: dict[str, list[int]] = {}
-            for n in missing:
-                said = ticks[n][1].lower()
-                rel = next((r for r in code if r.lower() in said or Path(r).name.lower() in said),
-                           max(code, key=lambda r: len(written[r])) if code else None)
-                if rel:
-                    by_file.setdefault(rel, []).append(n)
-            for rel, nums in by_file.items():
-                fix(rel, "Make only these changes, which aren't in the file yet:\n\n" + "\n\n".join(items[n] for n in nums))
-        if problems:
-            problems, checked = build_problems(folder, code)    # again: the edits above may have changed them
-            for rel in code:
-                mine = [x for x in problems if x.startswith(rel + " ")]
-                if mine:
-                    fix(rel, "Fix only these build errors (Windows' own C# compiler / PowerShell parser); every "
-                             "other line stays exactly as it is. If a class is defined twice across files, keep "
-                             "one:\n- " + "\n- ".join(mine[:30]))
+    # a limit reached part way (the task's cloud tokens, a step too long for this PC) ends the checks,
+    # not the task: what's true so far is reported, NOT COMPLETE (Nov 14, task 38 failed instead)
+    stopped = ""
+    ticks: dict[int, tuple[str, str]] = {}
+    try:
         ticks, problems, checked = check()
+        for rnd in range(1, rounds + 1):
+            missing = [n for n, (state, _) in ticks.items() if state == "MISSING"]   # NOT SAID isn't fixed blind
+            if not missing and not problems:
+                break
+            steps.info("Check round %d of %d: %s; asking for fixes.", rnd, rounds, ", ".join(filter(None, [
+                f"{len(missing)} change{'s' if len(missing) != 1 else ''} not in the files yet" if missing else "",
+                f"{len(problems)} build problem{'s' if len(problems) != 1 else ''}" if problems else ""])))
+            if missing:                                      # each to its own file, a few at a time
+                by_file: dict[str, list[int]] = {}
+                for n in missing:
+                    rel = file_for(n)
+                    if rel:
+                        by_file.setdefault(rel, []).append(n)
+                before = dict(written)
+                for rel, nums in by_file.items():
+                    for k in range(0, len(nums), 3):
+                        fix(rel, "Make only these changes, which aren't in the file yet:\n\n"
+                            + "\n\n".join(items[n] for n in nums[k:k + 3]))
+                if written == before and not problems:
+                    # nothing went in, so checking again would give the same answer (task 40 asked again and
+                    # got an empty reply that wiped out the first one's 6 DONE)
+                    steps.info("No fix went in this round, so the last check stands.")
+                    break
+            if problems:
+                problems, checked = build_problems(folder, code, stdlib_only)   # again: the edits may have changed them
+                for rel in code:
+                    mine = [x for x in problems if x.startswith(rel + " ")]
+                    if mine:
+                        fix(rel, "Fix only these build errors (Windows' own C# compiler / PowerShell parser / the "
+                                 "Python import check); every other line stays exactly as it is. If a class is "
+                                 "defined twice across files, keep one. Fix the code itself: never by deleting or "
+                                 "commenting out the import, call or test that found the problem (task 49 commented "
+                                 "out an import of a missing function):\n- " + "\n- ".join(mine[:30]))
+            old_ticks = ticks
+            ticks, problems, checked = check()
+            # a check that gave no answer for an item keeps the round before's answer, said as such
+            again = "(from the check before the last fixes; the last check gave no answer)"
+            ticks = {n: (old_ticks[n][0], old_ticks[n][1] if again in old_ticks[n][1]
+                         else (old_ticks[n][1] + " " if old_ticks[n][1] else "") + again)
+                     if s == "NOT SAID" and old_ticks.get(n, ("NOT SAID",))[0] != "NOT SAID" else (s, note)
+                     for n, (s, note) in ticks.items()}
+    except (BudgetOut, TooLongForLocal) as e:
+        stopped = str(e)
+        log.warning("build %d: checks stopped early: %s", job_id, stopped)
+        steps.info("The checks stopped early: %s.", stopped)
+        problems, checked = build_problems(folder, code, stdlib_only)    # no model needed for these
+        # the last check's answers stand (a fix may have been tried since, unchecked); none yet: not checked
+        ticks = {n: (s, note + " (a fix was tried, not checked again)" if s == "MISSING" else note)
+                 for n, (s, note) in ticks.items()} if ticks else {n: ("NOT SAID", "") for n in items} if use_list else {}
+
+    # the tests, in a throwaway Windows Sandbox (smithy_sandbox; off unless sandbox_tests is on). Only for the
+    # whole build, once it builds clean; a failure gets one fix round (sandbox_fix_rounds) and runs again.
+    sandbox = {"status": "off", "tests": {}, "output": {}, "why": ""}
+    if only is None and not stopped and not problems and any(smithy_sandbox.is_test(r) for r in code):
+        stop = getattr(ctx, "_should_stop", None)
+        try:
+            for rnd in range(int(ctx.cfg.get("sandbox_fix_rounds", 1)) + 1):
+                sandbox = smithy_sandbox.run_tests(job_id, folder, code, ctx.cfg, SMITHY.results_dir, stop, rnd + 1)
+                if sandbox["status"] != "failed" or rnd >= int(ctx.cfg.get("sandbox_fix_rounds", 1)):
+                    break
+                before = {r: (folder / r).read_bytes() for r in code if (folder / r).exists()}
+                for t, state in sandbox["tests"].items():
+                    if state == "passed":
+                        continue
+                    out = sandbox["output"].get(t, "")
+                    same = {f["path"] for f in plan.get("files", []) if f.get("change") == "same"}
+                    named = _failing_files(sandbox.get("full", {}).get(t, out), t, code, same) or \
+                        [r for r in _imported_by(folder, t, code) if r not in same] or [t]
+                    shown = _failing_test_code(folder / t, sandbox.get("full", {}).get(t, out))
+                    for rel in named[:4]:
+                        fix(rel, f"{t} failed when it was run (in a throwaway Sandbox). Its last lines:\n{out}\n\n"
+                                 + (f"The failing tests, as written in {t}:\n```python\n{shown}\n```\n\n" if shown else "")
+                                 + "Fix the cause in this file. Don't weaken or remove the test.")
+                if all((folder / r).exists() and (folder / r).read_bytes() == b for r, b in before.items()):
+                    steps.info("No fix changed a file, so the last test run stands (not run again).")
+                    break                    # task 55: a 10-minute Sandbox run again on the same files
+                problems, checked = build_problems(folder, code, stdlib_only)
+                if problems:
+                    break
+        except (BudgetOut, TooLongForLocal) as e:
+            stopped = str(e)
 
     # what's true now, for the result and the README
     left, truth = [], []
+    if stopped:
+        left.append("the checks stopped early (" + stopped.split(";")[0] + ")")
+        notes.append(f"**The checks stopped early:** {stopped}.")
     not_done = [n for n, (s, _) in ticks.items() if s != "DONE"]
     if problems:
         left.append(f"{len(problems)} build problem{'s' if len(problems) != 1 else ''}")
@@ -882,12 +1322,44 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
         truth.append("Build check passed (" + "; ".join(checked) + "). Nothing has been run.")
     else:
         notes.append("**Build check:** none of these file types can be checked automatically here.")
+    # say exactly what wasn't checked (review step 4): The Smithy runs nothing, so tests the request
+    # wants passing haven't been shown to pass, and the build isn't complete
+    tests = [r for r in code if re.match(r"(?i)^(?:test_\w*|\w*_test)\.py$", Path(r).name)]
+    ran = sandbox["status"] in ("passed", "failed", "timeout")
+    if ran:
+        said = ", ".join(f"`{t}` {s}" for t, s in sandbox["tests"].items())
+        if sandbox["status"] == "passed":
+            notes.append(f"**Tests passed in a throwaway Windows Sandbox** (networking off): {said}.")
+            truth.append("Its tests were run in a throwaway Windows Sandbox and passed: " + said + ".")
+        else:
+            left.append(f"its tests {'failed' if sandbox['status'] == 'failed' else 'ran out of time'} in the Sandbox")
+            notes.append(f"**Tests in a throwaway Windows Sandbox:** {said}. The last lines:\n\n"
+                         + "\n\n".join(f"`{t}`:\n```\n{o}\n```" for t, o in sandbox["output"].items()
+                                       if sandbox["tests"].get(t) != "passed"))
+            truth.append("Its tests were run in a Sandbox and did NOT all pass: " + said + ". Say so plainly.")
+    elif sandbox["status"] in ("busy", "unavailable") and tests:
+        notes.append(f"**Tests not run in the Sandbox:** {sandbox['why']}.")
+    if ran:
+        pass
+    elif wants_tests:
+        left.append("its tests weren't run (The Smithy runs nothing; the request asks for them to pass)")
+        notes.append("**Tests not run:** the request asks for "
+                     + (", ".join(f"`{t}`" for t in tests) if tests else "its tests") + " to pass, and The Smithy "
+                     "never runs code, so that isn't shown.")
+        truth.append("Its tests have NOT been run, so don't say they pass; say \"Tests not run yet\".")
+    elif tests:
+        notes.append("**Tests not run:** " + ", ".join(f"`{t}`" for t in tests) + " (The Smithy never runs code).")
+        truth.append("Its tests have NOT been run, so don't say they pass.")
     if ticks:
         done = [n for n in ticks if n not in not_done]
-        if not_done:
-            left.append(f"{len(not_done)} of {len(ticks)} changes not done ({', '.join(map(str, not_done))})")
+        unread = [n for n in not_done if ticks[n][0] == "NOT SAID"]
+        if unread:
+            left.append(f"{len(unread)} of {len(ticks)} changes couldn't be checked ({', '.join(map(str, unread))})")
+        if len(unread) < len(not_done):
+            left.append(f"{len(not_done) - len(unread)} of {len(ticks)} changes not done "
+                        f"({', '.join(str(n) for n in not_done if n not in unread)})")
         notes.append(f"**Changes asked for:** {len(done)} of {len(ticks)} done"
-                     + (". **Not done:** " + "; ".join(f"{n} ({ticks[n][1] or ticks[n][0].lower()})" for n in not_done)
+                     + (". **Not done:** " + "; ".join(f"{n} ({ticks[n][1] or ('not checked: the checklist reply had no answer for it' if ticks[n][0] == 'NOT SAID' else ticks[n][0].lower())})" for n in not_done)
                         if not_done else "."))
         truth.append("Of the numbered changes asked for, these are DONE: " + (", ".join(map(str, done)) or "none")
                      + (". These are NOT done, so don't describe them as done; list them under \"Not done yet\": "
@@ -907,6 +1379,19 @@ def _readme_messages(p: dict, desc: str, plan: dict, written: dict[str, str], tr
                                         + "Write its README.md: what it is, what each file "
                                         "does, where each file goes in the real project, how to install or use "
                                         "it, and anything to check first. Describe only what the files really do. "
+                                        "Always include a \"How to run it\" section and, if there are tests, a "
+                                        "\"How to test it\" section: numbered steps a beginner can follow (which "
+                                        "folder to open, the exact command to type, what they should see when it "
+                                        "works, and what a failure looks like). If a question was asked while "
+                                        "planning (\"how do I run the tests?\"), make sure the README answers it. "
+                                        "Write it in the tone of the request and any answers given while planning "
+                                        "(plain and friendly for someone new, short and technical for a "
+                                        "programmer), without leaving out anything that's checked to be true. "
+                                        "Never guess a user name or a user folder (Nov 15: a README said "
+                                        "C:\\Users\\the user, which isn't anyone's real folder): write paths from "
+                                        "the user's own folder as %USERPROFILE%\\... (cmd) or $env:USERPROFILE\\... "
+                                        "(PowerShell), or say \"the folder you copied it to\". Commands for "
+                                        "Windows go in ```powershell blocks, never ```bash. "
                                         "Plain markdown, no outer code fence."}]
 
 
@@ -944,6 +1429,604 @@ def first_params(parent_id: int) -> dict:
     return {}
 
 
+# ---------------------------------------------------------------- builds: read, ask, propose (Nov 14)
+# the user: "Build for The Smithy to read a prompt, ask for clarification where needed, create a plan
+# offered with a yes/no prompt and make any adaptations for further user input." A new build is a
+# proposal first (build_ask_first, on): its questions, what doesn't fit together, what it will assume, and
+# the plan, then it waits. Her reply (smithy.py reply ID TEXT, or the app's Plan window): yes builds it
+# with that plan, no drops it, anything else is answers or changes and gets a revised proposal.
+def ask_first(cfg: dict, p: dict) -> bool:
+    """Whether this build is proposed first (not a new version, not one she already said yes to)."""
+    return bool(cfg.get("build_ask_first", True)) and not p.get("no_ask") and not p.get("plan_task") \
+        and not p.get("parent_id")
+
+
+def proposal_path(job_id: int) -> Path:
+    return SMITHY.results_dir / f"{int(job_id):05d}-proposal.json"
+
+
+def load_proposal(job_id: int) -> dict | None:
+    try:
+        return json.loads(proposal_path(job_id).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _proposal_messages(p: dict, max_files: int, earlier: dict | None, facts: str) -> list[dict]:
+    flavour = ("\n\n" + JOOMLA) if p.get("joomla") else ""
+    ask = (f"Read this request carefully before anything is built.\n\nThe request: {redact(p['request'])}\n\n"
+           + (f"What the files the request names really look like (read from this PC, values hidden; trust "
+              f"these over any guess in the request):\n{facts}\n\n" if facts else "")
+           + (f"Your earlier proposal for it:\n{earlier['text'][:8000]}\n\nThe answers and changes so far "
+              "(the newest last; they override the request where they differ):\n- "
+              + "\n- ".join(redact(a) for a in earlier["answers"]) + "\n\nRevise the proposal to fit them.\n\n"
+              if earlier else "")
+           + "Then reply in exactly two parts:\nSPOKEN SUMMARY:\nTwo or three plain sentences for reading aloud: "
+           "what you'd build, and how many questions you have. No code or symbols.\nFULL RESULT:\nA short "
+           "description of the design, then ONE ```json block like this:\n"
+           '{"name": "short-folder-name", "files": [{"path": "src/main.py", "purpose": "what this file does"}], '
+           '"questions": [{"q": "the question", "default": "what you will do if not told"}], '
+           '"conflicts": ["..."], "assumptions": ["..."], "replies": ["..."]}\n'
+           "- The person may be new to coding. Write everything they read in plain words: no function, module "
+           "or file names in a question unless they can't be avoided, and say what a term means if you use one.\n"
+           "- Match their tone (the user, Nov 14): answer the way they wrote. Casual or worried gets a friendly, "
+           "reassuring reply; short and technical gets a short, technical one. The tone changes, never the "
+           "facts: keep every limit, conflict and cost in, however you say it.\n"
+           "- questions: only what you truly can't decide yourself and that changes what gets built (at most 5; "
+           "none is fine). One plain question each, with the answer you'll use if you're not told. If the "
+           "person says they don't understand, or to decide for them, don't ask it again: decide, and put it "
+           "under assumptions.\n"
+           "- replies: if their answers ask you something (\"does that mean it won't work?\"), answer it here, "
+           "plainly and honestly, one entry per thing they asked. Empty if they asked nothing. Nothing has been "
+           "built or run yet, so never promise that tests will pass or that the code will work (task 48 did): "
+           "say what you'll do, and what they'd need to do to find out.\n"
+           "- conflicts: places where the request contradicts itself, or asks for something that can't work "
+           "as written (a test that can't pass with the code it describes, a rule the code would break), "
+           "including where it disagrees with the real files above.\n"
+           "- assumptions: what else you'll decide yourself, said plainly (for example \"the files it reads "
+           "have these fields\"), so a wrong guess can be corrected before building.\n"
+           f"At most {max_files} files. Paths are relative, with forward slashes, laid out like the real "
+           "project. Text files only. Don't list a README.md: it's written last, automatically.")
+    return [{"role": "system", "content": SYSTEM + flavour}, {"role": "user", "content": ask}]
+
+
+def _list_of(raw: dict, key: str, most: int = 8) -> list[str]:
+    v = raw.get(key) if isinstance(raw, dict) else None
+    return [str(x).strip()[:400] for x in v if str(x).strip()][:most] if isinstance(v, list) else []
+
+
+def _q(x) -> dict:
+    """A question as {"q", "default"} (plans written before Nov 14 kept them as plain text)."""
+    return x if isinstance(x, dict) else {"q": str(x), "default": ""}
+
+
+def _questions_of(raw: dict) -> list[dict]:
+    """[{"q", "default"}]: each question with the answer it will use if not told (a plain string: no default)."""
+    out = []
+    for x in (raw.get("questions") if isinstance(raw, dict) else None) or []:
+        if isinstance(x, dict):
+            q, d = str(x.get("q") or x.get("question") or "").strip(), str(x.get("default") or "").strip()
+        else:
+            q, d = str(x).strip(), ""
+        if q:
+            out.append({"q": q[:400], "default": d[:400]})
+    return out[:5]
+
+
+# -- what the files a request names really look like (suggestion 5, Nov 14: Academy's prompt guessed
+# The Smithy's -check.json fields wrong). Only allowlisted files (worker_files, redacted), and from The
+# Smithy's own results folder only the layout of its JSON files (keys and types, never values).
+_NAMED_FILE = re.compile(r"[\w*.\-/\\]*\*?[\w.\-]*\.(?:json|md|txt|py|ps1|cs|csv|ini|yml|yaml|toml|xml|html|php|css|js)\b",
+                         re.I)
+
+
+def _layout(value, depth: int = 0) -> str:
+    """A JSON value's shape: {"notes": list of text, "left": list, ...}, never its contents."""
+    if isinstance(value, dict):
+        if depth >= 2:
+            return "an object"
+        return "{" + ", ".join(f'"{k}": {_layout(v, depth + 1)}' for k, v in list(value.items())[:25]) + "}"
+    if isinstance(value, list):
+        if not value:
+            return "a list (empty here)"
+        inner = _layout(value[0], depth + 1)
+        return "a list of objects" if inner == "an object" else f"a list of {inner}"
+    return {bool: "true/false", int: "a number", float: "a number", str: "text"}.get(type(value), "null")
+
+
+KNOWN_KEYS: dict[str, set[str]] = {}          # the last request_facts: each JSON file name -> every key it has
+
+
+def _all_keys(value, depth: int = 0) -> set[str]:
+    keys: set[str] = set()
+    if depth > 3:
+        return keys
+    if isinstance(value, dict):
+        for k, v in value.items():
+            keys.add(str(k))
+            keys |= _all_keys(v, depth + 1)
+    elif isinstance(value, list) and value:
+        keys |= _all_keys(value[0], depth + 1)
+    return keys
+
+
+_FIELD = re.compile(r"[`'\"](\w{2,40})[`'\"]|\b(?:field|key)s?\s+(?:called\s+|named\s+)?[`'\"]?(\w{2,40})|"
+                    r"(?<![-\w])(\w{2,40})\s+(?:field|key)\b")
+
+
+_HAS_LIST = re.compile(r"\b(?:has|have|contains?|with)\s+((?:[a-z_]\w*(?:\s*,\s*|\s+and\s+|\s+or\s+)?){1,6})")
+_NOT_FIELDS = {"a", "an", "the", "list", "lists", "string", "strings", "key", "keys", "field", "fields", "value",
+               "values", "top", "level", "each", "entry", "entries", "file", "files", "path", "paths", "one", "two",
+               "some", "any", "all", "no", "only", "its", "their", "text", "number", "object", "objects", "array",
+               "dict", "true", "false", "null", "data", "info", "information", "items", "item", "at", "least", "most"}
+
+
+def layout_conflicts(prop: dict) -> list[str]:
+    """A default answer or assumption that names a field a real file doesn't have (task 45 assumed `passed` in
+    -check.json, though the plan showed notes, truth and left). Worked out in code, from request_facts."""
+    out = []
+    texts = [(f"Question {i}'s default", q["default"]) for i, q in enumerate(map(_q, prop.get("questions", [])), 1)
+             if q.get("default")] + [("An assumption", a) for a in prop.get("assumptions", [])]
+    for name, keys in KNOWN_KEYS.items():
+        stem = name.lstrip("*-").lower()                     # "-check.json" -> "check.json"
+        for who, text in texts:
+            if stem not in text.lower() and stem.split(".")[0] not in text.lower():
+                continue
+            named = {g for m in _FIELD.finditer(text) for g in m.groups() if g}
+            for m in _HAS_LIST.finditer(text):                 # "-check.json has notes and passed"
+                named |= {w for w in re.split(r"\s*,\s*|\s+and\s+|\s+or\s+|\s+", m.group(1)) if re.fullmatch(r"[a-z_]\w+", w)}
+            named -= _NOT_FIELDS
+            named -= {stem, stem.split(".")[0], "json", "true", "false", "null", "new", "edit", "the", "a", "an", "each",
+                  "one", "this", "that", "top", "level", "same", "its", "their", "string", "list", "text", "boolean"}
+            wrong = sorted(k for k in named if k not in keys and not k.endswith("json"))
+            if wrong:
+                out.append(f"{who} uses {', '.join(f'`{k}`' for k in wrong)} in `{name}`, but the real file has: "
+                           + ", ".join(f"`{k}`" for k in sorted(keys)[:12]) + ".")
+    return out
+
+
+def request_facts(request: str, limit_chars: int = 3500) -> str:
+    """For each file name or pattern the request names that exists: where, and what it looks like."""
+    KNOWN_KEYS.clear()
+    import fnmatch
+    names = []
+    for m in _NAMED_FILE.finditer(request or ""):
+        n = Path(m.group(0).replace("\\", "/")).name
+        if n and n.lower() not in (x.lower() for x in names) and not n.lower().endswith("readme.md"):
+            names.append(n)
+    if not names:
+        return ""
+    own = [x for x in SMITHY.results_dir.glob("*") if x.is_file()] if SMITHY.results_dir.exists() else []
+    allowed_files = None
+    out = []
+    for n in names[:6]:
+        pat = n if "*" in n else n
+        mine = sorted((x for x in own if fnmatch.fnmatch(x.name.lower(), pat.lower())
+                       or (("*" not in n) and x.name.lower().endswith(n.lower()))),
+                      key=lambda x: x.stat().st_mtime, reverse=True)
+        if mine and mine[0].suffix.lower() == ".json":           # The Smithy's own: the layout only
+            try:
+                data = json.loads(mine[0].read_text(encoding="utf-8"))
+                KNOWN_KEYS[n] = _all_keys(data)
+                shape = _layout(data)
+                out.append(f"- `{n}` (The Smithy's own task files, e.g. `{mine[0].name}`): {shape}")
+            except Exception:
+                pass
+            continue
+        if allowed_files is None:
+            allowed_files = worker_files.candidates()
+        hits = sorted((x for x in allowed_files if fnmatch.fnmatch(x.name.lower(), pat.lower())),
+                      key=lambda x: x.stat().st_mtime, reverse=True)
+        if not hits:
+            continue
+        ok, why = worker_files.allowed(hits[0])                   # allowlist, private names and folders
+        if not ok and "too big" not in why:
+            continue
+        # a file too big for a review (BUGFIXES.md) still shows how it starts: its first 20 KB, keys hidden
+        text = worker_files.redact(hits[0].read_text(encoding="utf-8", errors="replace")[:20_000])
+        if hits[0].suffix.lower() == ".json":
+            try:
+                data = json.loads(text)
+                KNOWN_KEYS[n] = _all_keys(data)
+                out.append(f"- `{n}` (`{hits[0].name}`): {_layout(data)}")
+            except Exception:
+                pass
+        else:
+            heads = [l for l in text.splitlines() if l.startswith("#")][:6]
+            first = "\n".join(text.splitlines()[:12])
+            out.append(f"- `{n}` (`{hits[0].name}`): its headings look like: " + " | ".join(h[:90] for h in heads)
+                       + f"\n  It starts:\n  " + first[:900].replace("\n", "\n  "))
+    return "\n".join(out)[:limit_chars]
+
+
+# -- what The Smithy can't do here, said before she says yes (suggestion 6)
+_UNCHECKED_EXT = {".php", ".css", ".scss", ".js", ".jsx", ".ts", ".tsx", ".html", ".sql", ".sh", ".yml", ".yaml"}
+
+
+def build_limits(plan: dict, request: str, cfg: dict) -> list[str]:
+    out = []
+    if _WANTS_TESTS.search(request or ""):
+        out.append("The request asks for tests to pass. The Smithy never runs code, so the build will say "
+                   "\"tests not run\" and finish NOT COMPLETE, however good the code is. That doesn't mean it's "
+                   "broken: it means nobody has tried it yet. The tests are written for you, and running them "
+                   "(one command, in the README) is how you find out whether it works.")
+    unchecked = sorted({Path(f["path"]).suffix.lower() for f in plan.get("files", [])} & _UNCHECKED_EXT)
+    if unchecked:
+        out.append("These kinds of file can only be written, not checked here: " + ", ".join(unchecked) + ".")
+    if len(plan.get("files", [])) >= int(cfg.get("max_build_files", 20)):
+        out.append(f"The plan is at the most files a build may have ({cfg.get('max_build_files', 20)}), so some "
+                   "may have been left out.")
+    return out
+
+
+# -- cost and time, before she says yes (suggestion 2): its own token limit, and what earlier builds of
+# about this size really used (each result's first line: "N cloud tokens, ... S s")
+_SPENT = re.compile(r"([\d,]+) cloud tokens.*?(\d+) s,")
+
+
+def _past_builds(n_files: int) -> list[tuple[int, int]]:
+    out = []
+    for r in SMITHY.by_status("review", "kept", "discarded", limit=200):
+        if r["type"] not in ("build", "joomla", "followup") or not r["result_path"] or not r["artifact"]:
+            continue
+        try:
+            plan = json.loads((SMITHY.results_dir / f"{r['id']:05d}-plan.json").read_text(encoding="utf-8"))
+            first = Path(r["result_path"]).read_text(encoding="utf-8", errors="replace").split("\n", 1)[0]
+        except Exception:
+            continue
+        m = _SPENT.search(first)
+        if m and abs(len(plan["plan"]["files"]) - n_files) <= 3:
+            out.append((int(m.group(1).replace(",", "")), int(m.group(2))))
+    return out
+
+
+def cost_line(plan: dict, p: dict, cfg: dict, budget: int) -> str:
+    n = len(plan.get("files", []))
+    cc = cfg.get("cloud") or {}
+    est, _ = estimate_build_tokens(plan, p.get("request", ""), cfg, budget)
+    least = int(cc.get("max_tokens_per_task", 200_000))
+    limit = min(max(est, least), max(least, int(cc.get("auto_task_tokens_max", 600_000)))) \
+        if cc.get("auto_task_tokens") else least
+    past = sorted(_past_builds(n))
+    line = f"Its cloud-token limit would be {limit:,}."
+    if past:
+        toks, secs = sorted(t for t, _ in past), sorted(s for _, s in past)
+        mid = toks[len(toks) // 2]
+        line += (f" {len(past)} earlier build{'s' if len(past) != 1 else ''} of about this size used "
+                 f"{toks[0]:,} to {toks[-1]:,} (about {mid:,} in the middle) and took "
+                 f"{max(1, round(secs[0] / 60))} to {max(1, round(secs[-1] / 60))} minutes. "
+                 "Slower when the faster providers are used up for the day.")
+    else:
+        line += " There's no earlier build of about this size to compare with yet"
+    line = line.rstrip(".") + "."
+    if (now := cloud_note(cfg)):
+        line += " " + now
+    return line
+
+
+def _clock(ts: float) -> str:
+    t = time.localtime(ts)
+    when = time.strftime("%I:%M %p", t).lstrip("0")
+    if time.strftime("%Y-%m-%d", t) == time.strftime("%Y-%m-%d"):
+        return when
+    return "midnight" if when == "12:00 AM" else "tomorrow " + when
+
+
+def cloud_note(cfg: dict) -> str:
+    """Which providers in the switch order are out of free tokens now, in a sentence ('' = none, or the
+    cloud isn't used). Said before a build starts (Nov 14, suggestion 4: a big build queued while every
+    provider was out just waited)."""
+    cc = cfg.get("cloud") or {}
+    if str(cc.get("default", "")).lower() != "auto":
+        return ""
+    st = worker_cloud.switch_out(cfg)
+    if not st["out"]:
+        return ""
+    names = [n for n, _ in st["out"]]
+    who = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+    back = _clock(st["back_ts"])
+    if st["all_out"]:
+        return (f"Right now every provider in the switch order ({who}) is out of free tokens until about {back}, "
+                "so the build would mostly wait, or run much more slowly on this PC.")
+    return f"Right now {who} {'is' if len(names) == 1 else 'are'} out of free tokens until about {back}, so it may be slower."
+
+
+def plan_changes(before: dict, after: dict) -> list[str]:
+    """What a revised plan changed, in plain words (so she can see her answers took effect)."""
+    out = []
+    files_b = {f["path"] for f in (before.get("plan") or {}).get("files", [])}
+    files_a = {f["path"] for f in after["plan"].get("files", [])}
+    if files_a - files_b:
+        out.append("New files: " + ", ".join(f"`{f}`" for f in sorted(files_a - files_b)) + ".")
+    if files_b - files_a:
+        out.append("No longer planned: " + ", ".join(f"`{f}`" for f in sorted(files_b - files_a)) + ".")
+    qb = {_q(q)["q"] for q in before.get("questions", [])}
+    qa = {_q(q)["q"] for q in after.get("questions", [])}
+    if qb - qa:
+        out.append(f"{len(qb - qa)} question{'s' if len(qb - qa) != 1 else ''} answered or dropped.")
+    if qa - qb:
+        out.append(f"{len(qa - qb)} new question{'s' if len(qa - qb) != 1 else ''}.")
+    ab, aa = set(before.get("assumptions", [])), set(after.get("assumptions", []))
+    for a in sorted(aa - ab)[:5]:
+        out.append(f"Now assuming: {a}")
+    cb, ca = set(before.get("conflicts", [])), set(after.get("conflicts", []))
+    if cb - ca:
+        out.append(f"{len(cb - ca)} thing{'s' if len(cb - ca) != 1 else ''} that didn't fit together "
+                   f"{'are' if len(cb - ca) != 1 else 'is'} settled.")
+    return out or ["Nothing in the plan changed; your answers are kept for the build."]
+
+
+def proposal_text(prop: dict) -> str:
+    """The proposal as she reads it (the result, voice, and the app's Plan window)."""
+    out = []
+    if prop.get("changes"):
+        out.append("## What changed since the last plan\n\n" + "\n".join(f"- {c}" for c in prop["changes"]))
+    if prop.get("replies"):
+        out.append("## Your questions answered\n\n" + "\n".join(f"- {r}" for r in prop["replies"]))
+    if prop.get("limits"):
+        out.append("## What The Smithy can't do here\n\n" + "\n".join(f"- {c}" for c in prop["limits"]))
+    if prop["conflicts"]:
+        out.append("## Things in the request that don't fit together\n\n" + "\n".join(f"- {c}" for c in prop["conflicts"]))
+    if prop["questions"]:
+        out.append("## Questions\n\n" + "\n".join(
+            f"{i}. {q['q']}" + (f"\n   If you don't say: {q['default']}" if q.get("default") else "")
+            for i, q in enumerate(map(_q, prop["questions"]), 1)))
+    if prop["assumptions"]:
+        out.append("## What I'll assume unless you say otherwise\n\n" + "\n".join(f"- {a}" for a in prop["assumptions"]))
+    out.append(f"## The plan: {prop['plan'].get('name') or 'the build'}\n\n{prop['desc']}\n\n"
+               + "\n".join(f"- `{f['path']}`: {f['purpose']}" for f in prop["plan"]["files"]) + "\n- `README.md`")
+    if prop.get("cost"):
+        out.append("## Cost and time\n\n" + prop["cost"])
+    if prop.get("facts"):
+        out.append("## What I read in the files the request names\n\n" + prop["facts"])
+    if prop["answers"]:
+        out.append("## Your answers and changes so far\n\n" + "\n".join(f"- {a}" for a in prop["answers"]))
+    out.append("## Your reply\n\n**Yes** builds it with this plan. **No** drops it. Anything else is taken as "
+               "answers or changes, and you get a revised plan.")
+    return "\n\n".join(out)
+
+
+def _build_budget(ctx) -> int:
+    """Characters of earlier files a call shows (the same as run_build)."""
+    budget = int(ctx.cfg.get("context_tokens", 8192)) * 3 // 2
+    name = str(getattr(getattr(ctx, "backend", None), "name", ""))
+    if "cloud" in name or name.startswith("switching"):
+        budget = max(budget, int(ctx.cfg.get("cloud_build_chars", 64000)))
+    return budget
+
+
+def run_proposal(ctx, p: dict):
+    """Read the request, ask what's unclear, propose a plan; nothing is built. Waits for her reply."""
+    job_id = ctx.row["id"]
+    max_files = int(ctx.cfg.get("max_build_files", 20))
+    earlier = None
+    if p.get("proposal_of"):                            # a revision: the proposal before, and every answer
+        before = load_proposal(p["proposal_of"]) or {}
+        earlier = {"text": before.get("text", ""), "answers": list(before.get("answers", [])) + [p.get("answer", "")]}
+    request = p.get("request_given", p["request"])
+    steps.info("Reading the request%s.", " again, with your answers" if earlier else "")
+    facts = request_facts(request)
+    if facts:
+        steps.info("Read what the files the request names look like.")
+    msgs = _proposal_messages(p, max_files, earlier, facts)
+    answer = ctx.chat(msgs, 3000)
+    try:
+        summary, desc, plan = parse_plan(answer, max_files)
+    except ValueError as problem:                       # one more try, saying what was wrong (as builds do)
+        steps.info("The plan couldn't be read; asking again.")
+        again = ctx.chat(msgs + [{"role": "assistant", "content": answer},
+                                 {"role": "user", "content": f"I can't use that: {problem}. Reply with only the "
+                                  "corrected ```json block (name, files, questions, conflicts, assumptions)."}], 3000)
+        answer = answer + "\n\n" + again
+        summary, desc, plan = parse_plan(answer, max_files)
+    raw = {}
+    for m in _JSON_BLOCK.finditer(answer):              # the last readable json block holds the lists
+        try:
+            raw = json.loads(m.group(1))
+        except Exception:
+            pass
+    prop = {"request": request, "joomla": bool(p.get("joomla")), "path": p.get("path", ""),
+            "questions": _questions_of(raw), "conflicts": _list_of(raw, "conflicts"),
+            "assumptions": _list_of(raw, "assumptions"), "plan": plan, "desc": desc,
+            "limits": build_limits(plan, request, ctx.cfg), "facts": facts, "replies": _list_of(raw, "replies", 5),
+            "answers": earlier["answers"] if earlier else [], "revises": p.get("proposal_of"),
+            "asked": time.time()}
+    prop["conflicts"] += layout_conflicts(prop)        # a default that contradicts the real files (in code)
+    if p.get("proposal_of"):                            # what her answers changed (suggestion 8)
+        prop["changes"] = plan_changes(load_proposal(p["proposal_of"]) or {}, prop)
+    try:
+        prop["cost"] = cost_line(plan, {"request": request}, ctx.cfg, _build_budget(ctx))
+    except Exception as e:                              # never stops the plan
+        log.info("task %d: no cost line (%s)", job_id, e)
+        prop["cost"] = ""
+    prop["text"] = proposal_text(prop)
+    proposal_path(job_id).write_text(json.dumps(prop, indent=2), encoding="utf-8")
+    (SMITHY.results_dir / f"{job_id:05d}-plan.json").write_text(
+        json.dumps({"summary": summary, "desc": desc, "plan": plan}, indent=2), encoding="utf-8")
+    nq, nc = len(prop["questions"]), len(prop["conflicts"]) + len(prop["limits"])
+
+    def things(k: int) -> str:
+        return f"{k} thing{'s' if k != 1 else ''} to know first"
+    steps.info("Plan ready for your OK: %d file%s, %d question%s%s.", len(plan["files"]),
+               "" if len(plan["files"]) == 1 else "s", nq, "" if nq == 1 else "s", f", {things(nc)}" if nc else "")
+    bits = [f"{nq} question{'s' if nq != 1 else ''}" if nq else "", things(nc) if nc else ""]
+    spoken = (f"I've read the request{' again' if earlier else ''} and planned "
+              f"{len(plan['files']) + 1} files" + (" with " + " and ".join(b for b in bits if b) if any(bits) else "")
+              + ". It's waiting for your answer before anything is built.")
+    full = (f"**Plan for your OK (Smithy task {job_id}): nothing has been built yet.**\n\n" + prop["text"]
+            + f"\n\nReply with `smithy.py reply {job_id} yes`, `no`, or your answers, or use the Plan window "
+              "in The Smithy app.")
+    return spoken, full, None
+
+
+def _queue_from_plan(prop: dict, params: dict) -> int:
+    kind = "joomla" if prop.get("joomla") else "build"
+    if prop.get("joomla"):
+        params["joomla"] = True
+    title = REGISTRY[kind].title(params) if kind in REGISTRY else ""
+    return SMITHY.add(kind, params, requested_by="plan reply", title=title)
+
+
+_GO_AHEAD = re.compile(r"\b(?:go\s+ahead|build\s+it|just\s+(?:build|do|make)\s+it|do\s+it|make\s+it\s+now|"
+                       r"start\s+(?:it|building)|sounds?\s+good|looks?\s+good|that'?s\s+fine|fine\s+by\s+me|"
+                       r"you\s+can\s+build|please\s+build|let'?s\s+go)\b", re.I)
+
+
+# a "no" aimed at the building itself ("don't build it", "not yet"), not any "don't" ("I don't get the questions")
+_GO_NOT = re.compile(r"\b(?:don'?t|do\s+not|not|never|no\s+need\s+to)\s+(?:\w+\s+){0,3}?(?:go\s+ahead|build|do\s+it|start|make\s+it)"
+                     r"|\bnot\s+yet\b|^\W*no\b|\bwait\b|\bhold\s+on\b|\bstop\b", re.I)
+
+
+def _mark(job_id: int, status: str, text: str) -> None:
+    SMITHY._change("UPDATE jobs SET status=?, decided=?, decision_text=? WHERE id=? AND status='review'",
+                   (status, time.time(), text[:300], job_id))
+
+
+def reply_to_proposal(job_id: int, text: str, build_now: bool = False) -> str:
+    """Her reply to a proposal: yes -> the build is queued with that plan; no -> dropped; anything else ->
+    a revised proposal is queued. build_now (the app's "Build with these answers"): the answers are added
+    and it's built straight away, without a revised plan. Returns what was done, in plain words."""
+    prop = load_proposal(job_id)
+    row = SMITHY.get(job_id)
+    if prop is None or row is None:
+        raise ValueError(f"Smithy task {job_id} isn't a plan waiting for an answer")
+    if row["status"] != "review":
+        raise ValueError(f"Smithy task {job_id}'s plan was already answered ({row['status']})")
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("the reply is empty")
+    verdict = None if build_now else worker_shared.answer(text) if len(text.split()) <= 4 else None
+    if verdict is None and not build_now and _GO_AHEAD.search(text) and not _GO_NOT.search(text):
+        # a longer reply that clearly says to go ahead (Nov 14 test as a new user: "ok I still don't get the
+        # questions but go ahead and build it" got a third plan): built now, its words kept as answers
+        build_now = True
+    if verdict == "no":
+        _mark(job_id, "discarded", text)
+        return f"Dropped: Smithy task {job_id}'s plan won't be built."
+    if verdict == "yes" or build_now:
+        answers = list(prop["answers"]) + ([text] if build_now else [])
+        defaults = [f"{q['q']} {q['default']}" for q in map(_q, prop["questions"]) if q.get("default")]
+        agreed = ("\n\nAgreed while planning (these override the request where they differ):\n- "
+                  + "\n- ".join(answers) if answers else "")
+        assumed = ("\n\nAssumed in the plan you said yes to:\n- " + "\n- ".join(prop["assumptions"] + defaults)
+                   if prop["assumptions"] or defaults else "")
+        params = {"request": prop["request"] + agreed + assumed, "plan_task": job_id, "path": prop.get("path", "")}
+        new = _queue_from_plan(prop, params)
+        _mark(job_id, "kept", text)
+        return (f"Building it with your answers: Smithy task {new}, with the plan from task {job_id}." if build_now
+                else f"Building it: Smithy task {new}, with the plan from task {job_id}.")
+    params = {"request": prop["request"], "proposal_of": job_id, "answer": text[:4000], "path": prop.get("path", "")}
+    new = _queue_from_plan(prop, params)
+    _mark(job_id, "kept", text)
+    return f"Revising the plan with your answers: Smithy task {new}."
+
+
+def carry_on(job_id: int) -> str:
+    """A stopped or failed build back in the queue, as the same task: it keeps its plan, every file already
+    written (an empty one is written again) and its cloud-token count, and carries on from there (suggestion 2,
+    Nov 14: task 51 was stopped when the day's free tokens ran out)."""
+    row = SMITHY.get(job_id)
+    if row is None:
+        raise ValueError(f"there's no Smithy task {job_id}")
+    if row["type"] not in ("build", "joomla", "followup"):
+        raise ValueError(f"Smithy task {job_id} isn't a build")
+    # a finished build that didn't check clean (NOT COMPLETE, waiting for review) may carry on too: its checks
+    # and fix rounds run again on the files it has, and its README is written again (Nov 15, task 51)
+    unfinished = row["status"] == "review" and bool(re.search(r"\bNOT complete\b", (row["summary"] or "") + _result_head(row), re.I))
+    if row["status"] not in ("cancelled", "failed") and not unfinished:
+        raise ValueError(f"Smithy task {job_id} is {row['status']}, not stopped"
+                         + (" or NOT COMPLETE" if row["status"] == "review" else ""))
+    if not (SMITHY.results_dir / f"{job_id:05d}-plan.json").exists():
+        raise ValueError(f"Smithy task {job_id} stopped before it had a plan, so there's nothing to carry on")
+    # its old result and check are made again at the end; the files and the plan are kept
+    for old in (f"{job_id:05d}-check.json",):
+        (SMITHY.results_dir / old).unlink(missing_ok=True)
+    if unfinished and row["artifact"] and Path(row["artifact"]).is_dir():
+        (Path(row["artifact"]) / "README.md").unlink(missing_ok=True)      # told the new truth when it's done
+    if unfinished:                                     # a new effort: its cloud-token count starts again
+        worker_cloud.reset_task_tokens(f"smithy:{job_id}")
+    SMITHY._change("UPDATE jobs SET status='queued', error=NULL, finished=NULL, started=NULL, decided=NULL, "
+                   "announced=NULL, priority=priority+1 WHERE id=? AND status IN ('cancelled','failed','review')",
+                   (job_id,))
+    return (f"Smithy task {job_id} is back in the queue; "
+            + ("its checks and fixes run again on the files it has." if unfinished
+               else "it carries on from the files it had already written."))
+
+
+def _result_head(row) -> str:
+    try:
+        return Path(row["result_path"]).read_text(encoding="utf-8", errors="replace")[:2000] if row["result_path"] else ""
+    except OSError:
+        return ""
+
+
+def answer_waiting_plans(cfg: dict) -> None:
+    """build_ask_wait_hours (0 = off, the default): a plan nobody answered in that long is built on its own
+    assumptions and default answers (suggestion 7: requests from other sessions, with nobody to answer).
+    Called by the worker while it's idle (worker_engine.Profile.on_idle)."""
+    hours = float(cfg.get("build_ask_wait_hours", 0) or 0)
+    if hours <= 0:
+        return
+    for r in SMITHY.by_status("review", limit=50):
+        prop = load_proposal(r["id"])
+        if prop is None:
+            continue
+        asked = float(prop.get("asked") or r["finished"] or time.time())
+        if time.time() - asked >= hours * 3600:
+            said = reply_to_proposal(r["id"], "yes")
+            log.info("task %d: no answer in %g hours, built on its assumptions: %s", r["id"], hours, said)
+            steps.info("Smithy task %d's plan had no answer in %g hours, so it's being built on its own "
+                       "assumptions: %s", r["id"], hours, said)
+
+
+def estimate_build_tokens(plan: dict, request: str, cfg: dict, budget_chars: int,
+                          parent_chars: int = 0, items: int = 0) -> tuple[int, str]:
+    """About how many cloud tokens a build needs, from its plan (tokens in + out, every call), and how
+    that was worked out. Rough by design: the files' sizes aren't known before they're written, so each
+    is taken as about 4,500 characters (tasks 37 to 39: 4,700 to 5,000), or the earlier version's size.
+    Each call reads the request, the plan and the files so far, up to budget_chars."""
+    n = max(1, len(plan.get("files", [])))
+    proj = parent_chars or n * 4500
+    req = len(request) // 4 + 1500                            # the request, the plan, the instructions
+    ctx_all = min(proj, budget_chars) // 4 + req               # a call that reads all of the files
+    rounds = max(1, int(cfg.get("build_check_rounds", 3)))
+    fixes = min(n, 4)                                          # edit calls a round (a few files need fixing)
+    write = sum(min(proj * i // n, budget_chars) // 4 + req + 3000 for i in range(n))   # each file in turn
+    checks = (rounds + 1) * (ctx_all + 4000)                   # the checklist, before and after each round
+    edits = rounds * fixes * 1.5 * (ctx_all + 2000)            # fix edits, half asked again
+    stage_size = max(1, int(cfg.get("build_stage_items", 3)))
+    stages = -(-items // stage_size) if parent_chars and items > stage_size else 0
+    staged = stages * (2 * (ctx_all + 2000) + int(cfg.get("build_stage_rounds", 2)) * (ctx_all + 4000 + 2 * (ctx_all + 2000)))
+    total = int((3000 + write + checks + edits + staged + 4000) * 1.2)   # + the plan, the README, 20% spare
+    why = (f"the plan: {n} file{'s' if n != 1 else ''}, {rounds} check round{'s' if rounds != 1 else ''}"
+           + (f", {stages} stages" if stages else "") + ", about "
+           + f"{ctx_all:,} tokens a call that reads every file")
+    return total, why
+
+
+def _set_own_limit(ctx, job_id: int, plan: dict, p: dict, budget: int, parent: dict | None) -> None:
+    """cloud.auto_task_tokens: the build looks at its own plan and sets its own token limit, between
+    max_tokens_per_task (the least) and auto_task_tokens_max (the most; the user's ceiling, default 600,000).
+    Off, or no cloud: max_tokens_per_task as before."""
+    cc = ctx.cfg.get("cloud") or {}
+    if not cc.get("auto_task_tokens"):
+        return
+    import worker_cloud
+    parent_chars = 0
+    if parent:
+        parent_chars = sum(len(x.read_text(encoding="utf-8", errors="replace"))
+                           for x in parent["folder"].rglob("*") if x.is_file() and x.suffix.lower() != ".md")
+    est, why = estimate_build_tokens(plan, p.get("request", ""), ctx.cfg, budget, parent_chars,
+                                     len(numbered_items(p.get("change", ""))) if parent else 0)
+    least = int(cc.get("max_tokens_per_task", 200_000))
+    most = max(least, int(cc.get("auto_task_tokens_max", 600_000)))
+    limit = min(max(est, least), most)
+    note = ("" if est <= most else f"; the estimate was {est:,}, over the ceiling (auto_task_tokens_max)")
+    worker_cloud.set_task_limit(limit, why)
+    log.info("build %d: its own token limit: %d (estimated %d from %s)", job_id, limit, est, why)
+    steps.info("This task's own token limit: %s cloud tokens (from %s%s).", f"{limit:,}", why, note)
+
+
 def run_build(ctx, p: dict):
     """Plan, then each file, then the README. Picks up where it left off after a pause."""
     job_id = ctx.row["id"]
@@ -967,6 +2050,15 @@ def run_build(ctx, p: dict):
         p = {**first, **parent["params"], **p, "request": (first.get("request") or
                                                           "(the first version's request wasn't found)")
              + f"\n\nNew version {p.get('version', '')}: {p['change']}"}
+
+    # 0. a new build is a proposal first: questions and a plan, then it waits for her yes (Nov 14)
+    if p.get("proposal_of") or (not parent and ask_first(ctx.cfg, p)):
+        return run_proposal(ctx, p)
+    if p.get("plan_task") and not plan_path.exists():     # the plan she said yes to
+        agreed = results / f"{int(p['plan_task']):05d}-plan.json"
+        if agreed.exists():
+            shutil.copyfile(agreed, plan_path)
+            steps.info("Building with the plan from task %d, which you said yes to.", int(p["plan_task"]))
 
     # 1. the plan (kept, so a paused build carries on instead of starting again)
     if plan_path.exists():
@@ -1002,9 +2094,11 @@ def run_build(ctx, p: dict):
                 raise
         if parent:
             plan["name"] = parent["plan"].get("name") or plan["name"]
+            _keep_unasked(plan, parent, p.get("change", ""))
         plan_path.write_text(json.dumps({"summary": summary, "desc": desc, "plan": plan}, indent=2), encoding="utf-8")
         steps.info("Plan ready: %d file%s: %s, and the README.", len(plan["files"]), "" if len(plan["files"]) == 1 else "s",
                    ", ".join(f["path"] for f in plan["files"]))
+    _set_own_limit(ctx, job_id, plan, p, budget, parent)     # set again after a pause: begin_task clears it
     version = int(p.get("version", 1))
     name = plan["name"] or slug(p["request"])
     folder = results / (f"{job_id:05d}-{name}" + (f"-v{version}" if version > 1 else ""))
@@ -1030,8 +2124,11 @@ def run_build(ctx, p: dict):
         target = inside(folder, rel)
         old_path = inside(parent["folder"], rel) if parent and (parent["folder"] / rel).exists() else None
         if target.exists():                                           # done before a pause
-            written[rel] = target.read_text(encoding="utf-8", errors="replace")
-            continue
+            kept = target.read_text(encoding="utf-8", errors="replace")
+            if len(kept.strip()) >= 40 or rel.lower().endswith(".md"):
+                written[rel] = kept
+                continue
+            target.unlink()                                           # (nearly) empty: written again
         target.parent.mkdir(parents=True, exist_ok=True)
         if f.get("change") == "same" and old_path is not None:
             steps.info("%s stays the same: copied.", rel)
@@ -1077,6 +2174,17 @@ def run_build(ctx, p: dict):
             steps.info("%s is still cut off after 4 tries; it's marked as needing finishing.", rel)
             cut_files.append(rel)
         body = _strip_outer_fence(text, rel.lower().endswith(".md"))
+        if len(body.strip()) < 40:                      # an empty reply (task 49: academy_lesson.py, 2 bytes,
+            steps.info("%s came back empty; asking again.", rel)   # saved as "written: 1 line")
+            text = ctx.chat(msgs + [{"role": "assistant", "content": text or "(nothing)"},
+                                    {"role": "user", "content": f"That reply had no code in it. Write the complete "
+                                     f"file {rel} now, in one code block."}], 6000)
+            body = _strip_outer_fence(text, rel.lower().endswith(".md"))
+            if len(body.strip()) < 40:
+                log.warning("build %d: %s left out (empty twice)", job_id, rel)
+                steps.info("%s left out: it came back empty twice.", rel)
+                refused_files.append(rel)
+                continue
         if _refusal(body):                              # the model couldn't write it: leave it out, say so
             log.warning("build %d: %s left out (the model said it can't write it)", job_id, rel)
             steps.info("%s left out: the model said it can't write it.", rel)
@@ -1101,7 +2209,7 @@ def run_build(ctx, p: dict):
             part = {k: all_items[k] for k in chunks[s]}
             steps.info("Stage %d of %d: changes %s.", s + 1, len(chunks), ", ".join(map(str, chunks[s])))
             ps = {**p, "change": "\n\n".join(part.values())}  # only this stage's changes
-            for rel in staged:
+            for rel in _stage_files(staged, written, ps["change"]):
                 body, note = _edit_file(ctx, job_id, _edit_messages(
                     ps, desc, plan, rel, written, written[rel],
                     f"This is stage {s + 1} of {len(chunks)}: make only the changes above now (the others come in "
@@ -1150,7 +2258,14 @@ def run_build(ctx, p: dict):
                 steps.info("No usable README edits came back; writing it whole instead.")
         if text is None:
             steps.info("Writing the README.")
-            text = _strip_outer_fence(ctx.chat(_readme_messages(p, desc, plan, written, truth), 1500), True)
+            try:
+                text = _strip_outer_fence(ctx.chat(_readme_messages(p, desc, plan, written, truth), 1500), True)
+            except (BudgetOut, TooLongForLocal) as e:     # a limit: a plain README from what's known, no model
+                left = left + ["the README is a plain list (" + str(e).split(";")[0] + ")"]
+                text = (f"# {name.replace('-', ' ')}\n\n{summary}\n\n## Files\n\n"
+                        + "\n".join(f"- `{f['path']}`: {f.get('purpose', '')}" for f in plan["files"])
+                        + f"\n\n## What's checked\n\n{truth or 'Nothing could be checked.'}\n\n"
+                          "Written without a model, because a limit was reached: " + str(e) + ".\n")
         readme.write_text(text, encoding="utf-8")
 
     files = sorted(written) + ["README.md"]
@@ -1190,6 +2305,15 @@ def _check_build(p, joomla: bool = False):
         out["joomla"] = True
     if p.get("path"):                                        # a file to base it on (optional)
         out["path"] = _file(p)
+    if p.get("no_ask"):                                      # build straight away, no plan to answer first
+        out["no_ask"] = True
+    # a plan's links, kept: the worker checks every task's params again before it runs (Nov 14, task 46 lost
+    # plan_task and planned again; tasks 44 and 45 lost proposal_of and her answers)
+    for key in ("plan_task", "proposal_of"):
+        if p.get(key):
+            out[key] = int(p[key])
+    if p.get("answer"):
+        out["answer"] = str(p["answer"])[:4000]
     return out
 
 
@@ -1197,6 +2321,9 @@ def _check_followup_any(p):
     """A follow-up question, or on a build, a new version of it."""
     out = _check_followup(p)
     parent = SMITHY.get(out["parent_id"])
+    if load_proposal(out["parent_id"]) is not None and not parent["artifact"]:   # a plan, not a build yet
+        raise ValueError(f"task {out['parent_id']} is a plan waiting for your answer: reply to it instead "
+                         f"(smithy.py reply {out['parent_id']} yes, no, or your answers)")
     if parent["type"] in ("build", "joomla") or "change" in json.loads(parent["params"] or "{}"):
         pp = json.loads(parent["params"] or "{}")
         out = {"parent_id": out["parent_id"], "change": out["question"], "version": int(pp.get("version", 1)) + 1,
@@ -1216,17 +2343,28 @@ def _with_base_file(build):
     """A build that also gets a file to base it on (an existing layout to override)."""
     def run(ctx, p):
         if p.get("path"):
-            p = {**p, "request": p["request"] + "\n\nBase it on this existing file (don't change the original):\n"
+            p = {**p, "request_given": p["request"], "request": p["request"] + "\n\nBase it on this existing file (don't change the original):\n"
                  + _code_block(p["path"])}
         return build(ctx, p)
     return run
+
+
+def _proposes(p) -> bool:
+    try:
+        cfg = worker_shared.load_json(Path(__file__).with_name("smithy.json"))
+    except Exception:
+        cfg = {}
+    return ask_first(cfg, p)
 
 
 def _title_build(p):
     words = re.sub(r"^(?:me\s+)?(?:a|an|the)\s+", "", p["request"].strip(), flags=re.I).split()[:7]
     while len(words) > 2 and words[-1].lower().strip(",.") in _SMALL_WORDS:   # don't end on "the"
         words.pop()
-    return ("the Joomla task: " if p.get("joomla") else "the build: ") + " ".join(words).rstrip(",.;:")
+    what = ("the Joomla task: " if p.get("joomla") else "the build: ") + " ".join(words).rstrip(",.;:")
+    if p.get("proposal_of"):
+        return "the revised plan for " + what
+    return ("the plan for " + what) if _proposes(p) else what
 
 
 _SMALL_WORDS = {"a", "an", "the", "and", "or", "of", "in", "on", "to", "for", "that", "which", "with", "my", "your",

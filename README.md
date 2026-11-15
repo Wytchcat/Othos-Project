@@ -384,6 +384,34 @@ few seconds to start, and the visualizer can be turned off for speed (`?board=of
   of Ollama, or llama.cpp with Vulkan, can use Arc.
 - **Before you buy:** check [Ollama's GPU list](https://docs.ollama.com/gpu).
 
+## Two people on one computer
+
+If two people use one Windows PC, each with their own Windows account:
+
+**Each account has its own:**
+- Othos folder, settings and drafts;
+- keys, in `%LOCALAPPDATA%\Othos\keys.dat`, locked to that account by Windows, so one
+  account can't read another's keys;
+- Ollama and its models: `%LOCALAPPDATA%\Programs\Ollama` and `%USERPROFILE%\.ollama\models`;
+- npm tools: `%APPDATA%\npm`;
+- shortcuts.
+
+**The whole computer shares:**
+- **Local addresses (ports):** Othos uses 7880 (LiveKit server), 8081 (agent), 3000 (call page)
+  and Ollama's 11434. While one account's Othos is running, another account's either can't
+  start (`doctor.ps1` shows which port is taken) or ends up using the first account's Ollama,
+  with its models and data.
+- **Windows Sandbox:** only one can run at a time.
+- **The CPU, memory and graphics card.**
+
+**Best practice:** when you switch users, fully sign out: **Start**, your account picture,
+then **Sign out**. Don't use **Switch user**, and don't just lock the screen. Signing out
+closes Othos, its Ollama and anything else it started, so the next person starts clean. With
+Switch user, the first account's programs keep running in the background.
+
+If two accounts must run at the same time, give one of them its own ports (for The Smithy,
+that's `"ollama": {"start_own": true, "own_port": ...}` in that account's `smithy.json`).
+
 ## Troubleshooting
 
 - **Run `doctor.ps1` first.** It lists missing keys, models and programs, busy ports and

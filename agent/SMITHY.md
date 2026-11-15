@@ -51,11 +51,21 @@ it and copy what you want into place yourself, on screen.
 Coding requests go to the Smithy automatically. Task numbers are the Smithy's own
 ("Smithy task 3"); plain "task 3" works when only one worker has a task 3.
 
-- **Start** (only while the Smithy is running): "ask the Smithy to review gaming dot py",
+- **Start**: "ask the Smithy to review gaming dot py",
   "start a task: fix worker underscore queue dot py to close the connection",
   "have the Smithy write a PowerShell script to back up my drafts",
   "ask the Smithy to build a small to-do list web page",
   "ask the Smithy to make a Joomla override for the article layout that shows the author photo".
+- **When The Smithy (or Firestarter) isn't open** (Nov 14): Othos asks "The Smithy isn't open.
+  Shall I open it and queue this?" and on a yes opens `app\Smithy.exe` (only that program, from
+  Othos's own `app` folder) and queues the task. When the window is open but its worker stopped,
+  it says to close the app and open it again instead (neither window has a Start button). The same goes for a follow-up.
+- **The cloud is out:** when a build is queued, or in the plan's "Cost and time", Othos says which
+  providers in the switch order are out of free tokens now and until when
+  (`worker_cloud.switch_out`, `smithy_jobs.cloud_note`).
+- **"What did the Smithy make?"** (or "what has it built?", "tell me about the latest build"): the
+  latest build, its spoken summary and the opening of its README, never code. "Show me Smithy task
+  N" then opens its folder.
 - **Stop:** "stop the Smithy task" / "stop Smithy task 3".
 - **Progress and lists:** "how's Smithy task 3 coming?", "what's in the queue?", "what's done?".
 - **Read:** "read me Smithy task 3", then "read the rest" / "go on" (code described, not spelled out).
@@ -64,6 +74,14 @@ Coding requests go to the Smithy automatically. Task numbers are the Smithy's ow
 - **Keep / discard:** "keep Smithy task 3" -> "Say yes or no." Only a clear yes marks it.
 - **Work log:** "read me the Smithy log" (latest three, "go on" for more), "show me the Smithy log".
 - **"It's ready":** "Smithy task 3, the build: small to-do list web page, is ready." between turns.
+  When Othos starts, finished work is asked about first ("While you were away..."), and a plan
+  waiting for your answer comes first, since it needs you.
+- **A question answered in one place stops everywhere** (Nov 14): a plan answered in the app or on
+  the code page isn't asked about by voice any more; the Plan window says when a plan was answered
+  somewhere else; the free-tokens box closes by itself when you've answered by voice.
+- **Plans on the code page** (`http://127.0.0.1:3000/code`): plans waiting for your answer show at
+  the top, with the same answer boxes and buttons as the Plan window (Othos-ui
+  `app/api/smithy/plans`, which runs `smithy.py plans / plan / reply`; only the Othos page may ask).
 - **Task Mode** (the user's idea): Othos reads each new step of a task aloud as it happens,
   between turns, from the same steps file as the Progress window: "The Smithy: Planning the new
   version. Plan ready: 3 files ..."
@@ -99,6 +117,32 @@ When both have a task, one waits until the other's task is done (a build counts 
 task), then the one that just had a turn lets the other go first. Never side by side.
 Alone, the Smithy gets all its threads (`num_thread`). Games: paused for cpu-heavy, held
 back (fewer threads, low priority) for gpu-heavy / light, as Firestarter.
+
+## Two people on one computer
+
+Each Windows account sets up its own copy of The Smithy:
+- its Othos folder and `smithy.json`
+- its drafts
+- its keys, in `%LOCALAPPDATA%\Othos\keys.dat`, locked to that account by Windows
+- Ollama and its models
+- REA
+- its shortcuts
+
+None of these are shared, and one account can't read another's keys.
+
+A few things belong to the whole computer, though:
+- **Ollama's address (port 11434):** while one account's Ollama is running, another account's Smithy uses it, with
+  the first account's models, and its own Ollama can't start.
+- **Windows Sandbox:** only one can run at a time, so the other account's tests come back "busy" and don't run.
+- **The CPU and memory:** both accounts' local models share them.
+
+**Best practice, suggested by the Othos Project:** when you switch users, fully sign out, using **Start**, your
+account picture, then **Sign out**. Don't use **Switch user**, and don't just lock the screen. Signing out closes
+The Smithy, its Ollama and anything else it started, so the next person starts clean. With Switch user, the first
+account's Smithy and Ollama keep running in the background.
+
+If two accounts must run The Smithy at the same time, give one of them its own Ollama. In that account's
+`smithy.json`, set `"ollama": {"start_own": true, "own_port": 11436}`.
 
 ## Files
 
@@ -292,6 +336,16 @@ the step line says why. A task on this PC's model alone fails with that reason. 
     (until Nov 14 it counted each call on its own). Each result's header line says how many cloud
     tokens the task used. Over it, the task goes to this PC's model if the step fits, else it stops
     and says why.
+  - `auto_task_tokens` (on): a build looks at its own plan and sets **its own** token limit, at
+    least `max_tokens_per_task` and at most `auto_task_tokens_max` (600,000, your ceiling). The
+    estimate counts each file written, the checklist before and after each check round, a few fix
+    edits a round (half asked again), the stages of a new version, the plan and the README, plus
+    20% spare. Files are taken as about 4,500 characters each, or the earlier version's size. It's
+    a ceiling for the worst case (every round needing fixes), not what it expects to spend.
+    Academy phase 1's 8 files come to about 470,000; a 2-file installer version about 310,000
+    (they used 30,000 to 110,000). The Progress window says the limit and how it was worked out,
+    and running into it says "its own limit". Off: `max_tokens_per_task` for every task, as before.
+    Other task types (review, fix, script) keep `max_tokens_per_task`. The daily limits still apply.
   - `max_tokens_per_day` (1,000,000). The day limit counts
     **each provider on its own**: when one reaches it, switching moves on to the next, and that
     one is skipped until midnight. (Until Nov 13 it was one total for all providers, which

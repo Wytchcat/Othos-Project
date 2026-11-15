@@ -48,16 +48,54 @@ def answer(transcript: str) -> str | None:
 # ---------------------------------------------------------------- what may go to a model
 # key-like strings: provider prefixes, long random tokens, and NAME=value lines for keys/secrets
 _REDACT = [
+    # WordPress wp-config.php: define( 'DB_PASSWORD', '...' ), define('AUTH_KEY', '...'), the salts. The
+    # whole second argument, whatever it holds (salts have spaces and symbols); Firestarter, Nov 14.
+    re.compile(r"(?i)\bdefine\s*\(\s*(['\"][A-Z0-9_]*(?:PASSWORD|PASS|SECRET|KEY|SALT|TOKEN)[A-Z0-9_]*['\"]\s*,\s*)"
+               r"(?:'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")"),
     re.compile(r"\b(?:sk|pk|rk|tvly|ghp|gho|ghs|github_pat|xox[abpr]|AKIA|AIza|hf)[-_][A-Za-z0-9_\-]{12,}\b"),
-    re.compile(r"(?i)\b([A-Z0-9_]*(?:API_?KEY|_KEY|KEY_|SECRET|TOKEN|PASSWORD|PASSWD|PASS)[A-Z0-9_]*)\s*[:=]\s*['\"]?[^\s'\"#]{6,}['\"]?"),
-    re.compile(r"\b[A-Za-z0-9+/_\-]{40,}={0,2}\b"),
+    # NAME = value, where the value isn't code: a call, index or attribute after it (`total_tokens =
+    # sum(...)`, `passed = data.get(...)`) is left alone (Nov 14, Smithy task 39: the model saw
+    # `total_tokens=[REDACTED]`, called it placeholder code, and its edits couldn't find the real lines)
+    # The name, the = or : and the value stay on one line (task 40: `if tokens > max_tokens:` took the
+    # colon as a separator and hid the next line).
+    # passed, passing, passes aren't password names (task 41: {"passed": passed} was hidden)
+    re.compile(r"(?i)\b([A-Z0-9_]*(?:API_?KEY|_KEY|KEY_|SECRET|TOKEN|PASSWORD|PASSWD|PASS(?!ED|ING|ES))[A-Z0-9_]*)['\"]?([ \t]*[:=][ \t]*)['\"]?"
+               r"([^\s'\"#()\[\]{},]{6,})(?![\w(\[.])['\"]?"),
+    # a WordPress application password, "abcd EFGH ijkl MNOP qrst UVWX", after a PASSWORD / PASS /
+    # SECRET name (the spaces stopped the rule above; Firestarter, Nov 14). The name has to be there,
+    # so a sentence of 4-letter words is left alone.
+    re.compile(r"(?i)\b([A-Z0-9_]*(?:PASSWORD|PASSWD|PASS(?!ED|ING|ES)|SECRET)[A-Z0-9_]*)['\"]?[ \t]*[:=][ \t]*['\"]?"
+               r"[A-Za-z0-9]{4}(?: [A-Za-z0-9]{4}){3,7}\b['\"]?"),
+    # long random-looking runs; a long snake_case name (`test_disallowed_filenames_and_key_redaction`) isn't one
+    re.compile(r"\b(?![a-z]+(?:_[a-z]+)+\b)[A-Za-z0-9+/_\-]{40,}={0,2}\b"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
 ]
+_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_PW_NAME = re.compile(r"(?i)PASS|SECRET")
+
+
+def _hide(m: re.Match) -> str:
+    if not m.re.groups:
+        return "[REDACTED]"
+    if m.re is _REDACT[0]:                       # define('NAME', '...'): keep the call, hide the value
+        return m.group(0)[:m.end(1) - m.start()] + "'[REDACTED]'"
+    if m.re.groups >= 3:
+        name, sep, value = m.group(1), m.group(2), m.group(3)
+        # Python code, not a secret: a lowercase name, " = " with spaces, and a bare name as the value
+        # (`max_tokens = tokens`; unquoted, a real secret wouldn't be valid Python). .env (NAME=value),
+        # YAML (name: value), JSON and quoted values are still hidden.
+        # Never for a password or secret name: in an .ini file `password = sunshinesky` is the real thing
+        # (Firestarter, Nov 14: d2f2d4c showed it). Only TOKEN / KEY names (`max_tokens = tokens`).
+        if name != name.upper() and not _PW_NAME.search(name) and sep.strip() == "=" \
+                and sep.startswith((" ", "\t")) \
+                and sep.endswith((" ", "\t")) and _IDENT.fullmatch(value) and m.group(0).endswith(value):
+            return m.group(0)
+    return m.group(1) + "=[REDACTED]"
 
 
 def redact(text: str) -> str:
     for rx in _REDACT:
-        text = rx.sub(lambda m: (m.group(1) + "=[REDACTED]") if m.re.groups else "[REDACTED]", text)
+        text = rx.sub(_hide, text)
     return text
 
 

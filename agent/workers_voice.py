@@ -147,6 +147,11 @@ _TASK_N = re.compile(rf"\btask\s+(?:number\s+)?{_N}\b", re.I)
 _TASK_WORDS = re.compile(r"\b(?:read|show|open|keep|discard|results?|review|script|aloud|out\s+loud|say|tell\s+me)\b", re.I)
 _LOG_READ = re.compile(r"\bread\s+(?:me\s+)?(?:the\s+)?(?:work\s+)?log\b|\bwhat'?s\s+in\s+(?:the\s+)?(?:work\s+)?log\b|"
                        r"\bwhat\s+is\s+in\s+(?:the\s+)?(?:work\s+)?log\b", re.I)
+# "what did the Smithy make?", "what has it built?" (the worker's name is taken out first; Nov 14, suggestion 6)
+_MADE = re.compile(r"\bwhat\s+(?:did|has|have)\s+(?:you\s+|it\s+|they\s+)?(?:just\s+|last\s+)?"
+                   r"(?:make|made|build|built|write|wrote|written|come\s+up\s+with|finish|finished)\b|"
+                   r"\bwhat'?s\s+(?:it|the\s+(?:latest|last)\s+(?:build|thing))\s+(?:made|built|for)?|"
+                   r"\btell\s+me\s+about\s+(?:the\s+|your\s+)?(?:latest|last|new)\s+build\b", re.I)
 _LOG_SHOW = re.compile(r"\b(?:show|open)\s+(?:me\s+)?(?:the\s+)?(?:work\s+)?log\b", re.I)
 
 
@@ -211,6 +216,24 @@ def _summary(job) -> str:
     return speakable(s)
 
 
+def _readme_about(job, words: int = 70) -> str:
+    """The README's opening paragraph (what it is), with code and headings left out, a few sentences long."""
+    try:
+        text = (Path(job["artifact"]) / "README.md").read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+    text = re.sub(r"```.*?```", " ", text, flags=re.S)
+    paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip() and not p.lstrip().startswith(("#", "|", "-", "*", ">"))]
+    if not paras:
+        return ""
+    w = re.sub(r"`[^`]*`", "", paras[0]).split()
+    out = " ".join(w[:words])
+    if len(w) > words:
+        cut = max(out.rfind(". "), out.rfind("! "), out.rfind("? "))
+        out = out[:cut + 1] if cut > 20 else out + "..."
+    return out
+
+
 def _title(q: Queue, job) -> str:
     if job["title"]:
         return job["title"]
@@ -227,6 +250,45 @@ def _name(q: Queue, job_id: int) -> str:
 
 def _not_running(q: Queue) -> str:
     return f"{q.name} isn't running. Open {q.app} first."
+
+
+# Othos can open a worker's app when it's closed (Nov 14, suggestion 1: The Smithy had stopped without anyone
+# noticing, and a task sat queued). Asked first; only these two programs, from Othos's own app folder.
+APP_EXE = {"smithy": Path(__file__).parent / "app" / "Smithy.exe",
+           "firestarter": Path(__file__).parent / "app" / "Firestarter.exe"}
+_APP_MUTEX = {"smithy": r"Local\OthosSmithy", "firestarter": r"Local\OthosFirestarter"}
+
+
+def app_open(key: str) -> bool:
+    """The worker's app window is open (its single-instance mutex exists), whether or not its worker runs."""
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenMutexW(0x00100000, False, _APP_MUTEX[key])      # SYNCHRONIZE
+        if h:
+            k32.CloseHandle(h)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def open_app(key: str) -> bool:
+    exe = APP_EXE[key]
+    if not exe.is_file():
+        return False
+    subprocess.Popen([str(exe)], cwd=str(exe.parent.parent), creationflags=subprocess.DETACHED_PROCESS)
+    return True
+
+
+def _closed_offer(q: Queue) -> str:
+    """What to say when a worker isn't running: an offer to open its app, or why it can't."""
+    if app_open(q.key):
+        return (f"{q.app} is open, but its worker has stopped. Close {q.app} and open it again, "
+                "then ask me again.")
+    if not APP_EXE[q.key].is_file():
+        return _not_running(q)
+    return f"{q.app} isn't open. Shall I open it and queue this?"
 
 
 _KIND_WORDS = [
@@ -288,6 +350,7 @@ class WorkersVoice:
         self.reading: tuple[str, list[str], int] | None = None       # (what it's from, pieces, next piece)
         self.pending: tuple[Queue, int, str] | None = None          # (queue, task, "kept"/"discarded")
         self.pending_out: tuple[Queue, int] | None = None           # a task waiting for free tokens: asked
+        self.pending_open: dict | None = None                       # "Shall I open it and queue this?"
         self._asked_out: set[tuple[str, int]] = set()                # asked once per task
         self._announcer: asyncio.Task | None = None
         self.howto = howto_recorder.Recorder()                      # picks up a recording left running
@@ -300,12 +363,18 @@ class WorkersVoice:
         self.away: list | None = None
         self._away_ts = 0.0
         self._away_skip: set[tuple[str, int]] = set()               # not read this call (she moved on)
+        # a Smithy build's plan waiting for her answer (smithy_jobs.run_proposal), once it's been told or
+        # read: {"q", "id", "stage": "intro" | "decide" | "confirm", "text", "ts"}. Conversational: yes
+        # builds it, no leaves it waiting (never dropped by voice), anything else is read back first.
+        self.plan_pending: dict | None = None
 
     # -- one turn: a reply from code ('' = say nothing), or None for "not about the workers"
     def handle(self, text: str) -> str | None:
         if (said := self._howto(text)) is not None:
             return said
         if self.away is not None and (said := self._away_answer(text)) is not None:
+            return said
+        if self.plan_pending is not None and (said := self._plan_answer(text)) is not None:
             return said
         asking, self.tm_asking = self.tm_asking, False   # the question is for the very next turn only
         if _TASK_MODE.search(text):
@@ -318,6 +387,9 @@ class WorkersVoice:
         if asking and (said := self._task_mode_answer(text)) is not None:
             return said
         reading, self.reading = self.reading, None   # "read the rest" only right after a read
+        offer, self.pending_open = self.pending_open, None          # for the very next turn only
+        if offer is not None and (said := self._open_answer(offer, text)) is not None:
+            return said
         if (said := self._out_answer(text)) is not None:
             return said
         pending, self.pending = self.pending, None
@@ -353,6 +425,8 @@ class WorkersVoice:
             return self._log_show(who)
         if _LOG_READ.search(t):
             return self._log_read(who)
+        if _MADE.search(t) and (who == "smithy" or (not who and re.search(r"\bbuil[dt]\b", t, re.I))):
+            return self._made(_TASK_N.search(t))
         if m := _PROGRESS.search(t):
             return self._progress(who, _first(m))
         if _PAUSED.search(t):
@@ -483,8 +557,6 @@ class WorkersVoice:
             return ("That's coding, which is the Smithy's job." if target == "smithy"
                     else "That's site work, which is Firestarter's job.")
         q = QUEUES[target]
-        if not q.running():
-            return _not_running(q)
         if kind in ("review", "fix"):
             path, request, problem = self._file_and_request(arg, need_request=(kind == "fix"))
             if problem:
@@ -513,9 +585,40 @@ class WorkersVoice:
                 params["provider"] = provider
         except ValueError as e:
             return f"I can't start that: {e}."
+        if not q.running():                            # checked last, so a request that can't go isn't offered
+            said = _closed_offer(q)
+            if said.endswith("?"):
+                self.pending_open = {"q": q, "kind": kind, "params": params, "provider": provider}
+            return said
+        return self._queue_it(q, kind, params, provider)
+
+    def _queue_it(self, q: Queue, kind: str, params: dict, provider: str | None, opened: bool = False,
+                  parent_id: int | None = None) -> str:
+        jt = REGISTRIES[q.key][kind]
+        if parent_id is not None:
+            new_id = q.add(kind, params, requested_by="voice", title=jt.title(params), parent_id=parent_id)
+            return (f"Opening {q.app}. " if opened else "") + f"{_name(q, new_id)} is queued: {jt.title(params)}."
         job_id = q.add(kind, params, requested_by="voice", title=jt.title(params))
         via = f", using {worker_cloud.PROVIDERS[provider].spoken}" if provider else ""
-        return f"{_name(q, job_id)}, {jt.title(params)}, is queued for {q.name}{via}."
+        said = (f"Opening {q.app}. " if opened else "") + f"{_name(q, job_id)}, {jt.title(params)}, is queued for {q.name}{via}."
+        if q.key == "smithy" and kind in ("build", "joomla") and not provider:
+            note = smithy_jobs.cloud_note(worker_shared.load_json(Path(__file__).parent / "smithy.json"))
+            if note:
+                said += " " + note
+        return said
+
+    def _open_answer(self, offer: dict, text: str) -> str | None:
+        """Her answer to "Shall I open it and queue this?" (None: something else; nothing is queued)."""
+        ans = worker_shared.answer(text) if len(text.split()) <= 6 else None
+        if ans == "no":
+            return "Okay, I haven't queued it."
+        if ans != "yes":
+            return None
+        q = offer["q"]
+        if not q.running() and not app_open(q.key) and not open_app(q.key):
+            return _not_running(q)
+        return self._queue_it(q, offer["kind"], offer["params"], offer["provider"], opened=not q.running(),
+                              parent_id=offer.get("parent_id"))
 
     def _program(self, arg: str) -> tuple[str, str]:
         """'llama server dot exe in my downloads' -> (path, ''), or ('', what to say)."""
@@ -651,6 +754,28 @@ class WorkersVoice:
                 parts.append(f"{q.name} isn't paused")
         return ". ".join(parts) + "."
 
+    # -- "what did the Smithy make?": the latest build in plain words, from its summary and README (never code)
+    def _made(self, m) -> str:
+        q = SMITHY
+        if m:
+            row = q.get(_num(m.group(1)))
+            rows = [row] if row else []
+        else:
+            rows = [r for r in q.by_status("review", "kept", limit=20)
+                    if r["artifact"] and Path(r["artifact"]).is_dir()]
+        if not rows:
+            return "The Smithy hasn't finished a build yet." if not m else f"There's no {_name(q, _num(m.group(1)))}."
+        job = rows[0]
+        name = _name(q, job["id"])
+        said = f"The latest is {name}, {_title(q, job)}. " if not m else f"{name}, {_title(q, job)}. "
+        said += _summary(job) or ""
+        about = _readme_about(job)
+        if about:
+            said += " From its read me: " + about
+        if job["artifact"] and Path(job["artifact"]).is_dir():
+            said += f" Say show me {name} to open its folder."
+        return speakable(said.strip())
+
     # -- reading results
     def _read(self, who: str | None, job_id: int) -> str:
         got = self._pick(who, job_id)
@@ -661,11 +786,86 @@ class WorkersVoice:
         if not job["result_path"]:
             return f"{name} doesn't have a result yet."
         summary = _summary(job) or "Here's the result."
+        if (asked := self._plan_hook(q, job)):                 # a plan: its question, not "read the rest"
+            return f"{name}, {_title(q, job)}. {summary}{asked}"
         rest = pieces(_full_result(job))
         if not rest:
             return f"{name}, {_title(q, job)}. {summary}"
         self.reading = (name, rest, 0)
         return f"{name}, {_title(q, job)}. {summary} Say read the rest for the full result, or show me {name}."
+
+    # -- a build's plan waiting for her answer (Nov 14)
+    def _plan_hook(self, q, j) -> str:
+        """After a plan's summary is said: the question that goes with it, and remember it's asked."""
+        if q.key != "smithy" or j["status"] != "review":
+            return ""
+        prop = smithy_jobs.load_proposal(int(j["id"]))
+        if prop is None:
+            return ""
+        n = len(prop.get("questions", [])) + len(prop.get("conflicts", [])) + len(prop.get("limits", []))
+        self.plan_pending = {"q": q, "id": int(j["id"]), "stage": "intro" if n else "decide", "text": "",
+                             "ts": time.time()}
+        return " Want to hear what they are?" if n else " Shall I build it?"
+
+    def _plan_answer(self, text: str) -> str | None:
+        pp = self.plan_pending
+        if time.time() - pp["ts"] > PLAN_ANSWER_SECONDS:      # she moved on: not asked again
+            self.plan_pending = None
+            return None
+        q, n = pp["q"], pp["id"]
+        row = q.get(n)
+        if row is None or row["status"] != "review" or smithy_jobs.load_proposal(n) is None:
+            self.plan_pending = None                           # answered in the app (or gone): not asked again
+            return None
+        ans = worker_shared.answer(text) if len(text.split()) <= 5 else None
+        if ans is None and _PLAN_LATER.search(text) and len(text.split()) <= 5:
+            ans = "no"                                         # "not yet", "later": it keeps waiting
+        pp["ts"] = time.time()
+        if ans is None and pp["stage"] in ("intro", "decide") and _elsewhere(text):
+            # clearly about something else (Firestarter, Nov 14: an article request was read back as a plan
+            # answer, and every reply after it too): the plan keeps waiting, this turn goes on as normal
+            self.plan_pending = None
+            return None
+        if pp["stage"] == "intro":
+            if ans == "yes":
+                prop = smithy_jobs.load_proposal(n) or {}
+                said = ([f"Something to know first: {c}" for c in prop.get("limits", [])]
+                        + [f"Something that doesn't fit: {c}" for c in prop.get("conflicts", [])]
+                        + [f"Question {i}: {x['q']}" + (f" If you don't say, {x['default']}" if x.get("default") else "")
+                           if isinstance(x, dict) else f"Question {i}: {x}"
+                           for i, x in enumerate(prop.get("questions", []), 1)])
+                pp["stage"] = "decide"
+                return " ".join(said) + " Shall I build it as it is, or would you like to answer them?"
+            if ans == "no":
+                pp["stage"] = "decide"
+                return "Okay. Shall I build it as it is, or would you like to change something?"
+            pp["stage"] = "decide"                             # straight to her answers
+        if pp["stage"] == "decide":
+            if ans == "yes":
+                self.plan_pending = None
+                return self._plan_reply(n, "yes")
+            if ans == "no":
+                self.plan_pending = None
+                return (f"Okay, {_name(q, n)} will wait. You can answer it later, here or in The Smithy's "
+                        "Plans window.")
+            pp.update(stage="confirm", text=text.strip())
+            return f"I'll send this to the plan as your answer: {text.strip()}. Shall I?"
+        if pp["stage"] == "confirm":
+            if ans == "yes":
+                self.plan_pending = None
+                return self._plan_reply(n, pp["text"])
+            if ans == "no":
+                pp.update(stage="decide", text="")
+                return "Okay, I didn't send it. Shall I build it as it is, or what would you like changed?"
+            pp["text"] = text.strip()                          # said it again differently: read that back
+            return f"I'll send this to the plan as your answer: {text.strip()}. Shall I?"
+        return None
+
+    def _plan_reply(self, n: int, text: str) -> str:
+        try:
+            return smithy_jobs.reply_to_proposal(n, text)
+        except ValueError as e:
+            return f"I couldn't do that: {e}."
 
     def _next_piece(self, what: str, rest: list[str], i: int) -> str:
         if i >= len(rest):
@@ -740,13 +940,17 @@ class WorkersVoice:
         if isinstance(got, str):
             return got
         q, _ = got
-        if not q.running():
-            return _not_running(q)
         jt = REGISTRIES[q.key]["followup"]
         try:
             params = jt.check({"parent_id": job_id, "question": question.strip()})
         except ValueError as e:
             return f"I can't ask that: {e}."
+        if not q.running():
+            said = _closed_offer(q)
+            if said.endswith("?"):
+                self.pending_open = {"q": q, "kind": "followup", "params": params, "provider": None,
+                                     "parent_id": job_id}
+            return said
         new_id = q.add("followup", params, requested_by="voice", title=jt.title(params), parent_id=job_id)
         return f"{_name(q, new_id)} is queued: {jt.title(params)}."
 
@@ -764,10 +968,34 @@ class WorkersVoice:
     # -- "While you were away...": asked first, read only if she wants it. Conversational, not a
     # code-checked gate (it only reads a list; nothing is sent or applied). Her next reply answers it,
     # or it's dropped: something else is just carried on with, and it isn't asked again this call.
+    @staticmethod
+    def _is_plan(q, j) -> bool:
+        return q.key == "smithy" and j["status"] == "review" and smithy_jobs.load_proposal(int(j["id"])) is not None
+
+    def _away_question(self, jobs) -> str:
+        """Plans waiting for her answer first, since they're the ones that need her (Nov 14, suggestion 5)."""
+        plans = sum(1 for q, j in jobs if self._is_plan(q, j))
+        rest = len(jobs) - plans
+        bits = []
+        if plans:
+            bits.append("a build plan is waiting for your answer" if plans == 1 else f"{plans} build plans are waiting for your answer")
+        if rest:
+            bits.append(("a task" if rest == 1 else f"{rest} tasks") + " finished" if plans else
+                        ("a task finished" if rest == 1 else f"{rest} tasks finished"))
+        what = "it" if len(jobs) == 1 else "them"
+        return f"While you were away, {' and '.join(bits)}. Want to hear about {what}?"
+
     def _away_reply_text(self, jobs) -> str:
+        jobs = sorted(jobs, key=lambda qj: not self._is_plan(*qj))           # plans first
+        plans = [(q, j) for q, j in jobs if self._is_plan(q, j)]
+        if plans and len(jobs) > 1:
+            q, j = plans[0]
+            others = len(jobs) - 1
+            return (f"First, the plan for {_name(q, j['id'])}, {_title(q, j)}. {_summary(j)}" + self._plan_hook(q, j)
+                    + f" After that, {others} more: ask what's ready when you want them.")
         if len(jobs) == 1:
             q, j = jobs[0]
-            return f"{_name(q, j['id'])}, {_title(q, j)}, finished. {_summary(j)}"
+            return f"{_name(q, j['id'])}, {_title(q, j)}, finished. {_summary(j)}" + self._plan_hook(q, j)
         names = "; ".join(f"{_name(q, j['id'])}, {_title(q, j)}" for q, j in jobs[:5])
         more = f", and {len(jobs) - 5} more" if len(jobs) > 5 else ""
         return f"{len(jobs)} tasks finished: {names}{more}. Say read me, and the task."
@@ -1014,8 +1242,7 @@ class WorkersVoice:
                         if first:   # finished while the user was away: ask first (the user, Nov 14)
                             first = False
                             self.away, self._away_ts = jobs, time.time()
-                            text = ("While you were away, a task finished. Want to hear about it?" if len(jobs) == 1
-                                    else f"While you were away, {len(jobs)} tasks finished. Want to hear about them?")
+                            text = self._away_question(jobs)
                             log.info("workers: asked about the away list %s", [_name(q, j["id"]) for q, j in jobs])
                             self.session.say(text, allow_interruptions=True)
                             await asyncio.sleep(5)
@@ -1023,6 +1250,7 @@ class WorkersVoice:
                         else:
                             q, j = jobs[0]
                             text, done = f"{_name(q, j['id'])}, {_title(q, j)}, is ready. {_summary(j)}", [jobs[0]]
+                            text += self._plan_hook(q, j)       # a plan: asks for her answer
                         for q, j in done:
                             await asyncio.to_thread(q.mark_announced, j["id"])
                         log.info("workers: announced %s", [_name(q, j["id"]) for q, j in done])
@@ -1044,6 +1272,30 @@ _OUT_WAIT = re.compile(r"\b(?:wait|later|hold\s+on|leave\s+it)\b", re.I)
 # Her answer to "While you were away, N tasks finished. Want to hear about them?" A reply that's
 # neither (another question, a new topic) is carried on with, and the question is dropped.
 AWAY_ANSWER_SECONDS = 60                                 # no reply this long: dropped, nothing read
+PLAN_ANSWER_SECONDS = 180                                # a plan's question: dropped after this long (it waits)
+_PLAN_WORDS = re.compile(r"\b(?:plan|build\s+it|questions?|answers?|assum\w*|instead|rather|the\s+files?|"
+                         r"use\s+|don'?t\s+|do\s+not\s+|should|must|change\s+it)\b", re.I)
+_OTHER_ASK = re.compile(r"\?\s*$|^\W*(?:what|how|why|when|where|who|which|whose|can\s+you|could\s+you|would\s+you|"
+                        r"will\s+you|tell\s+me|is\s+there|are\s+there|do\s+you|does|did|what'?s|hey|hi|hello)\b", re.I)
+
+
+def _elsewhere(text: str) -> bool:
+    """A reply while a plan's question is open that's clearly about something else: another worker
+    command, a new task, Task Mode, the how-to recorder, or a question that doesn't mention the plan.
+    Plain statements ("use the drafts folder") stay answers; the broad build / review / fix kinds
+    aren't counted, since "make it use unittest" is an answer."""
+    t = _take_provider(text.strip())[0]                 # "using DeepSeek, write an article ..." (Firestarter)
+    commands = (_DO, _TASK_START, _TASK_STOP, _TASK_MODE, _MARK, _ASK, _READ, _SHOW, _LOG_SHOW, _LOG_READ,
+                _PROGRESS, _PAUSED, _LIST_DONE, _OUT_LOCAL, howto_recorder.WRITE_UP)
+    plain = _who(t)[1]                                   # as handle() reads it: the worker's name taken out
+    if any(rx.search(t) or rx.search(plain) for rx in commands):
+        return True
+    if _kind_of(t)[0] in ("article", "zoo", "script", "check", "joomla"):
+        return True
+    return bool(_OTHER_ASK.search(t)) and not _PLAN_WORDS.search(t)
+
+
+_PLAN_LATER = re.compile(r"\b(?:not\s+(?:yet|now|today)|later|hold\s+on|wait|another\s+time)\b", re.I)
 _AWAY_YES = re.compile(r"^\W*(?:(?:othos|osos|um+|uh+|oh|well)\W+)*(?:yes|yeah|yep|yup|sure|ok(?:ay)?|go\s+ahead|"
                        r"please|tell\s+me(?=\W*$|\s+about\s+(?:them|it|those)|\s+more)|read\s+(?:them|it)|"
                        r"let'?s\s+hear|i'?d\s+like\s+that|go\s+on|"

@@ -33,6 +33,26 @@ mixed and offline modes, the voice commands, privacy, hardware and troubleshooti
   a call is open.
 - Logs: `logs\agent.log`, `server.log`, `ui.log`. Earlier runs are in `logs\old\`.
 
+## Two people on one computer
+
+Each Windows account has its own Othos folder, settings, drafts and notes. Its keys are in
+`%LOCALAPPDATA%\Othos\keys.dat`, locked to that account by Windows (DPAPI), so one account can't read
+another's. Ollama and its models are per account too (`%LOCALAPPDATA%\Programs\Ollama`,
+`%USERPROFILE%\.ollama\models`), and so are npm tools (`%APPDATA%\npm`) and shortcuts.
+
+The whole computer shares:
+- **Local addresses (ports):** LiveKit 7880, the agent 8081, the call page 3000 and Ollama 11434. While one
+  account's Othos is running, another account's either uses what is already there (with the first account's
+  models and data) or can't start its own.
+- **The microphone and speakers:** two calls would hear each other.
+- **Windows Sandbox:** only one can run at a time.
+- **The CPU, memory and graphics card.**
+
+**Best practice:** when you switch users, fully sign out: **Start**, your account picture, then **Sign out**.
+Don't use **Switch user**, and don't just lock the screen. Signing out closes Othos, its Ollama and anything else
+it started, so the next person starts clean. With Switch user, the first account's programs keep running in the
+background. The Othos app's **Stop** (or closing its window) also stops everything it started.
+
 Licence: GNU AGPL v3.0 or later (the `LICENSE` file at the top of the shared copy).
 
 Never committed: `.env`, `personal.json`, `profile.md`, `brain\` (notes), `logs\`,

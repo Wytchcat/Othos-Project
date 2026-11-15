@@ -6,6 +6,7 @@ import { Streamdown } from 'streamdown';
 import { useCloseWhenOthosStops } from '@/hooks/useCloseWhenOthosStops';
 import { codeBlocks, useCodeChat } from '@/hooks/useCodeChat';
 import { spaced, useIdentity } from '@/hooks/useIdentity';
+import { SmithyPlans } from './smithy-plans';
 
 // Othos code chat: typed questions, answers from the local coding model, code
 // blocks you can save to the drafts folder (opens in Notepad++). No voice.
@@ -81,6 +82,7 @@ export function CodeChat() {
       </header>
 
       <section className="flex-1 space-y-4 overflow-y-auto pb-4">
+        <SmithyPlans />
         {messages.length === 0 && (
           <p className="text-muted-foreground pt-16 text-center text-sm">
             Ask a coding question. Answers come from the coding model on this laptop; nothing is

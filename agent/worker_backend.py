@@ -48,6 +48,12 @@ def _set_priority(proc: subprocess.Popen | None, low: bool) -> None:
         log.warning("couldn't change priority: %s", e)
 
 
+def _read_timeout(cfg: dict) -> httpx.Timeout:
+    """How long to wait for the local model's next words: local_read_seconds (default 600). A long step on a
+    small CPU can take longer than 10 minutes before the first word (The Smithy, Nov 15: task 51 timed out)."""
+    return httpx.Timeout(30, read=float(cfg.get("local_read_seconds", 600)))
+
+
 def _wait_http(url: str, seconds: float) -> bool:
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
@@ -89,8 +95,12 @@ class OllamaBackend:
             # stop a worker with "taskkill /T" (the whole family), which used to take the shared Ollama
             # down too, for the other worker and voice Othos (Nov 14). Once that cmd has exited, taskkill
             # can't find Ollama through it.
+            # Its output goes to NUL, not this worker's own: otherwise Ollama inherits the worker's log
+            # (logs\worker.log, smithy.log) and holds it open, and the app can't start its worker again
+            # while Ollama runs ("Worker stopped", Nov 14).
             subprocess.Popen(f'cmd.exe /d /s /c "start "" /B "{exe}" serve >> "{log_dir / "ollama.log"}" 2>&1"',
-                             stdin=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             creationflags=subprocess.CREATE_NO_WINDOW)
             log.info("Ollama wasn't running: started it hidden, apart from this worker")
         if not _wait_http(f"{self.url}/api/version", 30):
             raise RuntimeError(f"Ollama isn't answering at {self.url}")
@@ -110,7 +120,7 @@ class OllamaBackend:
                 "options": {"num_gpu": 0, "num_thread": threads,
                             "num_ctx": int(self.cfg.get("context_tokens", 8192)), "num_predict": max_tokens}}
         out = []
-        with httpx.stream("POST", f"{self.url}/api/chat", json=body, timeout=httpx.Timeout(30, read=600)) as r:
+        with httpx.stream("POST", f"{self.url}/api/chat", json=body, timeout=_read_timeout(self.cfg)) as r:
             if r.status_code != 200:
                 raise RuntimeError(f"Ollama error {r.status_code}: {r.read().decode(errors='replace')[:300]}")
             for line in r.iter_lines():
@@ -175,7 +185,7 @@ class LlamaServerBackend:
         body = {"model": model, "messages": messages, "stream": True, "max_tokens": max_tokens}
         out = []
         with httpx.stream("POST", f"{self.url}/v1/chat/completions", json=body,
-                          timeout=httpx.Timeout(30, read=600)) as r:
+                          timeout=_read_timeout(self.cfg)) as r:
             if r.status_code != 200:
                 raise RuntimeError(f"llama-server error {r.status_code}: {r.read().decode(errors='replace')[:300]}")
             for line in r.iter_lines():

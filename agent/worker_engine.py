@@ -112,6 +112,9 @@ class Profile:
     tiers: tuple[str, ...]                     # the model switcher's rows
     add_usage: str = ""
     add_parse: Callable[[str, list[str]], dict] | None = None   # command-line "add KIND ARGS" -> raw params
+    # called about once a minute while the worker has nothing queued, with its settings (The Smithy: a
+    # plan nobody answered is built on its assumptions after build_ask_wait_hours, when that's set)
+    on_idle: Callable[[dict], None] | None = None
 
 
 # ---------------------------------------------------------------- results
@@ -493,6 +496,7 @@ class Worker:
         self.q.write_log()
         log.info("%s started: %s, models %s, CPU only", self.q.name, self.backend.name, self.cfg.get("models"))
         poll = float(self.cfg.get("poll_seconds", 5))
+        idle_check = 0.0
         try:
             while True:
                 self.check_games()
@@ -504,6 +508,12 @@ class Worker:
                 if not self.q.has_queued():
                     self.cpu.stop_waiting()
                     self.write_status("idle")
+                    if self.profile.on_idle and time.monotonic() - idle_check >= 60:
+                        idle_check = time.monotonic()
+                        try:
+                            self.profile.on_idle(self.load_cfg())    # the settings as they are now
+                        except Exception as e:             # never stops the worker
+                            log.warning("idle check failed: %s", e)
                     time.sleep(poll)
                     continue
                 if not self.cpu.try_acquire():

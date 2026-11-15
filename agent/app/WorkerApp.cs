@@ -167,6 +167,50 @@ static class FirestarterApp
     }
 }
 
+// No fixed-size windows (the user's rule): every window here is sizable, can't open bigger than the screen's
+// free area (WindowFit.cs), and its controls follow the size. AutoAnchor sets each control's Anchor from where
+// it sits, once all the controls are in (the Load event): wide ones stretch, ones by the right edge stay right,
+// the biggest list or text box grows with the height, and whatever is below it stays at the bottom. A control
+// that already has its own Anchor (not the default Top, Left) is left as it is. Nov 14.
+static class AutoAnchor
+{
+    public static void Fit(Form f, bool dialog)
+    {
+        f.Load += (s, e) =>
+        {
+            Size open = f.ClientSize;
+            Apply(f);
+            if (dialog) WindowFit.ApplyDialog(f, open); else WindowFit.Apply(f, open);
+        };
+    }
+
+    public static void Apply(Control parent)
+    {
+        int w = parent.ClientSize.Width;
+        Control grower = null;
+        foreach (Control c in parent.Controls)
+            if ((c is ListBox || c is ListView || c is RichTextBox || (c is TextBox && ((TextBox)c).Multiline) ||
+                 c is DataGridView || c is TreeView || (c is Panel && ((Panel)c).AutoScroll))
+                && (grower == null || c.Height > grower.Height))
+                grower = c;
+        foreach (Control c in parent.Controls)
+        {
+            if (c.Anchor != (AnchorStyles.Top | AnchorStyles.Left)) continue;      // laid out on purpose already
+            if (c.Dock != DockStyle.None) continue;
+            AnchorStyles a = 0;
+            bool wide = c.Width >= w * 0.5;
+            bool right = !wide && c.Left > w / 2 && w - c.Right <= 40;
+            a |= wide ? AnchorStyles.Left | AnchorStyles.Right : right ? AnchorStyles.Right : AnchorStyles.Left;
+            if (c.Top <= 2 && c.Bottom >= parent.ClientSize.Height - 2) a |= AnchorStyles.Top | AnchorStyles.Bottom;   // a side stripe
+            else if (grower != null && c == grower) a |= AnchorStyles.Top | AnchorStyles.Bottom;
+            else if (grower != null && c.Top >= grower.Bottom - 2) a |= AnchorStyles.Bottom;
+            else a |= AnchorStyles.Top;
+            c.Anchor = a;
+            if (c is Panel || c is GroupBox) Apply(c);                              // the same inside
+        }
+    }
+}
+
 // Pop-ups in the colours of the window they come from (the user, Nov 13: "All popups match the
 // color scheme of the logo/ui it is from"): the dark background, the app's own accent (the
 // Smithy's steel blue, Firestarter's ember) on a stripe and the main button, gold for a warning,
@@ -186,6 +230,12 @@ static class ThemedBox
 
     public static DialogResult Show(IWin32Window owner, string text, string caption, MessageBoxButtons buttons,
                                     MessageBoxIcon icon, MessageBoxDefaultButton def)
+    { return Show(owner, text, caption, buttons, icon, def, null); }
+
+    // answeredElsewhere: checked every 2 seconds; when it's true (answered by voice, say), the box closes by
+    // itself with Cancel, so the same question is never answered twice (Nov 14, suggestion 2)
+    public static DialogResult Show(IWin32Window owner, string text, string caption, MessageBoxButtons buttons,
+                                    MessageBoxIcon icon, MessageBoxDefaultButton def, Func<bool> answeredElsewhere)
     {
         bool yesNo = buttons == MessageBoxButtons.YesNo;
         Color accent = icon == MessageBoxIcon.Warning ? Gold : FirestarterApp.Accent;
@@ -224,13 +274,23 @@ static class ThemedBox
             var stripe = new Panel(); stripe.BackColor = accent; stripe.SetBounds(0, 0, 6, f.ClientSize.Height);
             f.Controls.Add(stripe);
             f.Shown += (s, e) => ((Button)f.AcceptButton).Focus();
+            AutoAnchor.Fit(f, true);                    // a message box can be resized too
 
             // the worker windows live minimized on the taskbar: then centre on the screen, in front
             var o = owner as Form;
             bool hidden = o == null || !o.Visible || o.WindowState == FormWindowState.Minimized;
             f.StartPosition = hidden ? FormStartPosition.CenterScreen : FormStartPosition.CenterParent;
             f.TopMost = hidden;
-            return hidden ? f.ShowDialog() : f.ShowDialog(owner);
+            System.Windows.Forms.Timer watch = null;
+            if (answeredElsewhere != null)
+            {
+                watch = new System.Windows.Forms.Timer(); watch.Interval = 2000;
+                watch.Tick += (s, e) => { bool done = false; try { done = answeredElsewhere(); } catch { }
+                                          if (done) { watch.Stop(); f.DialogResult = DialogResult.Cancel; } };
+                f.Shown += (s, e) => watch.Start();
+            }
+            try { return hidden ? f.ShowDialog() : f.ShowDialog(owner); }
+            finally { if (watch != null) watch.Dispose(); }
         }
     }
 }
@@ -264,6 +324,7 @@ class DownloaderForm : Form
         FormBorderStyle = FormBorderStyle.FixedSingle; MaximizeBox = false; MinimizeBox = false;
         StartPosition = FormStartPosition.CenterParent;
         ClientSize = new Size(620, 560);
+        AutoAnchor.Fit(this, true);                     // sizable, fits the screen (no fixed-size windows)
         BackColor = Bg; ForeColor = Ink; Font = new Font("Segoe UI", 10f);
 
         int x = 20;
@@ -477,6 +538,7 @@ class ProvidersForm : Form
         FormBorderStyle = FormBorderStyle.FixedSingle; MaximizeBox = false; MinimizeBox = false;
         StartPosition = FormStartPosition.CenterParent;
         ClientSize = new Size(760, 640);
+        AutoAnchor.Fit(this, true);
         BackColor = Bg; ForeColor = Ink; Font = new Font("Segoe UI", 9.5f);
 
         var head = new Label();
@@ -631,10 +693,16 @@ class ProvidersForm : Form
         body.Controls.Add(model);
         var tip = new ToolTip(); tip.SetToolTip(model, "The model " + label + " runs, as its own site names it. Saved when you press Enter or leave the box.");
         var result = AddLabel(body, "", 330, y, 266, Dim);
-        result.TextAlign = ContentAlignment.TopRight;
+        result.TextAlign = ContentAlignment.TopRight; result.AutoEllipsis = true;
+        // a long reason (a failed test, a "not ready") doesn't fit on the row: hover shows it, a click shows it
+        // whole in a box that can be copied from (Nov 15: the reason for a failed test was cut off)
+        string fullResult = "";
+        Action<string, Color> showResult = (r, c) => { fullResult = r; result.Text = r; result.ForeColor = c;
+            tip.SetToolTip(result, r); result.Cursor = r.Length > 40 ? Cursors.Hand : Cursors.Default; };
+        result.Click += (s, e) => { if (fullResult.Length > 40) ThemedBox.Show(this, fullResult, label + " test"); };
         string problem = S(p, "problem");
-        if (problem != "") { result.Text = "Not ready: " + problem; result.ForeColor = Gold; tip.SetToolTip(result, problem); }
-        else if (B(p, "out")) { result.Text = "Out of free tokens for now (switching skips it)"; result.ForeColor = Dim; }
+        if (problem != "") showResult("Not ready: " + problem, Gold);
+        else if (B(p, "out")) showResult("Out of free tokens for now (switching skips it)", Dim);
         if (cloud) AddSwitchBox(p, name, label, y + 20, tip);
         string savedModel = model.Text;
         Action<bool> saveModel = reload => { string v = model.Text.Trim().Replace("\"", "");
@@ -650,9 +718,9 @@ class ProvidersForm : Form
             if (ThemedBox.Show(this, "Send " + label + " one tiny request (“Reply with the single word OK”)? " +
                     "Nothing of yours is sent. A cloud provider may charge a fraction of a cent.", Text,
                     MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
-            result.Text = "Testing…"; result.ForeColor = Dim;
+            showResult("Testing…", Dim);
             ThreadPool.QueueUserWorkItem(_ => { string r = FirestarterApp.Run("test-provider " + name).Trim();
-                try { BeginInvoke((Action)(() => { result.Text = r; result.ForeColor = r.StartsWith("Works") ? Ok : Gold; })); } catch { } });
+                try { BeginInvoke((Action)(() => showResult(r, r.StartsWith("Works") ? Ok : Gold))); } catch { } });
         };
         var keyBox = key;
         string page = S(p, "key_page");
@@ -752,6 +820,7 @@ class FirestarterForm : Form
     readonly ComboBox provider = new ComboBox();
     readonly List<string> providerNames = new List<string>();
     Label cloudLine;
+    Button plansButton;
     bool loadingCloud;
     int cloudTicks;
 #endif
@@ -775,12 +844,13 @@ class FirestarterForm : Form
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
 #if SMITHY
-        ClientSize = new Size(420, 176 + 36 * FirestarterApp.Tiers.Length + 128 + 62 + 38);
+        ClientSize = new Size(420, 176 + 36 * FirestarterApp.Tiers.Length + 128 + 62 + 38 + 38);
 #else
         ClientSize = new Size(420, 176 + 36 * FirestarterApp.Tiers.Length + 116 + 166 + 76);
 #endif
         BackColor = Bg; ForeColor = Ink;
         Font = new Font("Segoe UI", 10f);
+        AutoAnchor.Fit(this, false);                    // the main window: sizable and can maximize
 
         title.Text = FirestarterApp.Title;
         title.Font = new Font("Segoe UI Semibold", 14f);
@@ -841,6 +911,9 @@ class FirestarterForm : Form
         codeChat = MakeButton("Code chat", 150, y2 + 82, 250);
         codeChat.Enabled = false;
         codeChat.Click += (s, e) => FirestarterApp.OpenPage("http://127.0.0.1:3000/code");
+        // a build's plan, for her yes, no, or answers (PlanForm)
+        plansButton = MakeButton("Plans…", 150, y2 + 120, 250);
+        plansButton.Click += (s, e) => LoadPlans(true);
 #else
         var wpButton = MakeButton("WordPress drafts\u2026", 150, y2 + 82, 250);
         wpButton.Click += (s, e) => { using (var d = new WordPressForm()) d.ShowDialog(this); };
@@ -936,6 +1009,47 @@ class FirestarterForm : Form
             ThreadPool.QueueUserWorkItem(_ => { FirestarterApp.Run("set-provider " + name); LoadCloud(); });
         };
         Controls.Add(provider);
+    }
+
+    // a build's plan waiting for her answer (smithy_jobs.run_proposal): opened by itself once per plan,
+    // or from the Plans button. Checked every 30 seconds, with the cloud line.
+    readonly HashSet<string> shownPlans = new HashSet<string>();
+    bool loadingPlans;
+
+    void LoadPlans(bool openAll)
+    {
+        if (loadingPlans) return;
+        loadingPlans = true;
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            System.Collections.ArrayList list = null;
+            try { list = new JavaScriptSerializer().Deserialize<System.Collections.ArrayList>(FirestarterApp.Run("plans")); } catch { }
+            try { BeginInvoke((Action)(() => { loadingPlans = false; ShowPlans(list, openAll); })); } catch { loadingPlans = false; }
+        });
+    }
+
+    void ShowPlans(System.Collections.ArrayList list, bool openAll)
+    {
+        int n = list != null ? list.Count : 0;
+        plansButton.Text = n > 0 ? "Plans waiting for you (" + n + ")…" : "Plans…";
+        plansButton.FlatAppearance.BorderColor = n > 0 ? Ember : PurpleLine;
+        if (list == null || n == 0)
+        {
+            if (openAll) ThemedBox.Show(this, "No plan is waiting for your answer.", FirestarterApp.Name);
+            return;
+        }
+        foreach (Dictionary<string, object> p in list)
+        {
+            string id = Get(p, "id");
+            if (!openAll && shownPlans.Contains(id)) continue;
+            shownPlans.Add(id);
+            if (Application.OpenForms["plan-" + id] != null) { Application.OpenForms["plan-" + id].Activate(); continue; }
+            var f = new PlanForm(id, Get(p, "title"), !openAll);   // opened by itself: no focus taken, it flashes
+            f.FormClosed += (s, e) => LoadPlans(false);
+            // its own taskbar button (an owned window has none, and hides while The Smithy is minimized)
+            f.Show();
+            if (!openAll) break;                       // one at a time when it opens by itself
+        }
     }
 
     // what's turned on, the default, and today's cloud use (smithy.py cloud)
@@ -1132,9 +1246,21 @@ class FirestarterForm : Form
             "on every provider in the switch order. It's waiting, and nothing is lost.\n\n" +
             "Yes: finish it on this PC's model now (slower; nothing more is sent out).\n" +
             "No: wait, and it carries on by itself" + (back != "" ? " about " + back : "") + " when free tokens are back.",
-            FirestarterApp.Name, MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            FirestarterApp.Name, MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button1,
+            () => OutAnswered(tid));
+        if (a == DialogResult.Cancel) return;           // answered by voice meanwhile: that answer stands
         string choice = a == DialogResult.Yes ? "local" : "wait";
         ThreadPool.QueueUserWorkItem(_ => FirestarterApp.Run("out-choice " + tid + " " + choice));
+    }
+
+    // the free-tokens question was answered somewhere else (voice), or the task isn't waiting any more
+    static bool OutAnswered(string tid)
+    {
+        var s = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(File.ReadAllText(FirestarterApp.StatusFile));
+        string st = s.ContainsKey("state") ? Convert.ToString(s["state"]) : "";
+        string now = s.ContainsKey("task_id") ? Convert.ToString(s["task_id"]) : "";
+        string choice = s.ContainsKey("out_choice") ? Convert.ToString(s["out_choice"]) : "";
+        return st != "waiting for free tokens" || now != tid || choice != "";
     }
 
     static string Clock(string ts)
@@ -1193,6 +1319,7 @@ class FirestarterForm : Form
         Text = alive ? FirestarterApp.Name + ": " + st : FirestarterApp.Name;
 #if SMITHY
         if (++cloudTicks % 15 == 0) LoadCloud();        // today's cloud use, every 30 seconds
+        if (alive && cloudTicks % 15 == 2) LoadPlans(false);   // a plan waiting for her answer
 #endif
         if (codeChat != null && !checkingPage)
         {
@@ -1240,6 +1367,233 @@ class FirestarterForm : Form
         base.OnFormClosing(e);
     }
 }
+
+#if SMITHY
+// "Plan" window: a build's plan waiting for her answer (smithy_jobs.run_proposal; the user, Nov 14: "read
+// a prompt, ask for clarification where needed, create a plan offered with a yes/no prompt and make any
+// adaptations for further user input"). Build it = yes; Send answers = a revised plan; Don't build = no
+// (asked again first). Closing it (X, Escape, Alt+F4) answers nothing: the plan keeps waiting.
+class PlanForm : Form
+{
+    static readonly Color Bg = Color.FromArgb(2, 7, 5), Ink = Color.FromArgb(200, 230, 210),
+        Dim = Color.FromArgb(120, 140, 130), Field = Color.FromArgb(10, 14, 20),
+        PurpleFill = Color.FromArgb(14, 16, 25), PurpleLine = Color.FromArgb(64, 53, 105),
+        PurpleHover = Color.FromArgb(25, 24, 43);
+    readonly string id;
+    readonly bool quiet;                                // opened by itself: no focus taken, the taskbar flashes
+    readonly TextBox plan = new TextBox(), other = new TextBox();
+    readonly Panel answers = new Panel();
+    readonly List<TextBox> boxes = new List<TextBox>();
+    readonly List<string> asked = new List<string>(), defaults = new List<string>();
+    readonly Button build, buildWith, send, drop, later;
+    readonly Label note = new Label();
+    readonly System.Windows.Forms.Timer watch = new System.Windows.Forms.Timer();
+    bool busy = true, checking, answered;
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct FLASHWINFO { public uint cbSize; public IntPtr hwnd; public uint dwFlags; public uint uCount; public uint dwTimeout; }
+    [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool FlashWindowEx(ref FLASHWINFO f);
+
+    protected override bool ShowWithoutActivation { get { return quiet; } }
+
+    public PlanForm(string id, string title, bool quiet)
+    {
+        this.id = id; this.quiet = quiet;
+        Name = "plan-" + id;
+        Text = FirestarterApp.Name + ": plan for task " + id;
+        try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
+        BackColor = Bg; ForeColor = Ink; Font = new Font("Segoe UI", 10f);
+        StartPosition = FormStartPosition.CenterScreen;
+        ClientSize = new Size(720, 680);                // the opening size, before the controls (WindowFit)
+
+        var stripe = new Panel(); stripe.BackColor = FirestarterApp.Accent; stripe.SetBounds(0, 0, 6, 680);
+        stripe.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left;
+        var head = new Label(); head.Text = "Task " + id + ": " + (title != "" ? title : "a build") + "\nNothing has been built yet.";
+        head.ForeColor = FirestarterApp.Accent; head.SetBounds(24, 12, 676, 44);
+        head.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+
+        plan.Multiline = true; plan.ReadOnly = true; plan.ScrollBars = ScrollBars.Vertical; plan.WordWrap = true;
+        plan.BackColor = Field; plan.ForeColor = Ink; plan.BorderStyle = BorderStyle.FixedSingle;
+        plan.Text = "Loading the plan…";
+        plan.SetBounds(24, 60, 676, 300);
+        plan.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+
+        // one box per question, filled in with what it will do if not told; then any other changes
+        var ask = new Label(); ask.Text = "Your answers (each is filled in with what The Smithy will do if you leave it):";
+        ask.ForeColor = Dim; ask.SetBounds(24, 368, 676, 22);
+        ask.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+        answers.AutoScroll = true; answers.BackColor = Bg; answers.SetBounds(24, 392, 676, 168);
+        answers.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+        other.Multiline = true; other.AcceptsReturn = true; other.ScrollBars = ScrollBars.Vertical;
+        other.BackColor = Field; other.ForeColor = Ink; other.BorderStyle = BorderStyle.FixedSingle;
+        other.TextChanged += (s, e) => Enable();
+
+        note.ForeColor = Dim; note.SetBounds(24, 650, 676, 24);
+        note.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+        build = MakeButton("Build it", 24, 104, true);
+        buildWith = MakeButton("Build with these answers", 134, 196, false);
+        send = MakeButton("Send for a new plan", 336, 160, false);
+        drop = MakeButton("Don't build", 502, 100, false);
+        later = MakeButton("Later", 608, 92, false);
+        later.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
+        build.Click += (s, e) => Answer("yes", false, "Building it…");
+        buildWith.Click += (s, e) => Answer(Answers(), true, "Building it with your answers…");
+        send.Click += (s, e) => Answer(Answers(), false, "Sending your answers for a new plan…");
+        drop.Click += (s, e) =>
+        {
+            if (ThemedBox.Show(this, "Drop this plan? Task " + id + " won't be built.", FirestarterApp.Name,
+                               MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) == DialogResult.Yes)
+                Answer("no", false, "Dropping it…");
+        };
+        later.Click += (s, e) => Close();
+        CancelButton = later;                            // Escape / X / Alt+F4: nothing answered, the plan keeps waiting
+        foreach (Control c in new Control[] { head, plan, ask, answers, build, buildWith, send, drop, later, note, stripe }) Controls.Add(c);
+        stripe.SendToBack();
+        Enable();
+        WindowFit.ApplyDialog(this, new Size(640, 520));
+        Load += (s, e) => LoadPlan();
+        Shown += (s, e) => { if (quiet) Flash(); };
+        // answered by voice (or in another window) meanwhile: say so, and nothing here can answer it twice
+        // (Nov 14, suggestion 2). Checked every 10 seconds; her typing is left as it is.
+        watch.Interval = 10000;
+        watch.Tick += (s, e) => CheckStillWaiting();
+        Shown += (s, e) => watch.Start();
+        FormClosed += (s, e) => watch.Dispose();
+        Resize += (s, e) => LayOutAnswers();
+    }
+
+    void Flash()
+    {
+        try
+        {
+            var f = new FLASHWINFO();
+            f.cbSize = (uint)System.Runtime.InteropServices.Marshal.SizeOf(typeof(FLASHWINFO));
+            f.hwnd = Handle; f.dwFlags = 3 | 12;         // the caption and the taskbar button, until it's opened
+            FlashWindowEx(ref f);
+        }
+        catch { }
+    }
+
+    Button MakeButton(string text, int x, int w, bool main)
+    {
+        var b = new Button(); b.Text = text; b.SetBounds(x, 610, w, 34);
+        b.FlatStyle = FlatStyle.Flat; b.BackColor = PurpleFill; b.ForeColor = Ink;
+        b.FlatAppearance.BorderColor = main ? FirestarterApp.Accent : PurpleLine;
+        b.FlatAppearance.MouseOverBackColor = PurpleHover;
+        b.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
+        return b;
+    }
+
+    // what she changed, as one reply: each question whose box isn't its default, then the other changes
+    string Answers()
+    {
+        var parts = new List<string>();
+        for (int i = 0; i < boxes.Count; i++)
+        {
+            string a = boxes[i].Text.Trim();
+            if (a != defaults[i].Trim()) parts.Add("Question " + (i + 1) + " (" + asked[i] + "): " + (a != "" ? a : "no answer"));
+        }
+        if (other.Text.Trim() != "") parts.Add("Other changes: " + other.Text.Trim());
+        return string.Join("\n", parts.ToArray());
+    }
+
+    // Build it only with nothing changed (so answers are never lost); the answer buttons only with something changed
+    void Enable()
+    {
+        bool changed = Answers() != "";
+        build.Enabled = !busy && !changed; buildWith.Enabled = !busy && changed; send.Enabled = !busy && changed;
+        drop.Enabled = !busy;
+        foreach (var b in boxes) b.ReadOnly = busy;
+        other.ReadOnly = busy;
+        AcceptButton = changed ? null : build;           // Enter presses only the default button
+    }
+
+    void FillAnswers(System.Collections.ArrayList qs)
+    {
+        answers.Controls.Clear(); boxes.Clear(); asked.Clear(); defaults.Clear();
+        if (qs != null)
+            foreach (Dictionary<string, object> q in qs)
+            {
+                asked.Add(Convert.ToString(q["q"])); defaults.Add(q.ContainsKey("default") ? Convert.ToString(q["default"]) : "");
+                var l = new Label(); l.Text = (asked.Count) + ". " + asked[asked.Count - 1]; l.ForeColor = Ink; l.AutoSize = true;
+                var b = new TextBox(); b.Text = defaults[defaults.Count - 1]; b.BackColor = Field; b.ForeColor = Ink;
+                b.BorderStyle = BorderStyle.FixedSingle;
+                b.TextChanged += (s, e) => Enable();
+                answers.Controls.Add(l); answers.Controls.Add(b); boxes.Add(b);
+            }
+        var ol = new Label(); ol.Text = boxes.Count > 0 ? "Other changes (optional):" : "Your answers or changes (leave empty to build it as it is):";
+        ol.ForeColor = Dim; ol.AutoSize = true; ol.Name = "otherLabel";
+        answers.Controls.Add(ol); answers.Controls.Add(other);
+        LayOutAnswers();
+    }
+
+    // the rows follow the window's width (worked out again on every resize, never once at start-up)
+    void LayOutAnswers()
+    {
+        int w = Math.Max(200, answers.ClientSize.Width - SystemInformation.VerticalScrollBarWidth - 4), y = 0;
+        answers.AutoScrollPosition = new Point(0, 0);
+        foreach (Control c in answers.Controls)
+        {
+            if (c is Label) { ((Label)c).MaximumSize = new Size(w, 0); c.Location = new Point(0, y); y += c.GetPreferredSize(new Size(w, 0)).Height + 2; }
+            else if (c == other) { c.SetBounds(0, y, w, 64); y += 70; }
+            else { c.SetBounds(0, y, w, 26); y += 32; }
+        }
+    }
+
+    void LoadPlan()
+    {
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            Dictionary<string, object> m = null;
+            try { m = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(FirestarterApp.Run("plan " + id)); } catch { }
+            try { BeginInvoke((Action)(() => {
+                if (m == null) { plan.Text = "The plan couldn't be read."; FillAnswers(null); return; }
+                plan.Text = Convert.ToString(m["text"]).Replace("\r\n", "\n").Replace("\n", "\r\n");
+                plan.SelectionStart = 0; plan.SelectionLength = 0;
+                FillAnswers(m.ContainsKey("questions") ? m["questions"] as System.Collections.ArrayList : null);
+                bool waiting = m["waiting"] is bool && (bool)m["waiting"];
+                busy = !waiting; Enable();
+                note.Text = waiting ? Convert.ToString(m.ContainsKey("cost") ? m["cost"] : "") : "This plan was already answered.";
+            })); } catch { }
+        });
+    }
+
+    void CheckStillWaiting()
+    {
+        if (checking || answered || (busy && note.Text != "")) return;   // not while its own answer is being sent
+        checking = true;
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            Dictionary<string, object> m = null;
+            try { m = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(FirestarterApp.Run("plan " + id)); } catch { }
+            try { BeginInvoke((Action)(() => {
+                checking = false;
+                if (m == null || (m["waiting"] is bool && (bool)m["waiting"])) return;
+                answered = true; watch.Stop(); busy = true; Enable();
+                note.ForeColor = Color.FromArgb(231, 195, 104);   // gold, as the main window uses
+                note.Text = "This plan was answered somewhere else (by voice, or in another window), so there's nothing more to do here.";
+            })); } catch { checking = false; }
+        });
+    }
+
+    void Answer(string text, bool buildNow, string doing)
+    {
+        busy = true; Enable(); note.Text = doing;
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            string o;
+            try { o = FirestarterApp.RunWithInput("reply " + id + (buildNow ? " --build" : "") + " -", text); }
+            catch (Exception ex) { o = "can't do that: " + ex.Message; }
+            try { BeginInvoke((Action)(() => {
+                bool failed = o.StartsWith("can't") || o.Contains("Traceback") || o == "";
+                ThemedBox.Show(this, o == "" ? "No answer came back from The Smithy." : o, FirestarterApp.Name,
+                               MessageBoxButtons.OK, failed ? MessageBoxIcon.Warning : MessageBoxIcon.None);
+                if (failed) { busy = false; Enable(); note.Text = ""; } else Close();
+            })); } catch { }
+        });
+    }
+}
+#endif
 
 // "Progress" window: each step of the running task as it happens (Nov 13, the user: "a running step by
 // step as it progresses thru the task", to keep in a corner). Reads state\<worker>-status-steps.jsonl,
@@ -1419,6 +1773,7 @@ class WordPressForm : Form
         MaximizeBox = false; MinimizeBox = false;
         StartPosition = FormStartPosition.CenterParent;
         ClientSize = new Size(560, 420);
+        AutoAnchor.Fit(this, true);
         BackColor = Bg; ForeColor = Ink;
         Font = new Font("Segoe UI", 10f);
 
@@ -1566,6 +1921,7 @@ class SiteSetupForm : Form
         MaximizeBox = false; MinimizeBox = false;
         StartPosition = FormStartPosition.CenterParent;
         ClientSize = new Size(520, 640);
+        AutoAnchor.Fit(this, true);
         BackColor = Bg; ForeColor = Ink;
         Font = new Font("Segoe UI", 10f);
 
@@ -1752,6 +2108,7 @@ class SpecsForm : Form
         MaximizeBox = false; MinimizeBox = false;
         StartPosition = FormStartPosition.CenterParent;
         ClientSize = new Size(560, 520);
+        AutoAnchor.Fit(this, true);
         BackColor = Bg; ForeColor = Ink;
         Font = new Font("Segoe UI", 10f);
         pc.SetBounds(16, 12, 528, 40); pc.ForeColor = Gold; pc.Text = "Checking your PC\u2026 (this reads its hardware only)";
@@ -1883,6 +2240,7 @@ class ZooForm : Form
         MaximizeBox = false; MinimizeBox = false;
         StartPosition = FormStartPosition.CenterParent;
         ClientSize = new Size(560, 680);
+        AutoAnchor.Fit(this, true);
         BackColor = Bg; ForeColor = Ink;
         Font = new Font("Segoe UI", 10f);
         body.SetBounds(0, 0, 560, 600);

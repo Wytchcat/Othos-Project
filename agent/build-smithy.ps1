@@ -61,7 +61,7 @@ New-Item -ItemType Directory -Force "$A\icons" | Out-Null
 
 # --- build
 & $csc /nologo /target:winexe /optimize+ /define:SMITHY "/win32icon:$ico" "/out:$A\app\Smithy.exe" `
-    /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Web.Extensions.dll "$A\app\WorkerApp.cs"
+    /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Web.Extensions.dll "$A\app\WorkerApp.cs" "$A\app\WindowFit.cs"
 if ($LASTEXITCODE -ne 0) { throw "Build failed" }
 "built $A\app\Smithy.exe"
 

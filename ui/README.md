@@ -28,6 +28,20 @@ OTHOS_CODE_MODEL=qwen2.5-coder:3b
 # OTHOS_DRAFTS_DIR, OTHOS_EDITOR (opens saved drafts; Notepad++ by default)
 ```
 
+## Two people on one computer
+
+Each Windows account has its own copy of this folder, its own `.env.local`, its own keys
+(`%LOCALAPPDATA%\Othos\keys.dat`, locked to that account by Windows) and its own Ollama and models. One account
+can't read another's.
+
+The whole computer shares **the call page's port (3000)**, LiveKit's 7880, the agent's 8081 and Ollama's 11434, the
+**microphone and speakers**, and the CPU and graphics card. While one account's page is running, another account's
+can't start on port 3000, or opens the first account's page and models instead.
+
+**Best practice:** when you switch users, fully sign out: **Start**, your account picture, then **Sign out**. Don't
+use **Switch user**, and don't just lock the screen. Signing out closes the page and everything Othos started, so the
+next person starts clean. With Switch user, the first account's programs keep running in the background.
+
 ## Licences
 
 - **`public/othos-board/`** (the Circuit Board, by Jared Rhodenizer, from
