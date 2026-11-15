@@ -404,10 +404,11 @@ If two people use one Windows PC, each with their own Windows account:
 - **Windows Sandbox:** only one can run at a time.
 - **The CPU, memory and graphics card.**
 
-**Best practice:** when you switch users, fully sign out: **Start**, your account picture,
-then **Sign out**. Don't use **Switch user**, and don't just lock the screen. Signing out
-closes Othos, its Ollama and anything else it started, so the next person starts clean. With
-Switch user, the first account's programs keep running in the background.
+**Best practice: sign out of all Othos Project apps before switching users.** Close Othos
+(and The Smithy or Firestarter, if you use them), then fully sign out of Windows: **Start**,
+your account picture, then **Sign out**. Don't use **Switch user**, and don't just lock the
+screen. Signing out closes Othos, its Ollama and anything else it started, so the next person
+starts clean. With Switch user, the first account's programs keep running in the background.
 
 If two accounts must run at the same time, give one of them its own ports (for The Smithy,
 that's `"ollama": {"start_own": true, "own_port": ...}` in that account's `smithy.json`).
