@@ -14,16 +14,18 @@ $LogDir      = "$AgentDir\logs"
 $OllamaModel = "llama3.2:3b"
 $Url         = "http://127.0.0.1:3000"   # 127.0.0.1, not localhost (IPv6 issue)
 
-Add-Type -AssemblyName PresentationFramework
-function Say($msg) { [System.Windows.MessageBox]::Show($msg, "Othos") | Out-Null }
+. "$AgentDir\othos-box.ps1"      # Show-OthosBox: a message box in Othos's colours and logo
+function Say($msg) { Show-OthosBox $msg }
 function Fail($msg) { Say $msg; exit 1 }
 . "$AgentDir\open-private.ps1"   # Open-Private: the call page in a private browser window
 
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
-foreach ($p in @("$LiveKitDir\livekit-server.exe", "$AgentDir\agent.py",
-                 "$AgentDir\.venv\Scripts\python.exe", "$UiDir\package.json", $Pnpm)) {
-    if (-not (Test-Path $p)) { Fail "Missing: $p" }
+$missing = @("$LiveKitDir\livekit-server.exe", "$AgentDir\agent.py",
+             "$AgentDir\.venv\Scripts\python.exe", "$UiDir\package.json", $Pnpm) | Where-Object { -not (Test-Path $_) }
+if ($missing) {
+    Fail ("Othos isn't set up yet.`n`nRun setup.ps1 first (README, step 1), then start Othos again.`n`nMissing:`n" +
+          (($missing | ForEach-Object { "  $_" }) -join "`n"))
 }
 
 # Refuse to start twice: LiveKit server (7880), agent (8081), web page (3000)

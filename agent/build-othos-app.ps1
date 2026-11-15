@@ -17,7 +17,7 @@ try {
 } catch { }
 
 & $csc /nologo /target:winexe /optimize+ "/win32icon:$ico" "/out:$A\app\Othos.exe" `
-    /r:System.Windows.Forms.dll /r:System.Drawing.dll "$A\app\Othos.cs"
+    /r:System.Windows.Forms.dll /r:System.Drawing.dll "$A\app\Othos.cs" "$A\app\WindowFit.cs"
 if ($LASTEXITCODE -ne 0) { throw "Build failed" }
 "built $A\app\Othos.exe"
 

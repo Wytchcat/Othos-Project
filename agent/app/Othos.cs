@@ -229,13 +229,12 @@ class MainForm : Form
     {
         Text = OthosApp.Name;
         try { Icon = OthosApp.LogoIcon() ?? Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
-        FormBorderStyle = FormBorderStyle.FixedSingle;
-        MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
         bool speedDue = SpeedTestDue();
         int extra = speedDue ? 26 : 0;   // room for the reminder row
         btnY += extra;
         ClientSize = new Size(448, 256 + extra);
+        WindowFit.Apply(this, new Size(448, 256 + extra));   // sizable; the contents below are anchored
         BackColor = Bg;
         ForeColor = Ink;
         Font = new Font("Segoe UI", 10f);
@@ -252,6 +251,7 @@ class MainForm : Form
         models.LinkColor = Gold;
         models.ActiveLinkColor = Green;
         models.SetBounds(212, 22, 112, 22);
+        models.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         models.TextAlign = ContentAlignment.MiddleRight;
         models.LinkClicked += (s, e) => ShowModels();
         Controls.Add(models);
@@ -261,6 +261,7 @@ class MainForm : Form
         check.LinkColor = Gold;
         check.ActiveLinkColor = Green;
         check.SetBounds(330, 22, 104, 22);
+        check.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         check.TextAlign = ContentAlignment.MiddleRight;
         check.LinkClicked += (s, e) => ShowSpecs();
         Controls.Add(check);
@@ -273,11 +274,13 @@ class MainForm : Form
         }
 
         gamingRow.SetBounds(22, 52 + 4 * 26, 410, 24);
+        gamingRow.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         Controls.Add(gamingRow);
 
         if (speedDue)
         {
             speedRow.SetBounds(22, 52 + 5 * 26, 410, 24);
+            speedRow.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
             speedRow.ForeColor = Gold;
             speedRow.Text = "◆  New build: run the llama.cpp worker speed test (WORKER.md)";
             Controls.Add(speedRow);
@@ -286,6 +289,7 @@ class MainForm : Form
         // Code chat moved to the call screen's control bar (the </> button) and to The Smithy's window
         // the automatic model check's line (shown only when it found something new)
         modelsRow.SetBounds(22, 52 + (speedDue ? 6 : 5) * 26, 410, 24);
+        modelsRow.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         modelsRow.ForeColor = Gold;
         modelsRow.Cursor = Cursors.Hand;
         modelsRow.Visible = false;
@@ -343,27 +347,33 @@ class MainForm : Form
             d.Text = OthosApp.Name + ": " + caption;
             d.Icon = Icon;
             d.StartPosition = owner == null ? FormStartPosition.CenterScreen : FormStartPosition.CenterParent;
-            d.FormBorderStyle = FormBorderStyle.FixedDialog;
-            d.MaximizeBox = false;
-            d.MinimizeBox = false;
             d.ShowInTaskbar = owner == null;
             d.BackColor = Bg;
             d.ForeColor = Ink;
             d.Font = new Font("Segoe UI", 10f);
+            // the height the text needs at the opening width, then the window's final size, BEFORE the
+            // controls are added: Anchor remembers each control's distance to the edges as it is added
+            var t = new Label();
+            t.Text = text;
+            t.Font = d.Font;
+            t.ForeColor = Ink;
+            t.AutoSize = true;
+            t.MaximumSize = new Size(440, 0);
+            int th = t.PreferredHeight;
+            int by = 54 + th + 20;
+            d.ClientSize = new Size(484, by + 56);
             var h = new Label();
             h.Text = heading;
             h.Font = new Font("Segoe UI Semibold", 14f);
             h.ForeColor = Green;
             h.SetBounds(20, 14, 440, 30);
+            h.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
             d.Controls.Add(h);
-            var t = new Label();
-            t.Text = text;
-            t.ForeColor = Ink;
-            t.AutoSize = true;
-            t.MaximumSize = new Size(440, 0);
-            t.Location = new Point(22, 54);
+            t.MaximumSize = Size.Empty;
+            t.AutoSize = false;   // follows the window's size (wraps again when it's resized)
+            t.SetBounds(22, 54, 440, th);
+            t.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
             d.Controls.Add(t);
-            int by = 54 + t.PreferredHeight + 20;
             var y = new Button();
             var n = new Button();
             y.Text = yes; n.Text = no;
@@ -372,6 +382,7 @@ class MainForm : Form
             foreach (var b in new[] { y, n })
             {
                 b.SetBounds(x, by, 150, 36);
+                b.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
                 b.FlatStyle = FlatStyle.Flat;
                 b.FlatAppearance.BorderColor = b == y ? Green : PurpleLine;
                 b.FlatAppearance.MouseOverBackColor = PurpleHover;
@@ -383,7 +394,7 @@ class MainForm : Form
             }
             d.AcceptButton = y;
             d.CancelButton = n;
-            d.ClientSize = new Size(484, by + 56);
+            WindowFit.ApplyDialog(d, d.ClientSize);   // sizable; no smaller than the text and buttons need
             return (owner == null ? d.ShowDialog() : d.ShowDialog(owner)) == DialogResult.Yes;
         }
     }
@@ -410,8 +421,6 @@ class MainForm : Form
         f.Text = OthosApp.Name + ": this PC";
         f.Icon = Icon;
         f.StartPosition = FormStartPosition.CenterScreen;
-        f.FormBorderStyle = FormBorderStyle.FixedSingle;
-        f.MaximizeBox = false;
         f.ClientSize = new Size(720, 540);
         f.BackColor = Bg;
         f.ForeColor = Ink;
@@ -426,6 +435,7 @@ class MainForm : Form
         var sub = new Label();
         sub.ForeColor = Dim;
         sub.SetBounds(22, 46, 680, 40);
+        sub.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         sub.Text = "Reading this PC's specs (about 10 seconds). Nothing leaves this computer.";
         f.Controls.Add(sub);
 
@@ -434,6 +444,7 @@ class MainForm : Form
         list.BackColor = Panel;
         list.BorderStyle = BorderStyle.FixedSingle;
         list.SetBounds(20, 92, 680, 376);
+        list.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
         f.Controls.Add(list);
 
         var apply = new Button();
@@ -445,6 +456,7 @@ class MainForm : Form
         foreach (var b in new[] { apply, close })
         {
             b.SetBounds(x, 484, b == apply ? 190 : 110, 36);
+            b.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
             b.FlatStyle = FlatStyle.Flat;
             b.FlatAppearance.BorderColor = PurpleLine;
             b.FlatAppearance.MouseOverBackColor = PurpleHover;
@@ -456,11 +468,15 @@ class MainForm : Form
         close.Click += (s, e) => f.Close();
 
         // rows: {fit, area, text}; fit "" = a plain line (the apply results)
+        string[][] lastRows = null;   // kept so the rows can be laid out again when the window is resized
+        int lastW = 0;
         Action<string[][]> fill = rows =>
         {
+            lastRows = rows;
+            lastW = list.Width;
             list.SuspendLayout();
             list.Controls.Clear();
-            int y = 10, textW = list.ClientSize.Width - 250;
+            int y = 10, textW = Math.Max(160, list.Width - 270);
             foreach (var r in rows)
             {
                 string fit = r[0], area = r[1], text = r[2];
@@ -494,6 +510,7 @@ class MainForm : Form
             }
             list.ResumeLayout();
         };
+        list.Resize += (s, e) => { if (lastRows != null && list.Width != lastW) fill(lastRows); };
         Func<string, string[][]> parse = output =>
         {
             var rows = new System.Collections.Generic.List<string[]>();
@@ -556,6 +573,7 @@ class MainForm : Form
             }
             catch { }
         });
+        WindowFit.Apply(f, new Size(560, 380));   // sizable, with a minimum; opens no bigger than the screen's free area
         f.Show();   // not owned: the Othos window minimizes to the taskbar
     }
 
@@ -610,8 +628,9 @@ class MainForm : Form
         if (modelsRow.Visible) return;
         modelsRow.Text = "◆  Model check: " + news + " new or updated (click to see)";
         modelsRow.Visible = true;
-        ClientSize = new Size(ClientSize.Width, ClientSize.Height + 26);
-        foreach (var b in buttons) b.Top += 26;
+        // make room for the new row: a bigger minimum grows the window if it's at its smallest, and
+        // the buttons (anchored to the bottom) move down with it
+        MinimumSize = new Size(MinimumSize.Width, MinimumSize.Height + 26);
     }
 
     // The model check's window, in the same look as the PC check: a heading, then the rows
@@ -624,8 +643,6 @@ class MainForm : Form
         f.Text = OthosApp.Name + ": models";
         f.Icon = Icon;
         f.StartPosition = FormStartPosition.CenterScreen;
-        f.FormBorderStyle = FormBorderStyle.FixedSingle;
-        f.MaximizeBox = false;
         f.ClientSize = new Size(760, 580);
         f.BackColor = Bg;
         f.ForeColor = Ink;
@@ -640,6 +657,7 @@ class MainForm : Form
         var sub = new Label();
         sub.ForeColor = Dim;
         sub.SetBounds(22, 46, 720, 40);
+        sub.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         sub.Text = "Checking ollama.com, Hugging Face and GitHub for newer models (about 20 seconds). " +
                    "Only model names are sent. Nothing is downloaded.";
         f.Controls.Add(sub);
@@ -649,17 +667,20 @@ class MainForm : Form
         list.BackColor = Panel;
         list.BorderStyle = BorderStyle.FixedSingle;
         list.SetBounds(20, 92, 720, 416);
+        list.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
         f.Controls.Add(list);
 
         var close = new Button();
         close.Text = "Close";
         close.SetBounds(20, 524, 110, 36);
+        close.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
         StyleButton(close);
         close.Click += (s, e) => f.Close();
         f.Controls.Add(close);
         var how = new Label();
         how.ForeColor = Dim;
         how.SetBounds(144, 522, 600, 40);
+        how.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
         how.Text = "Get downloads a model to this PC after you say yes; it doesn't change which model is used. " +
                    "Fits / Tight / Won't fit use this PC's RAM and graphics card (Check my PC...).";
         f.Controls.Add(how);
@@ -801,6 +822,44 @@ class MainForm : Form
             try { var p = dl; dl = null; p.Kill(); } catch { }
         };
 
+        // the rows are placed from the list's width, so they wrap again (and the Get buttons stay at the
+        // right edge) when the window is resized; the buttons and their download state are kept as they are
+        var items = new System.Collections.Generic.List<ModelRow>();
+        int lastListW = 0;
+        bool laying = false;
+        Action relayout = () =>
+        {
+            if (laying) return;
+            laying = true;
+            try
+            {
+                lastListW = list.ClientSize.Width;
+                int off = list.AutoScrollPosition.Y;   // 0 or negative: how far the list is scrolled
+                int textW = Math.Max(160, list.ClientSize.Width - 230);
+                list.SuspendLayout();
+                int y = 10;
+                foreach (var it in items)
+                {
+                    if (it.Header != null)
+                    {
+                        it.Header.SetBounds(10, y + (it.Gap ? 6 : 0) + off, textW + 90, 22);
+                        y += it.Gap ? 30 : 24;
+                    }
+                    else
+                    {
+                        it.TagLabel.Location = new Point(10, y + off);
+                        it.Text.MaximumSize = new Size(textW, 0);
+                        it.Text.Location = new Point(94, y + 1 + off);
+                        if (it.Button != null) it.Button.Location = new Point(94 + textW + 14, y - 2 + off);
+                        y += Math.Max(28, it.Text.PreferredHeight) + 8;
+                    }
+                }
+                list.ResumeLayout(true);
+            }
+            finally { laying = false; }
+        };
+        list.Resize += (s, e) => { if (items.Count > 0 && list.ClientSize.Width != lastListW) relayout(); };
+
         f.Shown += (s, e) => ThreadPool.QueueUserWorkItem(_ =>
         {
             string o = RunPy("model_check.py", "--rows");
@@ -810,7 +869,8 @@ class MainForm : Form
                 {
                     list.SuspendLayout();
                     list.Controls.Clear();
-                    int y = 10, textW = list.ClientSize.Width - 230, n = 0;
+                    items.Clear();
+                    int n = 0;   // positions are worked out by relayout(), from the list's width
                     string last = "";
                     foreach (var line in o.Replace("\r", "").Split('\n'))
                     {
@@ -824,9 +884,8 @@ class MainForm : Form
                             a.Text = area;
                             a.ForeColor = Green;
                             a.Font = new Font("Segoe UI Semibold", 10f);
-                            a.SetBounds(10, y + (last.Length > 0 ? 6 : 0), textW + 90, 22);
                             list.Controls.Add(a);
-                            y += last.Length > 0 ? 30 : 24;
+                            items.Add(new ModelRow { Header = a, Gap = last.Length > 0 });
                             last = area;
                         }
                         var tag = new Label();
@@ -836,15 +895,15 @@ class MainForm : Form
                         tag.BackColor = Bg;
                         tag.TextAlign = ContentAlignment.MiddleCenter;
                         tag.Font = new Font("Segoe UI Semibold", 9f);
-                        tag.SetBounds(10, y, 74, 22);
+                        tag.Size = new Size(74, 22);
                         list.Controls.Add(tag);
                         var t = new Label();
                         t.Text = text;
                         t.ForeColor = Ink;
                         t.AutoSize = true;
-                        t.MaximumSize = new Size(textW, 0);
-                        t.Location = new Point(94, y + 1);
                         list.Controls.Add(t);
+                        var row = new ModelRow { TagLabel = tag, Text = t };
+                        items.Add(row);
 
                         var act = action.Split('|');
                         if ((act[0] == "pull" && act.Length == 3) || (act[0] == "hf" && act.Length == 4) || (act[0] == "open" && act.Length == 2))
@@ -853,7 +912,8 @@ class MainForm : Form
                             bool upd = act[0] == "pull" && text.Contains("an update is out");
                             b.Text = act[0] == "open" ? "Open page" : upd ? "Update" : "Get";
                             b.Tag = upd ? "update" : "get";
-                            b.SetBounds(94 + textW + 14, y - 2, 96, 28);
+                            b.Size = new Size(96, 28);
+                            row.Button = b;
                             StyleButton(b);
                             if (act[0] == "open")
                             {
@@ -875,9 +935,9 @@ class MainForm : Form
                             }
                             list.Controls.Add(b);
                         }
-                        y += Math.Max(28, t.PreferredHeight) + 8;
                     }
                     list.ResumeLayout();
+                    relayout();
                     int news = ModelNews();
                     checkedText = n == 0 ? "The check didn't run. Is the .venv folder set up (setup.ps1)?"
                              : "Checked " + DateTime.Now.ToString("ddd d MMM, h:mm tt") + ". " +
@@ -889,7 +949,17 @@ class MainForm : Form
             }
             catch { }
         });
+        WindowFit.Apply(f, new Size(600, 400));   // sizable, with a minimum; opens no bigger than the screen's free area
         f.Show();   // not owned: the Othos window minimizes to the taskbar
+    }
+
+    // one row of the models list (see relayout in ShowModels): a group heading, or a tag + text (+ a button)
+    class ModelRow
+    {
+        public Label Header;
+        public bool Gap;
+        public Label TagLabel, Text;
+        public Button Button;
     }
 
     void StyleButton(Button b)
@@ -928,6 +998,7 @@ class MainForm : Form
         var b = new Button();
         b.Text = text;
         b.SetBounds(x, btnY, 130, 36);
+        b.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
         b.FlatStyle = FlatStyle.Flat;
         b.FlatAppearance.BorderColor = PurpleLine;
         b.FlatAppearance.MouseOverBackColor = PurpleHover;

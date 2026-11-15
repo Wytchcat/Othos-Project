@@ -51,7 +51,7 @@ livekit-plugins-openai==1.8.11
 livekit-plugins-rime==1.8.11
 livekit-plugins-silero==1.8.11
 livekit-plugins-turn-detector==1.8.11
-livekit-protocol==1.1.31
+livekit-protocol==1.1.32
 markdown-it-py==4.2.0
 MarkupSafe==3.0.4
 mdurl==0.1.2

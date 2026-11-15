@@ -2,8 +2,8 @@ param([switch]$Quiet)   # -Quiet: no pop-up at all (used by Othos.exe when its w
 $LogDir  = Join-Path $PSScriptRoot "logs"
 $pidFile = "$LogDir\pids.txt"
 
-Add-Type -AssemblyName PresentationFramework
-function Say($msg) { [System.Windows.MessageBox]::Show($msg, "Othos") | Out-Null }
+. "$PSScriptRoot\othos-box.ps1"   # Show-OthosBox: a message box in Othos's colours and logo
+function Say($msg) { Show-OthosBox $msg }
 
 if (-not (Test-Path $pidFile)) {
     if ($Quiet) { exit 0 }

@@ -28,7 +28,13 @@ if (Test-Path $venvPy) {
     if ($v -eq "3.12") { Ok ".venv uses Python 3.12" } else { Bad ".venv uses Python $v; Othos needs 3.12. Delete .venv and run setup.ps1." }
     & $venvPy -c "import livekit.agents" 2>$null
     if ($LASTEXITCODE -eq 0) { Ok "livekit-agents installed" } else { Bad "packages missing: .venv\Scripts\python.exe -m pip install -r requirements.txt" }
-} else { Bad "no .venv: run setup.ps1" }
+} else {
+    # no .venv yet: the usual cause on a new PC is a missing Python 3.12, so say so
+    $py312 = $false
+    if (Get-Command py -ErrorAction SilentlyContinue) { & py -3.12 --version *> $null; $py312 = ($LASTEXITCODE -eq 0) }
+    if ($py312) { Ok "Python 3.12 found (py launcher)"; Bad "no .venv: run setup.ps1" }
+    else { Bad "Python 3.12 not found: install 3.12.x from https://www.python.org/downloads/ (tick 'py launcher'), then run setup.ps1" }
+}
 foreach ($t in "node", "pnpm", "ollama") {
     if (Get-Command $t -ErrorAction SilentlyContinue) { Ok "$t found" } else { Bad "$t not found (setup.ps1 says where to get it)" }
 }
@@ -40,12 +46,16 @@ if (Test-Path "$Ui\node_modules") { Ok "Othos-ui packages installed" } else { Ba
 Head "Settings"
 $envPath = Join-Path $A ".env"
 $e = Read-Env $envPath
-if (-not (Test-Path $envPath)) { Bad ".env missing: copy .env.example to .env" }
 $speech = if ($e["OTHOS_SPEECH"]) { $e["OTHOS_SPEECH"].ToLower() } else { "cloud" }
-Info "speech: $speech"
-$need = @("LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET")
-if ($speech -eq "cloud") { $need += "DEEPGRAM_API_KEY", "RIME_API_KEY" } else { $need += "LOCAL_STT_URL", "LOCAL_TTS_URL" }
-foreach ($k in $need) { if ($e[$k]) { Ok "$k set" } else { Bad "$k is empty in .env" } }
+if (-not (Test-Path $envPath)) {
+    # one cause, one line: without .env every key below would be empty too
+    Bad ".env missing (so none of its keys are set): run setup.ps1, or copy .env.example to .env and fill it in"
+} else {
+    Info "speech: $speech"
+    $need = @("LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET")
+    if ($speech -eq "cloud") { $need += "DEEPGRAM_API_KEY", "RIME_API_KEY" } else { $need += "LOCAL_STT_URL", "LOCAL_TTS_URL" }
+    foreach ($k in $need) { if ($e[$k]) { Ok "$k set" } else { Bad "$k is empty in .env" } }
+}
 if ($e["TAVILY_API_KEY"]) { Ok "TAVILY_API_KEY set" } else { Info "TAVILY_API_KEY empty: web search off (free sources still work)" }
 if (-not $e["RAVELRY_KEY"] -and $e["RAVERLY_KEY"]) { $e["RAVELRY_KEY"] = $e["RAVERLY_KEY"] }  # old spelling, still accepted
 foreach ($k in "GUARDIAN_API_KEY", "NYT_API_KEY", "YOUTUBE_API_KEY", "RAVELRY_KEY", "TWITCH_CLIENT_ID") {
@@ -85,7 +95,7 @@ if ($uiEnv["LIVEKIT_URL"] -and $e["LIVEKIT_URL"] -and $uiEnv["LIVEKIT_URL"] -ne 
 }
 
 Head "Ports"
-$ports = [ordered]@{ "7880" = "LiveKit server"; "8081" = "agent"; "3000" = "call page"; "11434" = "Ollama"; "11436" = "the Smithy's Ollama (new build)" }
+$ports = [ordered]@{ "7880" = "LiveKit server"; "8081" = "agent"; "3000" = "call page"; "11434" = "Ollama"; "11436" = "The Smithy's Ollama (new build)" }
 if ($speech -eq "local") { $ports["8000"] = "local speech-to-text"; $ports["8880"] = "Kokoro voice" }
 $othosUp = Test-Path (Join-Path $A "logs\pids.txt")
 foreach ($key in @($ports.Keys)) {
