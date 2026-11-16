@@ -69,6 +69,7 @@ class Provider:
     note: str = ""
     alt_env: tuple = ()       # other names people often give the same key in .env
     account_env: str = ""     # a provider whose address holds an account ID (Cloudflare), from .env
+    base: str = ""            # a second key's row: the provider it's a second account with ("cerebras")
 
 
 PROVIDERS: dict[str, Provider] = {p.name: p for p in [
@@ -114,6 +115,28 @@ PROVIDERS: dict[str, Provider] = {p.name: p for p in [
              note="Puter's AI API: your Puter account's auth token (Dashboard, Account, API token). Usage is billed "
                   "to that account; it passes requests on to many model makers."),
 ]}
+
+
+# A second key for the same provider (Nov 16, the user: "I have a personal and a biz Cerebras acct"): its own row,
+# "cerebras-2", with its own key (CEREBRAS_API_KEY_2), On switch, place in the switch order, usage and daily cap,
+# so when one account's day is used up switching goes on to the other. Same address, model and free-allowance
+# figures as the first. Shown in the Providers window once "Add a 2nd key" is pressed (cloud.second_keys) or a key
+# for it is saved.
+def _second(p: Provider) -> Provider:
+    # every name the first key goes by, with _2 (Nov 16: hers is CEREBRAS_AI_KEY, so the second was CEREBRAS_AI_KEY_2)
+    return Provider(f"{p.name}-2", f"{p.spoken} (2nd key)", p.kind, p.base_url, f"{p.key_env}_2", p.model,
+                    alt_env=tuple(f"{a}_2" for a in p.alt_env), trains=p.trains, note=f"A second {p.spoken} account's key. Switching uses it like any other "
+                    f"provider, so it can go on when the first account's day is used up.",
+                    account_env=f"{p.account_env}_2" if p.account_env else "", base=p.name)
+
+
+PROVIDERS.update({s.name: s for s in [_second(p) for p in list(PROVIDERS.values()) if p.key_env and not p.local]})
+
+
+def model_for(cc: dict, p: Provider) -> str:
+    """The model set for this provider; a second key's row uses the first's when it has none of its own."""
+    models = cc.get("models") or {}
+    return str(models.get(p.name) or (models.get(p.base) if p.base else "") or p.model)
 
 
 def spoken_names() -> dict[str, str]:
@@ -193,12 +216,13 @@ def _int(v) -> int:
 
 def free_info(name: str) -> dict:
     """{"score", "free" (text), "live" (text or ""), "checked", "source", "stale"} for one provider."""
-    t = dict(FREE_TIERS.get(name) or {"score": 0, "free": "", "checked": "", "source": ""})
+    base = PROVIDERS[name].base if name in PROVIDERS else ""
+    t = dict(FREE_TIERS.get(name) or FREE_TIERS.get(base) or {"score": 0, "free": "", "checked": "", "source": ""})
     live = _live().get(name) or {}
     h = live.get("headers") or {}
     text = ""
     tday = _int(h.get("x-ratelimit-limit-tokens-day"))
-    rday = _int(h.get("x-ratelimit-limit-requests-day")) or (_int(h.get("x-ratelimit-limit-requests")) if name == "groq" else 0)
+    rday = _int(h.get("x-ratelimit-limit-requests-day")) or (_int(h.get("x-ratelimit-limit-requests")) if (base or name) == "groq" else 0)
     tmonth = _int(h.get("x-ratelimit-limit-tokens-month"))
     if tday:
         t["score"] = tday
@@ -210,11 +234,11 @@ def free_info(name: str) -> dict:
     elif rday:
         left = _int(h.get("x-ratelimit-remaining-requests-day") or h.get("x-ratelimit-remaining-requests"))
         text = f"{rday:,} requests a day" + (f" ({left:,} left at the last reply)" if left else "")
-    if name == "openrouter" and live.get("free_requests_limit"):
+    if (base or name) == "openrouter" and live.get("free_requests_limit"):
         lim = int(live["free_requests_limit"])
         t["score"] = lim * 1000
         text = f"{lim:,} free requests a day, {int(live.get('free_requests_used', 0)):,} used today"
-    if name == "huggingface" and "pro" in live:
+    if (base or name) == "huggingface" and "pro" in live:
         t["score"] = 100_000 if live["pro"] else 0
         text = "PRO: $2 of credit a month" if live["pro"] else "not PRO: nothing free"
     if text:
@@ -233,67 +257,75 @@ def refresh_free_limits(enabled=()) -> dict:
     """Re-check what can be checked for free (no test requests): OpenRouter's account page gives
     today's free requests; Hugging Face's says whether the account is PRO. Run when models are
     checked (Get models, the Models window) and by the Providers window's Refresh.
-    Only providers that are switched On (enabled) are contacted: with none On, nothing is sent."""
+    Only providers that are switched On (enabled) are contacted: with none On, nothing is sent.
+    A second key's row ("openrouter-2") is checked the same way, saved under its own name (Nov 16)."""
     keys, out = _keys(), {}
     on = {str(e).lower() for e in enabled}
-    p = PROVIDERS["openrouter"]
-    if "openrouter" in on and key_for(p, keys):
+
+    def each(base: str):                               # the provider and its second key, where On with a key
+        return [q for q in (PROVIDERS.get(base), PROVIDERS.get(f"{base}-2"))
+                if q is not None and q.name in on and key_for(q, keys)]
+
+    for p in each("openrouter"):
+        n = p.name
         try:
             r = httpx.get("https://openrouter.ai/api/v1/key", headers={"Authorization": f"Bearer {key_for(p, keys)}"}, timeout=20)
             d = (r.json() or {}).get("data") or {}
             fr = d.get("free_model_daily_requests") or {}
             if r.status_code in (200, 401, 403):
-                _save_live("openrouter", {"key_ok": r.status_code == 200})
+                _save_live(n, {"key_ok": r.status_code == 200})
             if r.status_code == 200 and d.get("expires_at"):
-                _save_live("openrouter", {"key_expires": str(d["expires_at"])})
+                _save_live(n, {"key_expires": str(d["expires_at"])})
             if r.status_code == 200 and fr:
-                _save_live("openrouter", {"free_requests_limit": fr.get("limit"), "free_requests_used": fr.get("used", 0)})
-                out["openrouter"] = "checked"
+                _save_live(n, {"free_requests_limit": fr.get("limit"), "free_requests_used": fr.get("used", 0)})
+                out[n] = "checked"
             else:
-                out["openrouter"] = f"no answer ({r.status_code})"
+                out[n] = f"no answer ({r.status_code})"
         except Exception as e:
-            out["openrouter"] = f"couldn't reach it ({type(e).__name__})"
-    p = PROVIDERS["huggingface"]
-    if "huggingface" in on and key_for(p, keys):
+            out[n] = f"couldn't reach it ({type(e).__name__})"
+    for p in each("huggingface"):
+        n = p.name
         try:
             r = httpx.get("https://huggingface.co/api/whoami-v2", headers={"Authorization": f"Bearer {key_for(p, keys)}"}, timeout=20)
             if r.status_code in (200, 401, 403):
-                _save_live("huggingface", {"key_ok": r.status_code == 200})
+                _save_live(n, {"key_ok": r.status_code == 200})
             if r.status_code == 200:
                 who = r.json() or {}
                 exp = (((who.get("auth") or {}).get("accessToken") or {}).get("expiration")
                        or ((who.get("auth") or {}).get("accessToken") or {}).get("expiresAt"))
-                _save_live("huggingface", {"pro": bool(who.get("isPro")), **({"key_expires": str(exp)} if exp else {})})
-                out["huggingface"] = "checked"
+                _save_live(n, {"pro": bool(who.get("isPro")), **({"key_expires": str(exp)} if exp else {})})
+                out[n] = "checked"
             else:
-                out["huggingface"] = f"no answer ({r.status_code})"
+                out[n] = f"no answer ({r.status_code})"
         except Exception as e:
-            out["huggingface"] = f"couldn't reach it ({type(e).__name__})"
-    p = PROVIDERS["vercel"]                           # its credits page: is the key accepted
-    if "vercel" in on and key_for(p, keys):
+            out[n] = f"couldn't reach it ({type(e).__name__})"
+    for p in each("vercel"):                           # its credits page: is the key accepted
+        n = p.name
         try:
             r = httpx.get("https://ai-gateway.vercel.sh/v1/credits", headers={"Authorization": f"Bearer {key_for(p, keys)}"},
                           timeout=20)
             if r.status_code in (200, 401, 403):
-                _save_live("vercel", {"key_ok": r.status_code == 200})
-            out["vercel"] = "checked" if r.status_code == 200 else f"no answer ({r.status_code})"
+                _save_live(n, {"key_ok": r.status_code == 200})
+            out[n] = "checked" if r.status_code == 200 else f"no answer ({r.status_code})"
         except Exception as e:
-            out["vercel"] = f"couldn't reach it ({type(e).__name__})"
-    p = PROVIDERS["cloudflare"]                       # an account token says when it expires
-    acc = str(keys.get(p.account_env) or "").strip().lower()
-    if "cloudflare" in on and key_for(p, keys) and re.fullmatch(r"[0-9a-f]{32}", acc):
+            out[n] = f"couldn't reach it ({type(e).__name__})"
+    for p in each("cloudflare"):                       # an account token says when it expires
+        n = p.name
+        acc = str(keys.get(p.account_env) or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{32}", acc):
+            continue
         try:
             r = httpx.get(f"https://api.cloudflare.com/client/v4/accounts/{acc}/tokens/verify",
                           headers={"Authorization": f"Bearer {key_for(p, keys)}"}, timeout=20)
             res = (r.json() or {}).get("result") or {}
             if r.status_code == 200 and res.get("status") == "active":
-                _save_live("cloudflare", {"key_expires": str(res.get("expires_on") or ""), "key_ok": True})
-                out["cloudflare"] = "checked"
+                _save_live(n, {"key_expires": str(res.get("expires_on") or ""), "key_ok": True})
+                out[n] = "checked"
             else:
-                _save_live("cloudflare", {"key_ok": False})
-                out["cloudflare"] = f"the token wasn't accepted ({r.status_code})"
+                _save_live(n, {"key_ok": False})
+                out[n] = f"the token wasn't accepted ({r.status_code})"
         except Exception as e:
-            out["cloudflare"] = f"couldn't reach it ({type(e).__name__})"
+            out[n] = f"couldn't reach it ({type(e).__name__})"
     return out
 
 
@@ -363,7 +395,7 @@ def command(argv: list[str], config_path: Path) -> bool:
     import worker_keys
     cmd = argv[1] if len(argv) > 1 else ""
     if cmd not in ("providers", "provider-set", "set-key", "del-key", "test-provider", "set-limits", "free-limits",
-                   "switch-sort"):
+                   "switch-sort", "add-second"):
         return False
     cfg = worker_shared.load_json(config_path)
     cc = cfg.setdefault("cloud", {"enabled": [], "default": "", "models": {}, "accept_data_use": [],
@@ -396,18 +428,25 @@ def command(argv: list[str], config_path: Path) -> bool:
         rows = []
         order = [str(x).lower() for x in cc.get("switch_order", [])]
         # local first, then the cloud by free allowance (most to least), then paid only
-        names = [n for n, p in PROVIDERS.items() if p.local] + ranked(n for n, p in PROVIDERS.items() if not p.local)
+        # a second key's row only once it's asked for or has a key, right under the first's
+        asked = {str(x).lower() for x in cc.get("second_keys", [])}
+        shown = {n for n, p in PROVIDERS.items() if p.base and (p.base in asked or key_for(p, store) or key_for(p, env))}
+        names = [n for n, p in PROVIDERS.items() if p.local] + ranked(n for n, p in PROVIDERS.items()
+                                                                       if not p.local and not p.base)
+        names = [x for n in names for x in [n] + [t for t in shown if PROVIDERS[t].base == n]]
         for p in (PROVIDERS[n] for n in names):
             fi = free_info(p.name)
             k = (key_for(p, store) or key_for(p, env)) if p.key_env else ""
+            twin = f"{p.name}-2"
             rows.append({"name": p.name, "label": p.spoken, "note": p.note,
                          "where": "local" if p.local else "proxy" if p.proxy else "cloud",
                          "trains": p.trains, "needs_key": bool(p.key_env), "key_env": p.key_env,
                          "key": worker_keys.last4(k), "key_from": "saved" if key_for(p, store) else ".env" if k else "",
                          "on": p.name in [str(e).lower() for e in cc.get("enabled", [])],
-                         "model": (cc.get("models") or {}).get(p.name, "") or p.model,
+                         "model": model_for(cc, p), "second_of": p.base,
+                         "can_add_second": twin in PROVIDERS and twin not in shown and bool(k),
                          "accepted": p.name in [str(e).lower() for e in cc.get("accept_data_use", [])],
-                         "key_page": KEY_PAGES.get(p.name, ""), "problem": _problem(cfg, p),
+                         "key_page": KEY_PAGES.get(p.base or p.name, ""), "problem": _problem(cfg, p),
                          "order": order.index(p.name) + 1 if p.name in order else 0,
                          "out": _out_until(p.name) > time.time(),
                          "free": fi.get("free", ""), "free_live": fi.get("live", ""), "free_checked": fi.get("checked", ""),
@@ -451,9 +490,24 @@ def command(argv: list[str], config_path: Path) -> bool:
         except ValueError as e:
             raise SystemExit(str(e))
         print("saved")
+    elif cmd == "add-second":                         # show a second key's row for this provider
+        p = named()
+        twin = PROVIDERS.get(f"{p.name}-2")
+        if p.base or twin is None:
+            raise SystemExit(f"{p.spoken} can't have a second key")
+        cc["second_keys"] = [x for x in cc.get("second_keys", []) if x != p.name] + [p.name]
+        save()
+        print("saved")
     elif cmd == "del-key":
         p = named()
         print("removed" if worker_keys.del_key(p.key_env) else "no saved key (a key in .env stays there)")
+        if p.base:                                    # a second key removed: its row goes, and it's off
+            cc["second_keys"] = [x for x in cc.get("second_keys", []) if x != p.base]
+            for k in ("enabled", "switch_order", "accept_data_use"):
+                cc[k] = [x for x in cc.get(k, []) if str(x).lower() != p.name]
+            if cc.get("default") == p.name:
+                cc["default"] = ""
+            save()
     elif cmd == "set-limits":
         try:
             cc["max_tokens_per_day"] = max(0, int(float(argv[2])))
@@ -464,7 +518,7 @@ def command(argv: list[str], config_path: Path) -> bool:
         print("saved")
     else:                                             # test-provider: one tiny request, nothing of the user's
         p = named()
-        model = (cc.get("models") or {}).get(p.name) or p.model
+        model = model_for(cc, p)
         key = key_for(p, _keys()) if p.key_env else ""
         if p.key_env and not key:
             print(f"No key saved for {p.spoken}.")
@@ -552,7 +606,7 @@ def pick(cfg: dict, raw_params: dict, task_type: str, local=None):
         raise ValueError(f"{p.spoken} isn't turned on (add it to cloud.enabled in the settings)")
     if task_type == "check" and not p.local and not cc.get("allow_check_task"):
         raise ValueError("the check task stays on this PC (it holds decompiled code); set cloud.allow_check_task to send it")
-    model = str(raw_params.get("model") or (cc.get("models") or {}).get(name) or p.model)
+    model = str(raw_params.get("model") or model_for(cc, p))
     if not model and not p.local:
         raise ValueError(f"no model set for {p.spoken}: type one in its model box (Providers…) or set cloud.models.{name}")
     if p.trains and name not in [str(e).lower() for e in cc.get("accept_data_use", [])]:
@@ -677,7 +731,9 @@ _SENT: dict[str, list] = {}                            # provider -> [(time, tok
 
 
 def pace_for(cc: dict, name: str) -> dict:
-    mine = dict(PACE.get(name, {}))
+    base = PROVIDERS[name].base if name in PROVIDERS else ""     # a second key: the same limits, its own minute
+    mine = dict(PACE.get(name) or PACE.get(base) or {})
+    mine.update(((cc or {}).get("pace") or {}).get(base) or {})
     mine.update(((cc or {}).get("pace") or {}).get(name) or {})
     return {k: int(mine[k]) for k in ("rpm", "tpm", "tpm_total") if int(mine.get(k) or 0) > 0}
 
@@ -1119,7 +1175,7 @@ class OpenAICompatible(_Base):
 
     def _chat(self, model: str, messages: list[dict], max_tokens: int, should_stop, schema: dict | None) -> str:
         headers = {"Authorization": f"Bearer {self.key}"} if self.key else {}
-        if self.p.name == "openrouter":
+        if (self.p.base or self.p.name) == "openrouter":
             headers["X-Title"] = "Othos"                # no personal details
         body = {"model": model, "messages": _clean(messages), "stream": True, "max_tokens": max_tokens,
                 "stream_options": {"include_usage": True}}

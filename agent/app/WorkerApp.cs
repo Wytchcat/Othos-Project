@@ -748,7 +748,17 @@ class ProvidersForm : Form
             line += 20;
         }
         string note = S(p, "note") + (trains ? " Its free tier may use what's sent for training." : "");
-        var n = AddLabel(body, note, 6, line, 690, trains ? Gold : Dim);
+        bool addSecond = B(p, "can_add_second");      // a second account's key (Nov 16: a personal and a business one)
+        var n = AddLabel(body, note, 6, line, addSecond ? 550 : 690, trains ? Gold : Dim);
+        if (addSecond)
+        {
+            var more = new LinkLabel(); more.Text = "Add a 2nd key"; more.LinkColor = more.ActiveLinkColor = more.VisitedLinkColor = Gold;
+            more.LinkBehavior = LinkBehavior.HoverUnderline; more.SetBounds(560, line, 136, 20);
+            more.TextAlign = ContentAlignment.TopRight; body.Controls.Add(more);
+            new ToolTip().SetToolTip(more, "A key from another " + label + " account: its own row, On switch, switch order and daily limit.");
+            more.Click += (s, e) => ThreadPool.QueueUserWorkItem(_ => { string r = FirestarterApp.Run("add-second " + name).Trim();
+                try { BeginInvoke((Action)(() => { if (r != "saved") ThemedBox.Show(this, r, Text); Reload(); })); } catch { } });
+        }
         int y2 = line + 24;
 
         var on = new CheckBox(); on.Text = "On"; on.ForeColor = Ink; on.SetBounds(6, y2 + 2, 50, 22);
@@ -773,7 +783,8 @@ class ProvidersForm : Form
                 ThreadPool.QueueUserWorkItem(_ => { string r = FirestarterApp.RunWithInput("set-key " + name, v);
                     try { BeginInvoke((Action)(() => { if (r != "saved") ThemedBox.Show(this, r, Text); Reload(); })); } catch { } });
             };
-            if (S(p, "key_from") == "saved")
+            // a second key's row with no key yet can be taken away too
+            if (S(p, "key_from") == "saved" || (S(p, "second_of") != "" && shown == ""))
             {
                 var del = MakeButton(body, "Remove", 464, y2 - 1, 62);
                 del.Click += (s, e) => ThreadPool.QueueUserWorkItem(_ => { FirestarterApp.Run("del-key " + name);

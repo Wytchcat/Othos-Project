@@ -1243,14 +1243,54 @@ def quote_shown(written: dict[str, str], where: str, quote: str, test: bool = Fa
         if test:
             try:
                 tree = ast.parse(body)
+                spans = [(n.lineno, n.end_lineno or n.lineno) for n in ast.walk(tree)
+                         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test")]
+                inside_test = any(a <= i + 1 <= b for i in at for a, b in spans)
             except SyntaxError:
-                continue
-            spans = [(n.lineno, n.end_lineno or n.lineno) for n in ast.walk(tree)
-                     if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test")]
-            if not any(a <= i + 1 <= b for i in at for a, b in spans):
+                # a test file that doesn't parse is a build problem of its own; its tests are still found by
+                # indentation (Nov 16, task 56: one broken line made all 18 checks read as missing)
+                inside_test = any(_in_test_by_indent(lines, i) for i in at)
+            if not inside_test:
                 continue
         return rel
     return ""
+
+
+def _breaks(rel: str, old: str, new: str) -> str:
+    """Why `new` no longer parses when `old` did ('' when it's fine, or old was broken too): Python and JSON."""
+    low = rel.lower()
+    if new == old or not (low.endswith(".py") or low.endswith(".json")):
+        return ""
+
+    def err(text: str) -> str:
+        try:
+            if low.endswith(".py"):
+                ast.parse(text)
+            else:
+                json.loads(text)
+            return ""
+        except SyntaxError as e:
+            return f"line {e.lineno}: {e.msg}"
+        except ValueError as e:
+            return str(e)[:120]
+    return "" if err(old) else err(new)
+
+
+def _in_test_by_indent(lines: list[str], i: int) -> bool:
+    """Line i sits inside a `def test...` (by indentation): for a test file that doesn't parse."""
+    ind = len(lines[i]) - len(lines[i].lstrip())
+    for j in range(i - 1, -1, -1):
+        s = lines[j].strip()
+        if not s:
+            continue
+        lead = len(lines[j]) - len(lines[j].lstrip())
+        if lead < ind:
+            if re.match(r"(?:async\s+)?def\s+test", s):
+                return True
+            if s.startswith(("def ", "async def ", "class ")) or lead == 0:
+                return False
+            ind = lead                                     # an if/with/for inside the function: keep going up
+    return False
 
 
 def _parse_proofs(reply: str) -> dict[str, tuple[str, str, str, str]]:
@@ -1373,6 +1413,14 @@ def _checklist(ctx, p: dict, desc: str, plan: dict, written: dict[str, str], ite
 
 
 
+def _item_files(items: dict[int, str], written: dict[str, str]) -> dict[int, list[str]]:
+    """The files each item names; an item with lettered checks is shown in the test files, so they count too
+    (Nov 16, task 56: test_academy.py was fixed, but items 3 and 4 only named their modules, so "missing" stuck)."""
+    code = [{"path": r} for r in written if not r.lower().endswith(".md")]
+    tests = {r for r in written if _is_test(r)}
+    return {n: sorted(set(_names(t, code, stems=True)) | (tests if sub_points(t) else set())) for n, t in items.items()}
+
+
 def _no_change_no_done(ticks: dict[int, tuple[str, str]], written: dict[str, str], path: Path | None,
                        files_of: dict[int, list[str]] | None = None) -> dict[int, tuple[str, str]]:
     """A check that says DONE for an item an earlier check found MISSING, with none of that item's files changed
@@ -1447,6 +1495,25 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
             notes.append(f"`{rel}`: no edits came back for a change the check found missing here"
                          + (f"; the file was then written whole ({whole})" if whole else "; kept as it was"))
             return
+        broke = _breaks(rel, written[rel], body)
+        if broke:
+            # edits that turn a file that parsed into one that doesn't aren't kept (Nov 16, task 56: the last
+            # round's edit replaced unittest.main() with new tests, leaving `if __name__ == ...:` empty, and the
+            # run ended on a syntax error); asked once more with the error, on the file as it was
+            steps.info("%s: the edits broke it (%s); asking again.", rel, broke)
+            try:
+                body, note = _edit_file(ctx, job_id, _edit_messages(
+                    p, desc, plan, rel, written, written[rel],
+                    what + f"\n\nYour last edits for this were NOT kept: they broke the file ({broke}). Send edits "
+                    "that keep it valid; never replace a line other code needs (such as unittest.main()).", cap),
+                    rel, written[rel], none_ok=True)
+            except ValueError:
+                body = written[rel]
+            again = _breaks(rel, written[rel], body)
+            if again:
+                notes.append(f"`{rel}`: its edits broke the file twice ({again}), so they weren't kept")
+                return
+            note += f" (the first edits broke the file: {broke}; asked again)"
         if body != written[rel]:
             inside(folder, rel).write_text(body, encoding="utf-8")
             written[rel] = body
@@ -1506,9 +1573,7 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
 
     def check() -> tuple[dict[int, tuple[str, str]], list[str], list[str]]:
         ticks = _checklist(ctx, p, desc, plan, written, items, cap, check_log) if use_list else {}
-        files_of = {n: sorted(_names(t, [{"path": r} for r in written if not r.lower().endswith(".md")], stems=True))
-                    for n, t in items.items()}
-        ticks = _no_change_no_done(ticks, written, found_path, files_of)
+        ticks = _no_change_no_done(ticks, written, found_path, _item_files(items, written))
         problems, checked = all_problems()
         return ticks, problems, checked
 
