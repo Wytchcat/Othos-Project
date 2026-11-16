@@ -23,3 +23,6 @@ Check the code guards: `.venv/Scripts/python.exe training/score.py`
 3. QLoRA on the 9B voice model, thinking off; merge, convert to GGUF, register in Ollama as `othos-voice`.
 4. Score the same test set, then listen in real calls. Keep the stock model as the fallback.
 5. Train only with gaming mode off (it shares the 16 GB of VRAM).
+
+## Never train on these
+- **Stack Overflow / Stack Exchange dumps.** Their download terms allow Stack Overflow to deny access if the data is used to train an LLM. Othos searches them (retrieval) and cites them; it never uses them as training data.

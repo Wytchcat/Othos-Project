@@ -1315,13 +1315,16 @@ def _parse_proofs(reply: str) -> dict[str, tuple[str, str, str, str]]:
 
 
 def _checklist(ctx, p: dict, desc: str, plan: dict, written: dict[str, str], items: dict[int, str],
-               cap: int, log_path: Path | None = None) -> dict[int, tuple[str, str]]:
+               cap: int, log_path: Path | None = None, keep_path: Path | None = None) -> dict[int, tuple[str, str]]:
     """{item number: ("DONE" | "MISSING" | "NOT SAID", note)} for the numbered changes, from the files as they are.
     Cite it or it's missing (Nov 16): each item and each of its lettered checks is its own line, and a DONE must
     quote the line that does it; the quote is looked for in the files (quote_shown), and a DONE whose quote isn't
     there counts as MISSING. An item is DONE only when it and all its checks are. A big checklist is asked one
     item at a time, naming that item's files and the test files, so the step's shrink keeps them whole (task 56:
-    the test file was never named, so the checker saw only its outline and ticked checks that weren't written)."""
+    the test file was never named, so the checker saw only its outline and ticked checks that weren't written).
+    `keep_path`: an item that was DONE keeps its quotes there; next time, if the item reads the same and every quote
+    is still in the files (looked up, no model), it isn't asked again (Nov 16: asking each of task 56's 4 items
+    every round cost about 80,000 tokens a round)."""
     code = [r for r in written if not r.lower().endswith(".md")]
     files = "\n\n".join(f"--- {path} ---\n{written[path][:cap]}" + ("\n(... cut here)" if len(written[path]) > cap
                                                                     else "") for path in code)
@@ -1361,10 +1364,30 @@ def _checklist(ctx, p: dict, desc: str, plan: dict, written: dict[str, str], ite
             reply += "\n\n--- asked again ---\n\n" + more
         return got, reply
 
-    whole = [{"role": "user", "content": files + "\n".join(items.values())}]
-    parts = ([{n: t} for n, t in items.items()] if len(items) > 1 and worker_cloud.prompt_tokens(whole)
-             > _SPLIT_CHECKLIST else [items])
+    try:
+        kept = json.loads(keep_path.read_text(encoding="utf-8")).get("done", {}) if keep_path else {}
+    except (OSError, ValueError, AttributeError):
+        kept = {}
+
+    def same(n: int) -> dict:
+        """The quotes an earlier check gave for item n, when the item reads the same and all are still shown."""
+        k = kept.get(str(n)) or {}
+        pr = k.get("proofs") or {}
+        if k.get("text") != hashlib.sha256(items[n].encode("utf-8")).hexdigest() \
+                or set(pr) != {str(n)} | {f"{n}{x}" for x in subs[n]}:
+            return {}
+        return pr if all(quote_shown(written, w, q, key != str(n)) for key, (w, q) in pr.items()) else {}
+
+    reused = {n: pr for n, pr in ((n, same(n)) for n in items) if pr}
+    asking = {n: t for n, t in items.items() if n not in reused}
+    whole = [{"role": "user", "content": files + "\n".join(asking.values())}]
+    parts = ([{n: t} for n, t in asking.items()] if len(asking) > 1 and worker_cloud.prompt_tokens(whole)
+             > _SPLIT_CHECKLIST else [asking] if asking else [])
     got, replies = {}, []
+    for n, pr in reused.items():
+        got.update({key: ("DONE", w, q, "") for key, (w, q) in pr.items()})
+        replies.append(f"{n}: DONE (not asked again: the same item, and its {len(pr)} quoted line"
+                       f"{'s are' if len(pr) != 1 else ' is'} still in the files)")
     for part in parts:
         g, r = ask(part)
         got.update({k: v for k, v in g.items() if k.rstrip("abcdefghijklmnopqrstuvwxyz").isdigit()
@@ -1403,6 +1426,14 @@ def _checklist(ctx, p: dict, desc: str, plan: dict, written: dict[str, str], ite
             why.append(f"{len(lacking)} of {len(subs[n])} checks not shown in a test{where}: " + "; ".join(lacking))
         out[n] = ("DONE", "") if state == "DONE" and not lacking else ("MISSING", "; ".join(why)[:900])
         shown.append(f"{n}: {out[n][0]}" + (f" - {out[n][1]}" if out[n][1] else ""))
+    if keep_path is not None:                           # what's DONE, with its quotes, for the next check
+        done = {str(n): {"text": hashlib.sha256(items[n].encode("utf-8")).hexdigest(),
+                         "proofs": {key: [got[key][1], got[key][2]] for key in [str(n)] + [f"{n}{x}" for x in subs[n]]}}
+                for n in items if out[n][0] == "DONE"}
+        try:
+            keep_path.write_text(json.dumps({"done": done}, indent=1), encoding="utf-8")
+        except OSError:
+            pass
     if log_path is not None:                            # kept for review: what the checklist said, each round
         with open(log_path, "a", encoding="utf-8") as fh:
             fh.write(f"=== checklist ({len(got)} lines read, {len(parts)} ask{'s' if len(parts) != 1 else ''}) "
@@ -1570,9 +1601,10 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
     check_log = SMITHY.results_dir / f"{job_id:05d}-checklist.txt" if job_id else None
 
     found_path = SMITHY.results_dir / f"{job_id:05d}-missing.json" if job_id else None
+    done_path = SMITHY.results_dir / f"{job_id:05d}-done.json" if job_id else None
 
     def check() -> tuple[dict[int, tuple[str, str]], list[str], list[str]]:
-        ticks = _checklist(ctx, p, desc, plan, written, items, cap, check_log) if use_list else {}
+        ticks = _checklist(ctx, p, desc, plan, written, items, cap, check_log, done_path) if use_list else {}
         ticks = _no_change_no_done(ticks, written, found_path, _item_files(items, written))
         problems, checked = all_problems()
         return ticks, problems, checked
@@ -2450,8 +2482,14 @@ def _set_own_limit(ctx, job_id: int, plan: dict, p: dict, budget: int, parent: d
     est, why = estimate_build_tokens(plan, p.get("request", ""), ctx.cfg, budget, parent_chars,
                                      len(numbered_items(p.get("change", ""))) if parent else 0)
     least = int(cc.get("max_tokens_per_task", 200_000))
-    most = max(least, int(cc.get("auto_task_tokens_max", 600_000)))
+    # each second key that's On adds another ceiling's worth (Nov 16, the user: a task stopped at 600,000 the
+    # minute her second Cerebras key came in, which "defeats the purpose of the second key completely")
+    extra = worker_cloud.second_keys_on(cc)
+    most = max(least, int(cc.get("auto_task_tokens_max", 600_000))) * (1 + len(extra))
     limit = min(max(est, least), most)
+    if extra:
+        why += f"; the ceiling times {1 + len(extra)} for the second key{'s' if len(extra) != 1 else ''} " \
+               f"({', '.join(worker_cloud.PROVIDERS[n].spoken for n in extra)})"
     note = ("" if est <= most else f"; the estimate was {est:,}, over the ceiling (auto_task_tokens_max)")
     worker_cloud.set_task_limit(limit, why)
     log.info("build %d: its own token limit: %d (estimated %d from %s)", job_id, limit, est, why)

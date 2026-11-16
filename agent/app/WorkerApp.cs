@@ -2040,6 +2040,10 @@ class SiteSetupForm : Form
         save.Click += (s, e) => Save();
         Style(cancel, "Cancel", 404, 598, 100);
         cancel.Click += (s, e) => Close();
+        // the docs of the extensions ticked (and saved) here, into the shared library (ext_docs.py; Nov 16)
+        var docs = new Button();
+        Style(docs, "Download docs\u2026", 182, 598, 160);
+        docs.Click += (s, e) => { using (var d = new DocsForm(site)) d.ShowDialog(this); };
         AddLabel("Loading\u2026", 16, 16, 480, Dim);
         ThreadPool.QueueUserWorkItem(_ =>
         {
@@ -2185,6 +2189,150 @@ class SiteSetupForm : Form
                 else { result.Text = "Not saved: " + (o == "" ? "try  worker.py setup-save  in PowerShell" : o); save.Enabled = true; }
             })); } catch { }
         });
+    }
+}
+
+// "Download docs" (the user, Nov 16): the official docs of the extensions saved in Site setup, into the
+// shared library on this PC (library\<site>\extensions\<name>, ext_docs.py), which Othos and Firestarter
+// both search. Only the ones she ticks here; public pages only, the site's own docs folder only.
+class DocsForm : Form
+{
+    static readonly Color Bg = Color.FromArgb(2, 7, 5), Ink = Color.FromArgb(200, 230, 210),
+        Dim = Color.FromArgb(120, 140, 130), Ember = FirestarterApp.Accent, Gold = Color.FromArgb(231, 195, 104),
+        PurpleFill = Color.FromArgb(14, 16, 25), PurpleLine = Color.FromArgb(64, 53, 105), PurpleHover = Color.FromArgb(25, 24, 43);
+    static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
+
+    readonly string site;
+    readonly Panel list = new Panel();
+    readonly Label status = new Label();
+    readonly Button go = new Button(), close = new Button();
+    readonly Dictionary<string, CheckBox> ticks = new Dictionary<string, CheckBox>();
+    readonly Dictionary<string, string> names = new Dictionary<string, string>();
+    Process job;
+    bool stopping;
+
+    public DocsForm(string site)
+    {
+        this.site = site;
+        Text = FirestarterApp.Name + ": download docs";
+        FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false;
+        StartPosition = FormStartPosition.CenterParent; ShowInTaskbar = false;
+        try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
+        BackColor = Bg; ForeColor = Ink; Font = new Font("Segoe UI", 10f);
+        ClientSize = new Size(500, 460);
+
+        var stripe = new Panel(); stripe.BackColor = Ember; stripe.SetBounds(0, 0, 6, 460); Controls.Add(stripe);
+        var head = new Label(); head.Text = "Download the docs of your extensions"; head.ForeColor = Ember;
+        head.Font = new Font("Segoe UI Semibold", 12f); head.SetBounds(22, 14, 460, 26); Controls.Add(head);
+        var why = new Label(); why.ForeColor = Dim; why.SetBounds(22, 42, 460, 84);
+        why.Text = "The makers' own documentation, kept on this PC so Othos and Firestarter can look things up " +
+                   "without the internet. Public pages only, one every 2 seconds. Copyrighted: for your own use, never shared. " +
+                   "These are the extensions saved in Site setup.";
+        Controls.Add(why);
+        list.SetBounds(22, 130, 460, 228); list.AutoScroll = true; list.BackColor = Bg; Controls.Add(list);
+        status.SetBounds(22, 364, 460, 46); status.ForeColor = Dim; Controls.Add(status);
+        Button(go, "Download", 22, 416, 150, true); go.Enabled = false; go.Click += (s, e) => Start();
+        Button(close, "Close", 382, 416, 100, false); close.Click += (s, e) => Close();
+        CancelButton = close;                               // Escape closes (and stops a download)
+        AutoAnchor.Fit(this, true);
+        LoadList();
+    }
+
+    void Button(Button b, string text, int x, int y, int w, bool main)
+    {
+        b.Text = text; b.SetBounds(x, y, w, 32); b.FlatStyle = FlatStyle.Flat;
+        b.FlatAppearance.BorderColor = main ? Ember : PurpleLine; b.FlatAppearance.MouseOverBackColor = PurpleHover;
+        b.BackColor = PurpleFill; b.ForeColor = Ink; Controls.Add(b);
+    }
+
+    static string S(Dictionary<string, object> d, string k)
+    { return d != null && d.ContainsKey(k) && d[k] != null ? Convert.ToString(d[k]) : ""; }
+
+    void LoadList()
+    {
+        status.Text = "Reading the list…";
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            System.Collections.ArrayList rows = null;
+            try { rows = Json.Deserialize<System.Collections.ArrayList>(FirestarterApp.RunScript("ext_docs.py list " + site)); } catch { }
+            try { BeginInvoke((Action)(() => Fill(rows))); } catch { }
+        });
+    }
+
+    void Fill(System.Collections.ArrayList rows)
+    {
+        list.Controls.Clear(); ticks.Clear();
+        if (rows == null) { status.ForeColor = Gold; status.Text = "Couldn't read the list (try  ext_docs.py list " + site + "  in PowerShell)."; return; }
+        if (rows.Count == 0) { status.ForeColor = Dim; status.Text = "No extensions with docs are saved in Site setup yet. Tick them there, Save, then come back."; return; }
+        int y = 0;
+        foreach (var o in rows)
+        {
+            var r = (Dictionary<string, object>)o;
+            string key = S(r, "key"); int pages = 0; int.TryParse(S(r, "pages"), out pages);
+            var t = new CheckBox(); t.AutoSize = true; t.ForeColor = Ink; t.Location = new Point(0, y);
+            t.Text = S(r, "name"); t.Checked = pages == 0;            // the ones not downloaded yet
+            t.CheckedChanged += (s, e) => go.Enabled = job == null && AnyTicked();
+            list.Controls.Add(t); ticks[key] = t; names[key] = S(r, "name");
+            var n = new Label(); n.AutoSize = true; n.ForeColor = Dim; n.Location = new Point(20, t.Bottom);
+            n.Text = pages == 0 ? "Not downloaded yet" : pages + " pages in the library (tick to fetch again)";
+            list.Controls.Add(n);
+            y = n.Bottom + 8;
+        }
+        status.ForeColor = Dim; status.Text = "Tick the ones you want, then Download.";
+        go.Enabled = AnyTicked();
+    }
+
+    bool AnyTicked() { foreach (var t in ticks.Values) if (t.Checked) return true; return false; }
+
+    void Start()
+    {
+        var keys = new List<string>();
+        foreach (var t in ticks) if (t.Value.Checked) keys.Add(t.Key);
+        go.Enabled = false; stopping = false;
+        foreach (var t in ticks.Values) t.Enabled = false;
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            var said = new List<string>();
+            foreach (var key in keys)
+            {
+                if (stopping) break;
+                string name = names[key], final = null; bool ok = false;
+                var p = FirestarterApp.Start("ext_docs.py fetch " + site + " " + key);
+                job = p;
+                string line;
+                while ((line = p.StandardOutput.ReadLine()) != null)
+                {
+                    Dictionary<string, object> ev = null;
+                    try { ev = Json.Deserialize<Dictionary<string, object>>(line); } catch { }
+                    if (ev == null) continue;
+                    string kind = S(ev, "event");
+                    if (kind == "progress") { string st = S(ev, "status"), done = S(ev, "done");
+                        try { BeginInvoke((Action)(() => { status.ForeColor = Dim; status.Text = name + ": " + done + " pages so far. " + st; })); } catch { } }
+                    else if (kind == "done") { ok = true; final = name + ": " + S(ev, "pages") + " pages" +
+                        (S(ev, "cut") == "True" ? " (the first ones; the docs are longer)" : "") +
+                        (S(ev, "blocked") != "" ? ". " + S(ev, "blocked") : ""); }
+                    else if (kind == "error") final = name + ": " + S(ev, "message");
+                }
+                p.WaitForExit();
+                said.Add(final ?? (name + ": stopped."));
+                if (!ok && stopping) break;
+            }
+            job = null;
+            try { BeginInvoke((Action)(() => {
+                status.ForeColor = Ember; status.Text = string.Join("  ", said.ToArray());
+                foreach (var t in ticks.Values) t.Enabled = true;
+                if (!stopping) LoadList(); else go.Enabled = AnyTicked();
+            })); } catch { }
+        });
+    }
+
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        stopping = true;
+        var p = job;
+        if (p != null && !p.HasExited)
+            try { var k = new ProcessStartInfo("taskkill", "/PID " + p.Id + " /T /F"); k.CreateNoWindow = true; k.UseShellExecute = false; Process.Start(k).WaitForExit(10000); } catch { }
+        base.OnFormClosing(e);
     }
 }
 #endif

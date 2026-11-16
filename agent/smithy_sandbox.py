@@ -56,6 +56,48 @@ def running() -> list[str]:
         return re.findall(r"[0-9a-f]{8}-[0-9a-f-]{27}", out, re.I)
 
 
+def _remember(path: Path, sid: str, add: bool) -> None:
+    """The Sandboxes The Smithy started, and which run of it (process id) started each: started.json."""
+    try:
+        d = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (OSError, ValueError):
+        d = {}
+    if add:
+        d[sid] = os.getpid()
+    else:
+        d.pop(sid, None)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(d), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _stop_leftovers(path: Path) -> list[str]:
+    """Stop the Sandboxes an earlier run of The Smithy started and never stopped (Nov 16: closed mid-test at 8:03,
+    its Sandbox kept running, and the next run's tests were skipped as "another Sandbox is running"). Only ones it
+    recorded, from another run; one this run is using, or any Sandbox it didn't start, is left alone."""
+    try:
+        d = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (OSError, ValueError):
+        return []
+    now = set(running())
+    stopped = []
+    for sid, pid in list(d.items()):
+        if sid in now and pid != os.getpid():
+            _wsb("stop", "--id", sid, timeout=120)
+            log.info("Sandbox %s was left running by an earlier run of The Smithy; stopped it", sid)
+            steps.info("A Sandbox left over from an earlier run was stopped, so the tests can run.")
+            stopped.append(sid)
+        if sid not in now or sid in stopped:
+            d.pop(sid, None)
+    try:
+        path.write_text(json.dumps(d), encoding="utf-8")
+    except OSError:
+        pass
+    return stopped
+
+
 def _signed_by_python(path: Path) -> bool:
     ps = ("$s = Get-AuthenticodeSignature -LiteralPath $env:SMITHY_PY; "
           "if ($s.Status -eq 'Valid' -and $s.SignerCertificate.Subject -match 'Python Software Foundation') "
@@ -108,6 +150,9 @@ def run_tests(job_id: int, folder: Path, rels: list[str], cfg: dict, results_dir
         return {"status": "off", "tests": {}, "output": {}, "why": "Sandbox test runs are off (sandbox_tests)"}
     if not tests:
         return {"status": "off", "tests": {}, "output": {}, "why": "the build has no test files"}
+    started_file = results_dir / "sandbox-runs" / "started.json"
+    if running():
+        _stop_leftovers(started_file)
     if running():
         return {"status": "busy", "tests": {t: "not run" for t in tests}, "output": {},
                 "why": "another Windows Sandbox is running (only one at a time)"}
@@ -137,6 +182,7 @@ def run_tests(job_id: int, folder: Path, rels: list[str], cfg: dict, results_dir
             return {"status": "unavailable", "tests": {t: "not run" for t in tests}, "output": {},
                     "why": "Windows Sandbox didn't start: " + out.strip()[:200]}
         sid = m.group(0)
+        _remember(started_file, sid, add=True)
         viewer = subprocess.Popen(["wsb", "connect", "--id", sid], creationflags=_NO_WINDOW)   # a signed-in session
         started, runner = False, None
         while time.monotonic() < limit and not started:
@@ -160,6 +206,7 @@ def run_tests(job_id: int, folder: Path, rels: list[str], cfg: dict, results_dir
     finally:
         if sid:
             _wsb("stop", "--id", sid, timeout=120)
+            _remember(started_file, sid, add=False)
         if viewer is not None:
             try:
                 viewer.kill()

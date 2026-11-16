@@ -133,6 +133,13 @@ def _second(p: Provider) -> Provider:
 PROVIDERS.update({s.name: s for s in [_second(p) for p in list(PROVIDERS.values()) if p.key_env and not p.local]})
 
 
+def second_keys_on(cc: dict) -> list[str]:
+    """The second keys that are On and have a key ("cerebras-2"): each is another account's day of room."""
+    on = {str(e).lower() for e in (cc or {}).get("enabled", [])}
+    keys = _keys() if on else {}
+    return [n for n, p in PROVIDERS.items() if p.base and n in on and key_for(p, keys)]
+
+
 def model_for(cc: dict, p: Provider) -> str:
     """The model set for this provider; a second key's row uses the first's when it has none of its own."""
     models = cc.get("models") or {}

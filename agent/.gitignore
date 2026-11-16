@@ -37,3 +37,6 @@ workers/
 # personal settings: name, town, feeds (copy the .example files to make them)
 personal.json
 profile.md
+
+# the local reference library (pages from the web and the person's own files; never committed, never in the public copy)
+library/
