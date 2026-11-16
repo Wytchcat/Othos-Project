@@ -1778,10 +1778,25 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
                     named = _failing_files(sandbox.get("full", {}).get(t, out), t, code, same) or \
                         [r for r in _imported_by(folder, t, code) if r not in same] or [t]
                     shown = _failing_test_code(folder / t, sandbox.get("full", {}).get(t, out))
+                    # what the change asks for, where it names these files or has lettered checks, so a test that
+                    # disagrees with the request can be put right instead of the code being bent to it (Nov 16,
+                    # task 56: the test's made-up README had 2 glossary terms where check (a) says three, and the
+                    # fix made the lesson give 10 entries); the test file goes first, then the code
+                    asked = [items[n] for n in items if sub_points(items[n])
+                             or _names(items[n], [{"path": r} for r in named], stems=True)][:3]
+                    wanted = ("\n\nWhat the change asks for (the request; it decides who's right):\n\n"
+                              + "\n\n".join(asked)) if asked else ""
+                    named = ([t] if t in named else []) + [r for r in named if r != t]
                     for rel in named[:4]:
+                        how = ("If a failing test's setup or the value it expects doesn't match what the change asks "
+                               "for, correct the test to match the change (never to match the code, and never by "
+                               "removing a check the change asks for). If the test is right, change nothing here."
+                               if rel == t else
+                               "Fix the cause in this file, so it does what the change asks for. Don't weaken or "
+                               "remove the test, and don't bend the code to a test that disagrees with the change.")
                         fix(rel, f"{t} failed when it was run (in a throwaway Sandbox). Its last lines:\n{out}\n\n"
                                  + (f"The failing tests, as written in {t}:\n```python\n{shown}\n```\n\n" if shown else "")
-                                 + "Fix the cause in this file. Don't weaken or remove the test.")
+                                 + how + wanted)
                 if all((folder / r).exists() and (folder / r).read_bytes() == b for r, b in before.items()):
                     steps.info("No fix changed a file, so the last test run stands (not run again).")
                     break                    # task 55: a 10-minute Sandbox run again on the same files

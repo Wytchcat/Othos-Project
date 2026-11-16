@@ -6,8 +6,11 @@ like "python/3.12"), and optionally a page cap, an exact scope, a licence and a 
 shows what will be fetched and asks first; crawl() refuses to run unless the call says approved=True.
 
 Rules:
-- public pages only: no keys, no logins, no cookies; https only; the start page's own site and docs folder only
-- robots.txt is followed (and its crawl delay); at most one page every 2 seconds; a page cap per call
+- public pages only: no keys, no logins, no cookies (none kept or sent back); https only; the start page's own
+  site and docs folder only; never this PC or the home network (localhost, private addresses)
+- redirects are followed one hop at a time, each checked like a new page (https, same site, robots.txt)
+- robots.txt is followed (and its crawl delay, up to 30 s); a robots.txt that answers 401/403/5xx means "not
+  allowed" and stops it; at most one page every 2 seconds; a page cap per call; pages over 3 MB aren't read
 - a site that answers "busy" or puts up a robot check (202/403/429/503) is left alone, never worked around: the
   result says to read it in the browser
 - text pages only: PDFs, archives and pictures are skipped (nothing is downloaded as a file, nothing is run).
@@ -17,10 +20,13 @@ Rules:
 
 Progress is printed as one JSON line per event ({"event": "progress", "done", "total", "status"}), like model_fetch.
 """
+import hashlib
+import ipaddress
 import json
 import re
-import urllib.robotparser
+import socket
 import time
+import urllib.robotparser
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
@@ -34,6 +40,9 @@ MAX_BYTES = 3_000_000          # a single page bigger than this is skipped
 DELAY = 2.0                    # seconds between pages (more if robots.txt asks)
 MIN_TEXT = 200                 # a page with less text than this (an empty script-built page) is skipped
 BLOCKED = {202, 403, 429, 503}
+REDIRECT = {301, 302, 303, 307, 308}
+MAX_HOPS = 5                   # redirects followed per page, each one checked
+MAX_WAIT = 30.0                # a robots.txt asking for longer than this between pages: stop and say so
 SKIP_EXT = re.compile(r"\.(pdf|zip|gz|tgz|rar|7z|exe|msi|dmg|png|jpe?g|gif|webp|svg|ico|mp4|mp3|webm|css|js|json|xml|txt)$", re.I)
 
 
@@ -183,17 +192,140 @@ def to_markdown(html: str) -> dict:
     return {"title": title, "text": text, "links": t.links, "licence": licence}
 
 
-# ---------------------------------------------------------------- the crawl
-def _robots(client: httpx.Client, host: str) -> urllib.robotparser.RobotFileParser:
-    rp = urllib.robotparser.RobotFileParser()
+# ---------------------------------------------------------------- one page, safely
+class _Stop(Exception):
+    """The whole crawl stops here; the message is for the person."""
+
+
+def _bad_ip(ip) -> bool:
+    return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+
+
+def private_host(host: str, resolve: bool = True) -> bool:
+    """This PC, the home network or another internal address: never fetched, whatever a page links or redirects to."""
+    h = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+    h = h.strip("[]").lower().rstrip(".")
+    if h == "localhost" or h.endswith((".localhost", ".local", ".internal", ".lan", ".home.arpa")):
+        return True
     try:
-        r = client.get(f"https://{host}/robots.txt")
-        rp.parse(r.text.splitlines() if r.status_code == 200 else [])
-    except httpx.HTTPError:
-        rp.parse([])
-    return rp
+        return _bad_ip(ipaddress.ip_address(h))
+    except ValueError:
+        pass
+    if not resolve:
+        return False
+    try:
+        infos = socket.getaddrinfo(h, 443, proto=socket.IPPROTO_TCP)
+    except OSError:
+        return False                    # unknown name: the request fails on its own
+    return any(_bad_ip(ipaddress.ip_address(i[4][0].split("%")[0])) for i in infos)
 
 
+class _Fetcher:
+    """GETs with no cookies kept, redirects followed by hand (each hop https, an allowed host, not internal, and
+    allowed by that host's robots.txt), and a page read only up to MAX_BYTES."""
+
+    def __init__(self, client: httpx.Client, resolve: bool):
+        self.client, self.resolve, self.robots = client, resolve, {}
+
+    def _open(self, url: str):
+        self.client.cookies.clear()                  # no cookies, ever: nothing a site sets is sent back
+        return self.client.stream("GET", url, follow_redirects=False)   # each hop is checked here, by hand
+
+    def robots_for(self, host: str) -> urllib.robotparser.RobotFileParser:
+        if host in self.robots:
+            return self.robots[host]
+        url, why = f"https://{host}/robots.txt", ""
+        rp = urllib.robotparser.RobotFileParser()
+        for _ in range(MAX_HOPS + 1):
+            u = urlsplit(url)
+            if u.scheme != "https" or private_host(u.netloc, self.resolve):
+                why = "sends its robots.txt somewhere unsafe"
+                break
+            try:
+                with self._open(url) as r:
+                    loc = r.headers.get("location")
+                    if r.status_code in REDIRECT and loc:
+                        url = urljoin(url, loc)
+                        continue
+                    if r.status_code == 200:
+                        body = b""
+                        for chunk in r.iter_bytes():
+                            body += chunk
+                            if len(body) > 500_000:
+                                break
+                        rp.parse(body.decode("utf-8", errors="replace").splitlines())
+                    elif r.status_code in (404, 410):
+                        rp.parse([])                 # no robots file: everything allowed
+                    else:                            # 401/403: not allowed; 5xx and the rest: not now
+                        why = f"answered {r.status_code} for its robots.txt"
+            except httpx.HTTPError as ex:
+                why = f"couldn't be asked for its robots.txt ({type(ex).__name__})"
+            break
+        else:
+            why = "redirected its robots.txt too many times"
+        self.client.cookies.clear()
+        if why:
+            raise _Stop(f"{host} {why}, so its docs weren't downloaded. Read them in your browser.")
+        self.robots[host] = rp
+        return rp
+
+    def get(self, url: str, hosts: set, new_host_once: bool = False) -> dict:
+        """{"url", "status", "type", "text", "skip"}: skip says why a page wasn't read (text is None then)."""
+        for _ in range(MAX_HOPS + 1):
+            u = urlsplit(url)
+            host = u.netloc.lower()
+            if u.scheme != "https":
+                return {"url": url, "skip": "not https"}
+            if host not in hosts:
+                if not new_host_once:
+                    return {"url": url, "skip": "another site"}
+                new_host_once = False                # the start page may move to its docs site, once
+                hosts.add(host)
+            if private_host(host, self.resolve):
+                return {"url": url, "skip": "an internal address"}
+            if not self.robots_for(host).can_fetch(UA, url):
+                return {"url": url, "skip": "robots.txt"}
+            try:
+                with self._open(url) as r:
+                    loc = r.headers.get("location")
+                    if r.status_code in REDIRECT and loc:
+                        url = urljoin(url, loc)
+                        continue
+                    out = {"url": url, "status": r.status_code, "type": r.headers.get("content-type", ""),
+                           "text": None, "skip": ""}
+                    if r.status_code != 200:
+                        return out
+                    if int(r.headers.get("content-length") or 0) > MAX_BYTES:
+                        return {**out, "skip": "too big"}
+                    body = bytearray()
+                    for chunk in r.iter_bytes():
+                        body += chunk
+                        if len(body) > MAX_BYTES:
+                            return {**out, "skip": "too big"}
+                    out["text"] = bytes(body).decode(r.encoding or "utf-8", errors="replace")
+                    return out
+            finally:
+                self.client.cookies.clear()
+        return {"url": url, "skip": "too many redirects"}
+
+
+def _free_slug(source: str, slug: str, url: str, used: dict) -> str:
+    """A page name not already taken by another page ("a/b" and "a-b" both make "a-b")."""
+    def taken(s):
+        if used.get(s, url) != url:
+            return True
+        path = library.LIBRARY / source / (s + ".md")
+        if path.exists():
+            meta, _ = library.parse_page(path)
+            return meta.get("url", url) not in ("", url)
+        return False
+    if taken(slug):
+        slug = slug[:73].rstrip("-.") + "-" + hashlib.sha1(url.encode()).hexdigest()[:6]
+    used[slug] = url
+    return slug
+
+
+# ---------------------------------------------------------------- the crawl
 def crawl(start_urls: list[str], source: str, *, approved: bool, max_pages: int = MAX_PAGES, scope: str | None = None,
           licence: str | None = None, version: str = "", delay: float = DELAY,
           client: httpx.Client | None = None) -> dict:
@@ -206,22 +338,23 @@ def crawl(start_urls: list[str], source: str, *, approved: bool, max_pages: int 
         raise PermissionError("not approved: the caller's window must ask first")
     if not start_urls:
         raise ValueError("no start page")
+    own = client is None
     for start in start_urls:
         if urlsplit(start).scheme != "https":
             raise ValueError(f"not an https address: {start}")
+        if private_host(urlsplit(start).netloc, resolve=own):
+            raise ValueError(f"an internal address, never fetched: {start}")
     source = library.clean_source(source)
     max_pages = max(1, int(max_pages))
-    own = client is None
     client = client or httpx.Client(headers={"User-Agent": UA}, timeout=httpx.Timeout(30, read=60),
-                                    follow_redirects=True)
-    saved, skipped, blocked, cut = 0, 0, "", False
+                                    follow_redirects=False)
+    fetcher = _Fetcher(client, resolve=own)
+    saved, skipped, blocked, cut, used = 0, 0, "", False, {}
     try:
         for start in start_urls:
-            host = urlsplit(start).netloc.lower()
-            rp = _robots(client, host)
-            wait = max(delay, float(rp.crawl_delay(UA) or 0))
+            hosts = {urlsplit(start).netloc.lower()}
             queue, seen = [start], set()
-            here, start_path, first = scope or "", "", True
+            here, start_path, first, wait, host = scope or "", "", True, delay, ""
             while queue:
                 if saved >= max_pages:
                     cut = True
@@ -230,39 +363,48 @@ def crawl(start_urls: list[str], source: str, *, approved: bool, max_pages: int 
                 if url in seen:
                     continue
                 seen.add(url)
-                if not rp.can_fetch(UA, url):
-                    skipped += 1
-                    continue
                 emit(event="progress", done=saved, total=max_pages, status=f"Reading {url}")
                 try:
-                    r = client.get(url)
+                    r = fetcher.get(url, hosts, new_host_once=first)
                 except httpx.HTTPError as ex:
                     skipped += 1
                     emit(event="progress", done=saved, total=max_pages, status=f"Skipped {url}: {type(ex).__name__}")
                     continue
-                if r.status_code in BLOCKED:
+                if r.get("status") in BLOCKED:
+                    where = urlsplit(r["url"]).netloc
                     if first:              # the start page itself: the site doesn't let programs read it
-                        blocked = (f"{host} answered {r.status_code} (busy or a robot check), so its docs weren't "
+                        blocked = (f"{where} answered {r['status']} (busy or a robot check), so its docs weren't "
                                    f"downloaded. Read them in your browser: {start}")
                     else:
-                        blocked = f"{host} answered {r.status_code} part way through; stopped there, as asked."
+                        blocked = f"{where} answered {r['status']} part way through; stopped there, as asked."
                     break
-                final = normal(str(r.url))
+                final = normal(r["url"])
                 if final != url and final in seen:          # a redirect to a page already read
                     continue
                 seen.add(final)
                 if first:
+                    if r["skip"] or r.get("status") != 200:
+                        skipped += 1
+                        emit(event="progress", done=saved, total=max_pages,
+                             status=f"The start page couldn't be read ({r['skip'] or r.get('status')}): {start}")
+                        break
                     first = False
                     here = here or scope_of(start, final)
                     start_path = urlsplit(final).path or "/"
                     host = urlsplit(final).netloc.lower()
-                if r.status_code != 200 or "html" not in r.headers.get("content-type", "") \
-                        or len(r.content) > MAX_BYTES or not in_scope(final, host, here, start_path):
+                    asked = float(fetcher.robots_for(host).crawl_delay(UA) or 0)
+                    if asked > MAX_WAIT:
+                        blocked = (f"{host} asks programs to wait {asked:g} seconds between pages, too slow to "
+                                   f"download its docs. Read them in your browser: {start}")
+                        break
+                    wait = max(delay, asked)
+                if r["skip"] or r.get("status") != 200 or "html" not in r.get("type", "") \
+                        or not in_scope(final, host, here, start_path):
                     skipped += 1
                     continue
-                page = to_markdown(r.text)
+                page = to_markdown(r["text"])
                 if len(page["text"]) >= MIN_TEXT:
-                    slug = slug_of(final, here)
+                    slug = _free_slug(source, slug_of(final, here), final, used)
                     library.add_page(source, slug, page["title"] or slug, final, page["text"],
                                      licence=licence or page["licence"], version=version)
                     saved += 1
@@ -275,6 +417,8 @@ def crawl(start_urls: list[str], source: str, *, approved: bool, max_pages: int 
                 time.sleep(wait)
             if blocked:
                 break
+    except _Stop as stop:
+        blocked = str(stop)
     finally:
         if own:
             client.close()
