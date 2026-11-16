@@ -10,7 +10,7 @@ import ssl
 import threading
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -41,6 +41,9 @@ from tavily import AsyncTavilyClient
 
 import gaming  # gaming mode: gaming.py + gaming.json
 from workers_voice import WorkersVoice  # Firestarter (site work) and the Smithy (coding) by voice
+import workers_voice  # (its INSTALLED list, for the self-check)
+import selfcheck  # the quiet self-check behind "How are you?"
+import searchctx  # searches keep the topic and the user's town: searchctx.py
 import sources  # free sources tried before Tavily: sources.py
 import personal  # the user's name, town, feeds and respellings: personal.json
 
@@ -1175,6 +1178,9 @@ def _news_query(text: str) -> tuple[str, str] | None:
                  r"\b(?:computer arts|wired)\b[^.?!]*\b(?:new|latest)\b", text, re.I):
         # "What's new in Computer Arts?" / "Anything new on Wired?": that magazine's feed
         return ("design news", "design") if re.search(r"computer arts", text, re.I) else ("tech news", "tech")
+    for label, rx in sources.TOPIC_ASKS.items():   # gardening / recipes / books / movies and TV: the built-in feeds
+        if rx.search(text):
+            return sources.TOPIC_QUERY[label], label
     if re.search(r"\b(?:most (?:popular|read|viewed|shared)|what(?:'s| are| is)? (?:people|everyone) reading|"
                  r"trending (?:stories|articles|news))\b", text, re.I):
         return "most popular", "popular"  # NYT Most Popular
@@ -1651,6 +1657,8 @@ def _tool_names_for(text: str, has_results: bool) -> set[str]:
         # "Any free crochet hat patterns?", "Are there any good OBS tutorials?", "Have there
         # been any Joomla security updates?": the user's topics, answered from the free sources first
         names.add("web_search")
+    if searchctx.says_near_me(text) and not _ABOUT_OTHOS.search(plain):
+        names.add("web_search")  # "Where's a butcher near me?", "Find me a coffee shop nearby": found by the contraction
     if has_results and _ASKS_MORE.search(text):
         names |= {"more_results", "web_search"}
     return names
@@ -1828,6 +1836,7 @@ WEATHER_LOCATION = personal.weather_location()  # personal.json, or OTHOS_WEATHE
 # Where the user lives: OTHOS_HOME_LOCATION, or else the weather town. Kept on the laptop:
 # it goes into Othos's instructions (local model) and the weather search only.
 HOME_LOCATION = personal.home_location()
+BRAVE_ALL = os.getenv("OTHOS_BRAVE", "").strip().lower() == "all"   # every web search tries Brave first
 _STATE_NAMES = {"WA": "Washington", "MO": "Missouri", "OR": "Oregon", "ID": "Idaho", "CA": "California", "MT": "Montana",
                 "AK": "Alaska", "NV": "Nevada", "AZ": "Arizona", "UT": "Utah", "CO": "Colorado", "TX": "Texas",
                 "NY": "New York", "FL": "Florida", "BC": "British Columbia"}
@@ -1954,6 +1963,113 @@ _WEATHER_LATER = re.compile(r"\b(?:tomorrow|tonight|later|this (?:weekend|week|a
                             r"forecast|will it|going to|gonna|monday|tuesday|wednesday|thursday|friday|"
                             r"saturday|sunday)\b", re.I)
 _PLACE_NAMED = re.compile(r"\b(?:in|at|for|near)\s+(?:[A-Z][\w'.-]+)", re.U)
+
+
+# ---------------------------------------------------------------- earthquakes, air quality, smoke (by code)
+_ASKS_QUAKE = re.compile(r"\b(?:earthquakes?|quakes?|tremors?|aftershocks?|seismic)\b", re.I)
+_QUAKE_NOW = re.compile(r"\b(?:just|now|felt|was that|right now|minutes? ago|moment ago|shaking)\b", re.I)
+_ASKS_AIR = re.compile(
+    r"\b(?:air quality|aqi|air pollution|wildfire smoke|(?:any|is there|is there any) (?:wildfire )?smoke|"
+    r"smoke (?:outside|today|in the air|out there|nearby|near me)|smoky (?:out|outside|today)|"
+    r"how(?:'s| is) the air|is the air|(?:the )?air (?:outside|today)|wildfires? (?:smoke|nearby|near me))\b", re.I)
+
+
+def _units(km: float) -> str:
+    us = bool(re.search(r"\b(?:US|USA)\s*$", HOME_LOCATION or "")) or not HOME_LOCATION
+    d = km * 0.621371 if us else km
+    unit = "mile" if us else "kilometer"
+    d = round(d) if d >= 10 else round(d, 1)
+    return f"{d:g} {unit}{'' if d == 1 else 's'}"
+
+
+def _hours_ago(hours: float) -> str:
+    if hours < 1:
+        m = max(1, round(hours * 60))
+        return f"{m} minute{'' if m == 1 else 's'} ago"
+    h = round(hours)
+    return f"about {h} hour{'' if h == 1 else 's'} ago"
+
+
+async def _quake_reply(user: str) -> str | None:
+    """'Any earthquakes?', 'Was that an earthquake?': USGS's feed, the distances worked out here (nothing sent)."""
+    ll = sources._latlon()
+    if not ll:
+        return None
+    just = bool(_QUAKE_NOW.search(user))
+    week = bool(re.search(r"\b(?:this|past|last) week\b", user, re.I))
+    hours, feed, radius = (2, "all_day", 161) if just else (168, "2.5_week", 300) if week else (24, "all_day", 161)
+    qs = await sources.usgs_quakes(ll[0], ll[1], radius, hours, feed)
+    span = "in the last two hours" if just else "in the past week (magnitude 2.5 and up)" if week else "in the last day"
+    near = _units(radius)
+    if qs is None:
+        return "I couldn't reach the U.S. Geological Survey's earthquake feed just now."
+    if not qs:
+        extra = " Small or very recent ones can take a few minutes to show up." if just else ""
+        return f"The U.S. Geological Survey shows no earthquakes within {near} {span}.{extra}"
+
+    def one(q: dict) -> str:
+        return (f"a magnitude {q['mag']:.1f}, about {_units(q['km'])} to the {q['dir']}, near {q['town']}, "
+                f"{_hours_ago(q['age_h'])}")
+    big, close = max(qs, key=lambda q: q["mag"]), min(qs, key=lambda q: q["km"])
+    n = len(qs)
+    if just:
+        text = f"Yes. The U.S. Geological Survey lists {one(qs[0])}."
+        if n > 1:
+            text += f" That's {n} within {near} {span}."
+    else:
+        text = (f"The U.S. Geological Survey lists {n} earthquake{'' if n == 1 else 's'} within {near} {span}. "
+                f"The biggest was {one(big)}.")
+        if close is not big:
+            text += f" The closest was {one(close)}."
+    if any(q["tsunami"] for q in qs):
+        text += " One of them carries a tsunami flag, so check the tsunami warning center."
+    return text
+
+
+async def _air_reply(user: str) -> str | None:
+    """'How's the air?', 'Any wildfire smoke?': AirNow's reading, NOAA's satellite smoke map (checked here) and any
+    smoke or air-quality alert from the NWS."""
+    ll = sources._latlon()
+    if not ll:
+        return None
+    aq, smoke, alerts = await asyncio.gather(
+        sources.airnow_current(ll[0], ll[1]), sources.smoke_map(ll[0], ll[1]), sources.nws_alerts(),
+        return_exceptions=True)
+    aq = None if isinstance(aq, Exception) else aq
+    smoke = None if isinstance(smoke, Exception) else smoke
+    alerts = [] if isinstance(alerts, Exception) else alerts
+    parts = []
+    if aq:
+        best = max(aq, key=lambda o: o.get("AQI") or 0)
+        what = {"PM2.5": "fine particles, which is what smoke is made of", "PM10": "coarse dust", "O3": "ozone"}.get(
+            best.get("ParameterName"), best.get("ParameterName") or "")
+        cat_name = (best.get("Category") or {}).get("Name", "unrated").lower()
+        mainly = "" if cat_name == "good" else f", mainly {what}"   # nothing to explain when the air is good
+        where = ", ".join(x for x in (best.get("ReportingArea"), best.get("StateCode")) if x)
+        hr = best.get("HourObserved")
+        when = f" at {hr % 12 or 12} {'AM' if hr < 12 else 'PM'}" if isinstance(hr, int) else ""
+        parts.append(f"The air quality index is {best.get('AQI')}, which AirNow calls {cat_name}{mainly}, "
+                     f"reported for {where}{when}. It's preliminary data.")
+    elif aq == []:
+        parts.append("AirNow has no reporting area within 50 miles of you right now.")
+    elif aq is None:
+        parts.append("I couldn't reach AirNow just now.")
+    if smoke:
+        stamp = ""
+        if smoke["date"] and smoke["date"] != datetime.now(timezone.utc).strftime("%Y%m%d"):
+            d = datetime.strptime(smoke["date"], "%Y%m%d")
+            stamp = f" (the latest map is from {d.strftime('%B')} {d.day})"
+        if smoke["overhead"]:
+            parts.append(f"NOAA's satellite smoke map shows {smoke['overhead'].lower()} smoke overhead{stamp}.")
+        elif smoke["nearest_km"] is not None and smoke["nearest_km"] < 322:
+            parts.append(f"NOAA's satellite smoke map shows no smoke overhead; the closest is about "
+                         f"{_units(smoke['nearest_km'])} away{stamp}.")
+        else:
+            parts.append(f"NOAA's satellite smoke map shows no smoke within {_units(322)}{stamp}.")
+    bad = [a for a in alerts if re.search(r"smoke|air quality", a, re.I)]
+    if bad:
+        parts.append("The National Weather Service has an alert: " + bad[0].split(" issued ")[0] + ".")
+    return " ".join(parts) if parts else "I couldn't reach the air quality sources just now."
 
 
 async def _forecast_reply(user: str) -> str | None:
@@ -2234,10 +2350,12 @@ class Assistant(Agent):
         self._story = None       # the story last talked about, for "where's that from?"
         self._followup_query = ""  # a question about one story, to search
         self._user_text = ""     # what the user said this turn (tools can't see it)
+        self._recent_user: list[str] = []  # their last few earlier turns (a search borrows the topic from them)
         self._verbatim = False   # the last tool output is ready to speak as-is
         self._say_first = ""     # spoken before the model's answer to a search
         self._force_web = False  # next web_search skips the free sources ("yes, search the web")
         self._offered_web = ""   # the query a Q and A answer offered to search the web for
+        self._brave_next = False  # the next web search goes to Brave (reviews, after an OpenStreetMap list)
         self._twitch_turns = 0   # Twitch was mentioned this recently (turns left)
         self._allowed = set()    # tools the gate allowed this turn
         self._looking = False    # a look is in progress (one at a time)
@@ -2281,6 +2399,8 @@ class Assistant(Agent):
             # the start of Ollama's prompt, so it re-reads the whole call (up to 28 s)
             self._allowed = set()
             return []
+        if self._user_text:
+            self._recent_user = (self._recent_user + [self._user_text])[-4:]
         self._user_text = _as_othos(last.text_content or "")  # the chosen name reads as "Othos" here
         allowed = _tool_names_for(self._user_text, has_results=bool(self._results))
         if self._recent_pic() and _LOOK_FOLLOWUP.search(self._user_text) \
@@ -2315,6 +2435,24 @@ class Assistant(Agent):
                                   conn_options=self.session.conn_options.llm_conn_options, **kwargs) as stream:
             async for chunk in stream:
                 yield chunk
+
+    async def _self_check_reply(self, user_text: str) -> str:
+        """The quiet self-check behind "How are you?": looks at this PC and the call, nothing spoken
+        until the answer is ready, and words it from templates (selfcheck.py)."""
+        workers = []
+        for q in workers_voice.INSTALLED:
+            try:
+                workers.append({"name": q.name, "running": q.running(),
+                                "working": q.read_status().get("state") == "working"})
+            except Exception:
+                pass
+        g = self._gaming
+        facts = await asyncio.to_thread(
+            selfcheck.gather, _OLLAMA_ROOT, os.getenv("OLLAMA_MODEL", "llama3.2:3b"),
+            workers=workers, gaming=bool(g and g.mode.on), camera=bool(_camera_publication()))
+        reply = selfcheck.describe(facts, user_text)
+        log.info("self-check: %s -> %r", {k: v for k, v in facts.items() if k != "workers"}, reply)
+        return reply
 
     # ---- keep leaked tool-call text out of speech --------------------------
     async def llm_node(self, chat_ctx, tools, model_settings):
@@ -2505,6 +2643,19 @@ class Assistant(Agent):
                 )]),
             )
             return
+        if (isinstance(last, llm.ChatMessage) and last.role == "user" and not _PLACE_NAMED.search(self._user_text)
+                and not _SEARCH_WORDS.search(self._user_text)
+                and (_ASKS_QUAKE.search(self._user_text) or _ASKS_AIR.search(self._user_text))):
+            # "Any earthquakes?" / "How's the air? Any wildfire smoke?": USGS, AirNow and NOAA, worded by code
+            replies = []
+            if _ASKS_QUAKE.search(self._user_text) and (r := await _quake_reply(self._user_text)):
+                replies.append(r)
+            if _ASKS_AIR.search(self._user_text) and (r := await _air_reply(self._user_text)):
+                replies.append(r)
+            if replies:
+                log.info("quake/air answered by code: %r", " ".join(replies)[:300])
+                yield " ".join(replies)
+                return
         if (isinstance(last, llm.ChatMessage) and last.role == "user"
                 and _WHERE_LIVE.search(self._user_text) and not _SEARCH_WORDS.search(self._user_text)):
             # "Where do I live?" / "Where am I?": from the user's home town, never the web
@@ -2520,6 +2671,11 @@ class Assistant(Agent):
                 and _FILLER_ONLY.match(self._user_text.strip())):
             # "Also," on its own: the user is still talking; say nothing and wait for the rest
             log.info("filler-only turn %r: no reply", self._user_text)
+            return
+        if (isinstance(last, llm.ChatMessage) and last.role == "user" and not self._allowed
+                and selfcheck.asks_back(self._user_text)):
+            # "I'm fine, how are you?": a quiet self-check, answered by code (no model)
+            yield await self._self_check_reply(self._user_text)
             return
         asked = next((i.text_content or "" for i in reversed(chat_ctx.items[:-1])
                       if isinstance(i, llm.ChatMessage) and i.role == "assistant"), "")
@@ -2689,6 +2845,12 @@ class Assistant(Agent):
         asked_n = _count_from(user)
         count = max(1, min(asked_n or _to_int(count, 4), MAX_PAGE))
         clean, dates = _dated_query(_clean_query(query, user))  # "yesterday's game" -> "November 8, 2026 game"
+        topic = ""
+        local_ask = bool(user) and searchctx.wants_local(user, clean)   # "near me", "in my area", "local"
+        if user and not _WEATHER_TOPIC.search(clean):
+            # "What are any good recommendations?" after "I'm looking for a butcher in my area": keep the topic,
+            # and "near me" / "local" becomes the user's city and state (searchctx.py)
+            clean, topic = searchctx.resolve(clean, user, self._recent_user, HOME_LOCATION)
         if (HOME_LOCATION and _WEATHER_TOPIC.search(clean) and not _PLACE_NAMED.search(user or "")
                 and not _PLACE_NAMED.search(clean) and not sources.topic_of(f"{user} {clean}")):
             # (not "keep the solar battery warm": that's off-grid, not weather)
@@ -2716,53 +2878,93 @@ class Assistant(Agent):
                 free = None
             if free is not None:
                 return free
-        if _tavily_out():
-            self._verbatim = True
-            log.info("Tavily credits used up; not searching %r", clean)
-            return ("I've used up this month's web searches, and my free sources didn't have that. "
-                    "Ask me something else, or try again next month.")
-        if _PRICE_ASK.search(user or clean):
-            return await self._price_answer(clean)
-        try:
-            global _tavily
-            if _tavily is None:  # creating it blocks for ~0.7 s, so only once per process
-                _tavily = AsyncTavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
-            # for a question, Tavily also writes an answer from the pages it found
-            # (~1 s), which saves the model 10-15 s of reading the results.
-            # "advanced" names its sources and says when they disagree.
-            extra_opts = {} if as_list else {"include_answer": "advanced"}
-            if deep:
-                extra_opts["search_depth"] = "advanced"
-            if recent:
-                news_opts = {"topic": "news"}
-                if dates:
-                    news_opts["start_date"] = (min(dates) - timedelta(days=1)).isoformat()
-                    news_opts["end_date"] = (max(dates) + timedelta(days=1)).isoformat()
-                else:
-                    news_opts["time_range"] = "week"
-                log.info("news-style search: %s", news_opts)
-                result = await asyncio.wait_for(
-                    _tavily_search(query=clean, max_results=FETCH_N, **extra_opts, **news_opts), timeout=10)
-                if not result.get("results"):  # nothing in the news index: try the whole web
-                    log.info("news search found nothing; searching the whole web")
+        # OpenStreetMap (sources.py): "Where's a butcher near me?" lists the nearest named places around the user's town,
+        # by code. It has no reviews, so it offers a web search for those (Brave).
+        brave_next, self._brave_next = self._brave_next, False
+        if (local_ask or topic) and not force_web and not _PLACE_NAMED.search(user or ""):
+            if kind := sources.osm_kind(topic or clean):
+                try:
+                    places = await asyncio.wait_for(sources.osm_places(kind), timeout=25)
+                except Exception as e:
+                    log.info("OpenStreetMap failed: %s", e)
+                    places = []
+                if places:
+                    return self._osm_reply(kind, places)
+        # Brave (sources.py) first for lists and local searches (and when Tavily is out or has failed); Tavily writes the
+        # answers to questions. OTHOS_BRAVE=all sends every web search to Brave first.
+        brave = []
+        engine_used = "Tavily"
+        if (sources.brave_ready() and not _PRICE_ASK.search(user or clean)
+                and (as_list or local_ask or brave_next or BRAVE_ALL or _tavily_out())):
+            try:
+                brave = await asyncio.wait_for(sources.brave_search(clean, FETCH_N, "pw" if recent else ""), timeout=8)
+            except Exception as e:
+                log.info("Brave search failed: %s", e)
+        if brave:
+            result, engine_used = {"results": brave, "answer": None}, "Brave"
+            as_list = as_list or local_ask   # "butchers near me": a list of places, read out by code
+            log.info("search with Brave: %r (%d results)", clean, len(brave))
+        else:
+            if _tavily_out():
+                self._verbatim = True
+                log.info("Tavily credits used up; not searching %r", clean)
+                return ("I've used up this month's web searches, and my free sources didn't have that. "
+                        "Ask me something else, or try again next month.")
+            if _PRICE_ASK.search(user or clean):
+                return await self._price_answer(clean)
+            try:
+                global _tavily
+                if _tavily is None:  # creating it blocks for ~0.7 s, so only once per process
+                    _tavily = AsyncTavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+                # for a question, Tavily also writes an answer from the pages it found
+                # (~1 s), which saves the model 10-15 s of reading the results.
+                # "advanced" names its sources and says when they disagree.
+                extra_opts = {} if as_list else {"include_answer": "advanced"}
+                if deep:
+                    extra_opts["search_depth"] = "advanced"
+                if recent:
+                    news_opts = {"topic": "news"}
+                    if dates:
+                        news_opts["start_date"] = (min(dates) - timedelta(days=1)).isoformat()
+                        news_opts["end_date"] = (max(dates) + timedelta(days=1)).isoformat()
+                    else:
+                        news_opts["time_range"] = "week"
+                    log.info("news-style search: %s", news_opts)
                     result = await asyncio.wait_for(
-                        _tavily_search(query=clean, max_results=FETCH_N, **extra_opts), timeout=10)
-            else:
-                result = await asyncio.wait_for(
-                    _tavily_search(query=clean, max_results=FETCH_N, **extra_opts), timeout=8
-                )
-        except Exception as e:
-            return f"Search failed: {e}"
+                        _tavily_search(query=clean, max_results=FETCH_N, **extra_opts, **news_opts), timeout=10)
+                    if not result.get("results"):  # nothing in the news index: try the whole web
+                        log.info("news search found nothing; searching the whole web")
+                        result = await asyncio.wait_for(
+                            _tavily_search(query=clean, max_results=FETCH_N, **extra_opts), timeout=10)
+                else:
+                    result = await asyncio.wait_for(
+                        _tavily_search(query=clean, max_results=FETCH_N, **extra_opts), timeout=8
+                    )
+            except Exception as e:
+                rs = []
+                if sources.brave_ready():   # Tavily failed: Brave, if it's set up
+                    try:
+                        rs = await asyncio.wait_for(sources.brave_search(clean, FETCH_N, "pw" if recent else ""), timeout=8)
+                    except Exception:
+                        rs = []
+                if not rs:
+                    return f"Search failed: {e}"
+                result, engine_used = {"results": rs, "answer": None}, "Brave"
         self._results = result.get("results", [])
         self._cursor = 0
         if not self._results:
             return "No results found."
+        if topic and not searchctx.relevant(topic, self._results, result.get("answer")):
+            # nothing that came back mentions what was asked for (TV shows for a butcher): don't read it out
+            log.info("search for %r came back off-topic (%d results); not read out", topic, len(self._results))
+            self._results, self._cursor, self._verbatim = [], 0, True
+            return searchctx.no_match_reply(topic, HOME_LOCATION)
         weather = bool(_WEATHER_TOPIC.search(clean))
         if weather:  # Fahrenheit only: the model said "13 degrees" from "(about 13 °C)"
             for r in self._results:
                 r["content"] = _fahrenheit_only(r.get("content", ""))
         engine = _engine_named(user)
-        note = f"I search with Tavily, not {engine}. " if engine else ""
+        note = f"I search with {engine_used}, not {engine}. " if engine else ""
         if as_list:
             return self._read_page(0, count, note + "Here's what I found.")
         spoken = _short_answer(_fahrenheit_only(result.get("answer")) if weather else result.get("answer"))
@@ -2777,6 +2979,40 @@ class Assistant(Agent):
         if weather:
             extra += " Give temperatures in Fahrenheit."
         return self._answer_page(max(3, min(asked_n or 3, 5))) + _ANSWER_FROM_RESULTS + extra
+
+    def _osm_reply(self, kind, places: list[dict]) -> str:
+        """The places OpenStreetMap lists near the user's town, worded by code. It has no reviews: says so."""
+        one, many, _tags = kind
+        us = bool(re.search(r"\b(?:US|USA)\s*$", HOME_LOCATION or "")) or not HOME_LOCATION
+        place = searchctx.city_state(HOME_LOCATION).split(",")[0] or "you"
+
+        def far(km: float) -> str:
+            d = km * 0.621371 if us else km
+            unit = "mile" if us else "kilometer"
+            if d < 0.15:
+                return "right nearby"
+            d = round(d, 1)
+            return f"about {d:g} {unit}{'' if d == 1 else 's'} away"
+
+        def one_line(p: dict) -> str:
+            return f"{p['name']}, {far(p['km'])}" + (f", at {p['street']}" if p.get("street") else "")
+
+        top = places[:4]
+        parts = [f"OpenStreetMap lists {len(places)} {many if len(places) != 1 else one} near {place}."]
+        parts.append(f"The closest is {one_line(top[0])}.")
+        if len(top) > 1:
+            rest = [one_line(p) for p in top[1:]]
+            parts.append("Next: " + "; ".join(rest) + ".")
+        parts.append("It doesn't have reviews, so I can't say which is best. Want me to search the web for reviews?")
+        self._results = [{"title": p["name"], "url": p["website"] or f"https://www.openstreetmap.org/{p['id']}",
+                          "content": ", ".join(x for x in (p["street"], p["city"], p["phone"], p["hours"]) if x)}
+                         for p in places]
+        self._cursor, self._news, self._verbatim = len(top), False, True
+        loc = searchctx.city_state(HOME_LOCATION)
+        self._offered_web = f"best {one} reviews" + (f" near {loc}" if loc else "")
+        self._brave_next = True
+        log.info("OpenStreetMap: %d %s near the town, nearest %s", len(places), many, places[0]["name"])
+        return " ".join(parts)
 
     async def _free_answer(self, q: str, user: str, as_list: bool, count: int, recent: bool) -> str | None:
         """An answer from the free sources (sources.py), or None to search with Tavily.
@@ -3033,12 +3269,13 @@ class Assistant(Agent):
         where = sources.STATE or "the state"
         self._breaking = bool(_BREAKING.search(self._user_text or ""))
         self._news_q = ({"local": "local news", "hardware": "PC hardware news", "tech": "tech news",
-                         "design": "design news"}.get(label, f"{sources.STATE_LABEL} news"), label)
-        # magazines post less often than newspapers: look back further
-        slow = label in ("design",)
+                         "design": "design news", **sources.TOPIC_QUERY}.get(label, f"{sources.STATE_LABEL} news"), label)
+        # magazines and blogs post less often than newspapers: look back further
+        slow = label in ("design", *sources.TOPIC_FEED_SETS)
         hours = 72 if wider else BREAKING_HOURS if self._breaking else 36
         if slow:
-            hours = 24 * (60 if wider else 30)
+            days = sources.TOPIC_DAYS.get(label, 30)
+            hours = 24 * (days * 3 if wider else days)
         found = [r for r in await sources.feed_news(label, hours=hours) if r["url"] not in self._read_urls]
         kept, seen = [], []
         for r in found:  # the same story from three stations -> once
@@ -3051,9 +3288,11 @@ class Assistant(Agent):
         if not kept:
             return f"That's all the {label} news I have right now; nothing new since I last checked."
         self._results, self._cursor, self._news = kept, 0, True
-        if label in ("hardware", "tech", "design"):
+        if label in ("hardware", "tech", "design", *sources.TOPIC_FEED_SETS):
             intro = {"hardware": "Here's the latest in PC hardware.", "tech": "Here's the latest in tech.",
-                     "design": "Here's what's new in digital art and design."}[label]
+                     "design": "Here's what's new in digital art and design.",
+                     "gardening": "Here's what's new in gardening.", "recipes": "Here are some fresh recipes.",
+                     "books": "Here's what's new in books.", "movies": "Here's what's new in movies and TV."}[label]
         elif self._breaking:
             intro = f"Here's the latest from around {where}." if state else "Here's the latest around here."
         else:
@@ -3661,7 +3900,9 @@ async def entrypoint(ctx: JobContext):
             # (sends audio to LiveKit's gateway); "v1-mini" runs on this PC.
             turn_detection=inference.TurnDetector(version="v1-mini"),
             preemptive_generation={"enabled": False},
-            interruption={"min_words": 2},
+            # "vad": interruptions are judged on this PC. The default ("adaptive") connects to LiveKit's
+            # cloud gateway (agent-gateway.livekit.cloud) with the call's audio, which isn't an approved service.
+            interruption={"mode": "vad", "min_words": 2},
         ),
     )
 
@@ -3669,6 +3910,19 @@ async def entrypoint(ctx: JobContext):
     # server closes the empty room, and calling straight back could fail to get
     # an agent.
     session.on("close", lambda ev: ctx.shutdown(reason=f"session closed: {ev.reason}"))
+
+    # counters for the quiet self-check ("How are you?"): how long answers take, errors this call
+    selfcheck.reset()
+
+    def _count_metrics(ev):
+        m = getattr(ev, "metrics", None)
+        if getattr(m, "type", "") == "llm_metrics" and not getattr(m, "cancelled", False) \
+                and getattr(m, "ttft", -1) is not None and m.ttft >= 0:
+            selfcheck.note_reply(m.ttft)
+
+    session.on("metrics_collected", _count_metrics)
+    # (only errors that weren't retried away: a recoverable one worked on the next try)
+    session.on("error", lambda ev: None if getattr(ev.error, "recoverable", False) else selfcheck.note_error())
 
     assistant = Assistant()
     # gaming mode: watches for listed games and switches the voice model between turns
@@ -3736,6 +3990,15 @@ async def entrypoint(ctx: JobContext):
                         f"Heads up: Tavily's at {_tavily_used:,} searches this month.")
     else:
         log.info("Tavily usage check failed; credits not counted this call")
+    # Brave Search: its own count of this month's searches (state\brave-usage.json); a spoken heads-up near the limit
+    if os.getenv("BRAVE_API_KEY"):
+        used = sources.brave_used()
+        log.info("Brave searches this month: %s of %s (warn at %s)", used, sources.BRAVE_LIMIT, sources.BRAVE_WARN)
+        if used >= sources.BRAVE_LIMIT:
+            session.say(f"Heads up: I've used all {sources.BRAVE_LIMIT:,} of this month's Brave searches, so I'll use "
+                        "my free sources and Tavily until it resets.")
+        elif used >= sources.BRAVE_WARN:
+            session.say(f"Heads up: Brave's at {used:,} of its {sources.BRAVE_LIMIT:,} searches this month.")
 
 
 if __name__ == "__main__":

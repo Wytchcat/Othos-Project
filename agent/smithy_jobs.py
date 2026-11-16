@@ -20,7 +20,9 @@ Rules, enforced here in code, not in the prompt:
   installed; the user copies what they want into place themselves.
 - A build is checked before its README: C# files are compiled together (Windows' own csc.exe,
   into a temporary folder that's deleted), PowerShell, Python and JSON files are parsed, and
-  Python imports between the files are checked (with `ast`). The result is never run, so tests
+  Python imports between the files are checked (with `ast`). The language checkers in
+  smithy_checkers.py read them too (ruff, pyright, PSScriptAnalyzer, tsc, javac), and the JSON fields
+  a change asks for are checked on every entry. The result is never run, so tests
   are reported as "not run", and a request that wants them passing stays NOT COMPLETE. Each
   numbered item asked for (a first build's request, or a new version's change) is checked off.
 """
@@ -29,6 +31,7 @@ from __future__ import annotations
 import ast
 import base64
 import difflib
+import hashlib
 import json
 import logging
 import os
@@ -43,6 +46,7 @@ try:                                             # the check task: left out of t
     import smithy_check
 except ImportError:
     smithy_check = None
+import smithy_checkers
 import smithy_sandbox
 import worker_cloud
 import worker_files
@@ -380,9 +384,17 @@ _LEAVE = re.compile(r"(?i)" + _SENT + r"\bleave (?:them|it|these|those)?[ \t]*(?
                     r"unchanged)" + _SENT)
 
 
-def _names(text: str, files: list[dict]) -> set[str]:
-    return {f["path"] for f in files if re.search(r"(?<![\w.])" + re.escape(PurePosixPath(f["path"]).name)
-                                                  + r"(?![\w])", text, re.I)}
+def _names(text: str, files: list[dict], stems: bool = False) -> set[str]:
+    """The files the text names. stems: also by the name without its extension, for a name long enough not to be
+    an ordinary word, and not as a module before a dot ("academy_privacy.safe" isn't asking for that file)."""
+    out = set()
+    for f in files:
+        p = PurePosixPath(f["path"])
+        if re.search(r"(?<![\w.])" + re.escape(p.name) + r"(?![\w])", text, re.I) or (
+                stems and len(p.stem) >= 8 and "_" in p.stem
+                and re.search(r"(?<![\w.])" + re.escape(p.stem) + r"(?![\w.])", text, re.I)):
+            out.add(f["path"])
+    return out
 
 
 def _failing_files(out: str, test: str, code: list[str], same: set[str]) -> list[str]:
@@ -405,6 +417,90 @@ def _failing_files(out: str, test: str, code: list[str], same: set[str]) -> list
     return [r for r in found if r != test] + ([test] if test in found else [])
 
 
+def outline(path: str, body: str) -> str:
+    """A short view of a file for this PC's model: a Python file's imports, constants, and each function and class
+    with its signature and the first line of its docstring; another file's first lines."""
+    if path.lower().endswith(".py"):
+        try:
+            tree = ast.parse(body)
+        except SyntaxError:
+            tree = None
+        if tree is not None:
+            out = []
+
+            def doc1(n):
+                d = ast.get_docstring(n) or ""
+                return f'    """{d.splitlines()[0][:120]}"""' if d.strip() else ""
+
+            def sig(n, pad=""):
+                line = (ast.get_source_segment(body, n) or "").split("\n")[0].rstrip()
+                return pad + line + (" ..." if not line.endswith(":") else "")
+
+            for n in tree.body:
+                if isinstance(n, (ast.Import, ast.ImportFrom)):
+                    out.append(ast.get_source_segment(body, n) or "")
+                elif isinstance(n, (ast.Assign, ast.AnnAssign)):
+                    seg = (ast.get_source_segment(body, n) or "").split("\n")[0]
+                    out.append(seg[:120] + (" ..." if len(seg) > 120 or "\n" in (ast.get_source_segment(body, n) or "") else ""))
+                elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    out += [sig(n)] + ([doc1(n)] if doc1(n) else [])
+                elif isinstance(n, ast.ClassDef):
+                    out += [sig(n)] + ([doc1(n)] if doc1(n) else [])
+                    for m in n.body:
+                        if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            out.append(sig(m, "    "))
+            return "\n".join(x for x in out if x)
+    lines = body.splitlines()
+    return "\n".join(lines[:30]) + (f"\n(... {len(lines) - 30} more lines)" if len(lines) > 30 else "")
+
+
+_SECTION = re.compile(r"(?ms)^--- (?P<path>[^\n]+?) ---(?P<rest>[^\n]*)\n(?P<body>.*?)(?=^--- [^\n]+? ---|\Z)")
+
+
+def shrink_for_local(messages: list[dict], tokens: int) -> list[dict]:
+    """The same step, smaller, for this PC's model (Nov 15, the user: "If it chews makes progress until free resets
+    that's the goal"; task 55's steps were about 30,000 tokens against its 20,480). The files the step's last
+    message names stay whole; every other file shown as `--- path ---` becomes its outline, the largest first, until
+    the step fits. Nothing is changed when it already fits."""
+    if worker_cloud.prompt_tokens(messages) <= tokens:
+        return messages
+    last = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
+    out = [dict(m) for m in messages]
+    found = []                                         # (size, message index, path)
+    for i, m in enumerate(out):
+        for s in _SECTION.finditer(str(m.get("content", ""))):
+            name = PurePosixPath(s.group("path").strip()).name
+            if name and name not in last and len(s.group("body")) > 400:
+                found.append((len(s.group("body")), i, s.group("path")))
+    # still too big: the files the last message names become outlines too, all but the one being edited (Nov 15,
+    # task 56: a fix's item and check notes named 6 files, so a 30,899-token step only came down to 29,238)
+    # the file being edited is shown whole in its own message, so its copy among the files is an outline first
+    editing = {PurePosixPath(m.group(1)).name for m in (_EDITING.search(str(x.get("content", ""))) for x in out) if m}
+    twice, named = [], []
+    if editing:
+        for i, m in enumerate(out):
+            for s in _SECTION.finditer(str(m.get("content", ""))):
+                name = PurePosixPath(s.group("path").strip()).name
+                if name and name in last and len(s.group("body")) > 400:
+                    (twice if name in editing else named).append((len(s.group("body")), i, s.group("path")))
+    for _, i, path in twice + sorted(found, reverse=True) + sorted(named, reverse=True):
+        def swap(s, path=path):
+            if s.group("path") != path:
+                return s.group(0)
+            return (f"--- {path} --- (outline only: its names and signatures; the whole file is in the build)\n"
+                    + outline(path, s.group("body")) + "\n\n")
+        out[i]["content"] = _SECTION.sub(swap, str(out[i]["content"]))
+        if worker_cloud.prompt_tokens(out) <= tokens:
+            break
+    return out
+
+
+_EDITING = re.compile(r"^The current (\S+) \(the whole file\)", re.M)
+
+
+worker_cloud.LOCAL_SHRINK = shrink_for_local
+
+
 def _failing_test_code(test_path: Path, out: str, limit: int = 6000) -> str:
     """The source of each test function the output says FAIL or ERROR, so a fix sees what was asked (task 55: the
     fixes saw only "AssertionError: False is not true" and said the code needed no change, three times)."""
@@ -425,7 +521,8 @@ def _stage_files(staged: list[str], written: dict, change: str) -> list[str]:
     that the stage's own changes name (Nov 15, task 55: item 4 said academy_explain.py and academy_readme.py call
     record(); both were new files, so only the old ones were offered, and the model sent their edits to
     academy_glossary.json, where none could go in)."""
-    named = sorted(_names(change, [{"path": r} for r in written if r not in staged and not r.lower().endswith(".md")]))
+    named = sorted(_names(change, [{"path": r} for r in written if r not in staged and not r.lower().endswith(".md")],
+                          stems=True))         # task 56: "academy_explain and academy_readme call record()", no .py
     return list(staged) + named
 
 
@@ -582,12 +679,31 @@ EDIT_FORMAT = ("Reply with only the edits, each one in exactly this form:\n"
                "=======\n(the lines that replace them; nothing here deletes them)\n>>>>>>> REPLACE\n"
                "Copy the FIND lines character for character, with their indentation. Keep each edit small. "
                "To add new lines, FIND the line just before where they go and REPLACE it with that same line "
-               "followed by the new ones. Don't send the whole file.")
+               "followed by the new ones. Don't send the whole file. If your answer has to be JSON, send "
+               "{\"edits\": [{\"find\": ..., \"replace\": ...}]} with the same FIND and REPLACE text.")
 _EDIT = re.compile(r"<<<<<<< FIND[ \t]*\n([\s\S]*?)\n=======[ \t]*\n([\s\S]*?)\n?>>>>>>> REPLACE")
 
 
+# the edits as an answer shape (worker_shared.answer_shape): where the model is held to it, every answer is a
+# list of find/replace pairs, never prose or a broken block (Nov 16, checkers plan phase 2)
+EDITS_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["edits"],
+                "properties": {"edits": {"type": "array", "items": {
+                    "type": "object", "additionalProperties": False, "required": ["find", "replace"],
+                    "properties": {"find": {"type": "string"}, "replace": {"type": "string"}}}}}}
+
+
 def parse_edits(text: str) -> list[tuple[str, str]]:
-    """The (find, replace) pairs in a reply, in order."""
+    """The (find, replace) pairs in a reply, in order: {"edits": [...]} JSON, or FIND/REPLACE blocks."""
+    t = text.strip()
+    if t.startswith("{"):
+        try:
+            data = json.loads(t)
+        except ValueError:
+            data = None
+        if isinstance(data, dict) and isinstance(data.get("edits"), list):
+            return [(str(e["find"]).replace("\r\n", "\n"), str(e["replace"]).replace("\r\n", "\n"))
+                    for e in data["edits"] if isinstance(e, dict) and "find" in e and "replace" in e
+                    and str(e["find"]).strip()]
     return [(m.group(1), m.group(2)) for m in _EDIT.finditer(text.replace("\r\n", "\n"))]
 
 
@@ -728,7 +844,8 @@ def _edit_file(ctx, job_id: int, msgs: list[dict], rel: str, old: str,
     No edits at all: the file is kept as it was (the plan can call a file "changed" that the change
     doesn't touch; Nov 13, task 18 failed on that), or with none_ok=False, ValueError."""
     steps.info("Editing %s: asking for the changes as edits.", rel)
-    reply = ctx.chat(msgs, 6000)
+    with worker_shared.answer_shape(EDITS_SCHEMA):
+        reply = ctx.chat(msgs, 6000)
     edits = parse_edits(reply)
     if not edits:
         if none_ok:
@@ -743,12 +860,13 @@ def _edit_file(ctx, job_id: int, msgs: list[dict], rel: str, old: str,
                  len(problems))
         steps.info("%s: %d of %d edits went in; %d couldn't be found, asking again for %s.", rel, done, len(edits),
                    len(problems), "it" if len(problems) == 1 else "them")
-        again = ctx.chat(msgs + [{"role": "assistant", "content": reply},
-                                 {"role": "user", "content":
-                                  "These edits couldn't be applied, so they weren't:\n- " + "\n- ".join(problems)
-                                  + f"\n\nThe others are already in. Here is {rel} now:\n```\n{body}\n```\n\n"
-                                  "Send only the missed edits again, with the FIND lines copied exactly from it. "
-                                  + EDIT_FORMAT}], 6000)
+        with worker_shared.answer_shape(EDITS_SCHEMA):
+            again = ctx.chat(msgs + [{"role": "assistant", "content": reply},
+                                     {"role": "user", "content":
+                                      "These edits couldn't be applied, so they weren't:\n- " + "\n- ".join(problems)
+                                      + f"\n\nThe others are already in. Here is {rel} now:\n```\n{body}\n```\n\n"
+                                      "Send only the missed edits again, with the FIND lines copied exactly from "
+                                      "it. " + EDIT_FORMAT}], 6000)
         more = parse_edits(again)
         if more:                                       # no edits in the reply: the missed ones stay missed
             body, done2, problems = apply_edits(body, more, brace)
@@ -913,7 +1031,8 @@ def build_problems(folder: Path, rels: list[str], stdlib_only: bool = False) -> 
             problems += found
             checked.append("Python imports between the files checked"
                            + (" (standard library only)" if stdlib_only else ""))
-    return problems, checked
+    more, said = smithy_checkers.check_all(folder, rels)      # ruff, pyright, PSScriptAnalyzer, tsc, javac
+    return problems + more, checked + said
 
 
 def _py_module(rel: str) -> str:
@@ -1111,6 +1230,35 @@ def _unbold(text: str) -> str:
                   r"\1: \2 ", text)
 
 
+def _no_change_no_done(ticks: dict[int, tuple[str, str]], written: dict[str, str], path: Path | None,
+                       files_of: dict[int, list[str]] | None = None) -> dict[int, tuple[str, str]]:
+    """A check that says DONE for an item an earlier check found MISSING, with none of that item's files changed
+    since, is wrong (Nov 15, task 56: this PC's 3B model ticked all 4 DONE; the glossary still had no ids), so the
+    item stays MISSING. `files_of`: the files each item names (default: all; README.md never counts). What's
+    MISSING, with a fingerprint of its files, is kept in `path` across continue runs."""
+    if path is None:
+        return ticks
+    every = [k for k in written if not k.lower().endswith(".md")]
+
+    def mark(n: int) -> str:
+        names = sorted(r for r in ((files_of or {}).get(n) or every) if r in written) or sorted(every)
+        return hashlib.sha256("\0".join(f"{k}\0{written[k]}" for k in names).encode("utf-8")).hexdigest()
+    try:
+        last = json.loads(path.read_text(encoding="utf-8")).get("items", {})
+    except (OSError, ValueError, AttributeError):
+        last = {}
+    same = {k: v for k, v in last.items() if k.isdigit() and v.get("files") == mark(int(k))}
+    ticks = {n: ("MISSING", same[str(n)]["note"] + " (a later check said done, but none of its files changed since)")
+             if s == "DONE" and str(n) in same else (s, note) for n, (s, note) in ticks.items()}
+    keep = dict(same)                                  # still unchanged: what was missing stays known
+    keep.update({str(n): {"note": note, "files": mark(n)} for n, (s, note) in ticks.items() if s == "MISSING"})
+    try:
+        path.write_text(json.dumps({"items": keep}, indent=1), encoding="utf-8")
+    except OSError:
+        pass
+    return ticks
+
+
 def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path, written: dict[str, str],
                   cap: int, only: dict[int, str] | None = None,
                   rounds: int | None = None) -> tuple[list[str], str, list[str]]:
@@ -1131,7 +1279,9 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
     stdlib_only = bool(_STDLIB_ONLY.search(p.get("request", "")))
     wants_tests = only is None and bool(_WANTS_TESTS.search(p.get("request", "")))
 
-    def fix(rel: str, what: str) -> None:
+    def fix(rel: str, what: str, must: bool = False) -> None:
+        """`must`: the check named this file for a change it found missing, so "no edits" isn't an answer: the
+        file is then written whole (Nov 15, task 56: models answered no edits while the glossary had no ids)."""
         if len(written[rel].strip()) < 200 and not rel.lower().endswith(".md"):
             # (nearly) empty: there's nothing for an edit to find (task 49), so it's written whole
             steps.info("%s is (nearly) empty, so it's written whole, not edited.", rel)
@@ -1145,8 +1295,15 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
             else:
                 notes.append(f"`{rel}`: still empty after asking again")
             return
-        body, note = _edit_file(ctx, job_id, _edit_messages(p, desc, plan, rel, written, written[rel], what, cap),
-                                rel, written[rel])
+        try:
+            body, note = _edit_file(ctx, job_id, _edit_messages(p, desc, plan, rel, written, written[rel], what, cap),
+                                    rel, written[rel], none_ok=not must)
+        except ValueError:
+            steps.info("%s: the check found a change missing here, but no edits came back.", rel)
+            whole = _rewrite_whole(rel, what)
+            notes.append(f"`{rel}`: no edits came back for a change the check found missing here"
+                         + (f"; the file was then written whole ({whole})" if whole else "; kept as it was"))
+            return
         if body != written[rel]:
             inside(folder, rel).write_text(body, encoding="utf-8")
             written[rel] = body
@@ -1202,19 +1359,62 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
 
     check_log = SMITHY.results_dir / f"{job_id:05d}-checklist.txt" if job_id else None
 
+    found_path = SMITHY.results_dir / f"{job_id:05d}-missing.json" if job_id else None
+
     def check() -> tuple[dict[int, tuple[str, str]], list[str], list[str]]:
         ticks = _checklist(ctx, p, desc, plan, written, items, cap, check_log) if use_list else {}
+        files_of = {n: sorted(_names(t, [{"path": r} for r in written if not r.lower().endswith(".md")], stems=True))
+                    for n, t in items.items()}
+        ticks = _no_change_no_done(ticks, written, found_path, files_of)
         problems, checked = build_problems(folder, code, stdlib_only)
+        # the JSON fields a change asks for, checked on every entry (task 56: the glossary had no ids for hours
+        # while models said it did)
+        jsons = [r for r in code if r.lower().endswith(".json")]
+        asked: dict[str, set[str]] = {}
+        for t in items.values():
+            for j, fields in smithy_checkers.asked_fields(t, jsons).items():
+                asked.setdefault(j, set()).update(fields)
+        if asked:
+            found = smithy_checkers.json_field_errors(folder, asked)
+            if found is None:
+                checked.append("JSON fields not checked (jsonschema isn't installed)")
+            else:
+                problems = problems + found
+                checked.append("JSON fields the change asks for checked ("
+                               + ", ".join(f"{j}: {', '.join(sorted(f))}" for j, f in asked.items()) + ")")
+        # the calls a change says a file makes ("academy_explain and academy_readme call record()"), with ast
+        # (task 56: a model's check said done with no record() call in either file)
+        pys = [r for r in code if r.lower().endswith(".py")]
+        calls: dict[str, set[str]] = {}
+        for t in items.values():
+            for f, names in smithy_checkers.asked_calls(t, pys).items():
+                calls.setdefault(f, set()).update(names)
+        if calls:
+            problems = problems + smithy_checkers.call_errors(folder, calls)
+            checked.append("calls the change asks for checked ("
+                           + ", ".join(f"{f}: {', '.join(n + '()' for n in sorted(c))}" for f, c in calls.items())
+                           + ")")
         return ticks, problems, checked
 
-    def file_for(n: int) -> str | None:
-        """The file the check named, else the file the item itself names, else the longest."""
-        for text in (ticks[n][1], items[n].split("\n")[0]):
-            low = text.lower()
-            rel = next((r for r in code if r.lower() in low or Path(r).name.lower() in low), None)
-            if rel:
-                return rel
-        return max(code, key=lambda r: len(written[r])) if code else None
+    same = {f["path"] for f in (plan or {}).get("files", []) if f.get("change") == "same"}
+
+    def files_for(n: int) -> list[str]:
+        """The files to fix for item n, at most 3: the ones the check's note names, else the ones the whole item
+        names (its "Files:" lines, names without .py), in the order they're named; else the longest. Never a file
+        the plan keeps the same (Nov 15, task 56: the notes named no file, the item's first line neither, so all
+        three items went to academy_sources.py, the longest, which the request said to leave as it is)."""
+        pick = [r for r in code if r not in same] or list(code)
+        for text in (ticks[n][1], items[n]):
+            found = _names(text, [{"path": r} for r in pick], stems=True)
+            if found:
+                low = text.lower()
+
+                def at(r):
+                    p = PurePosixPath(r)
+                    i = low.find(p.name.lower())
+                    return i if i >= 0 else low.find(p.stem.lower())
+                return sorted(found, key=at)[:3]
+        return [max(pick, key=lambda r: len(written[r]))] if pick else []
 
     if use_list:
         steps.info("Checking the %d changes asked for against the files.", len(items))
@@ -1233,15 +1433,24 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
                 f"{len(problems)} build problem{'s' if len(problems) != 1 else ''}" if problems else ""])))
             if missing:                                      # each to its own file, a few at a time
                 by_file: dict[str, list[int]] = {}
-                for n in missing:
-                    rel = file_for(n)
-                    if rel:
+                first: set[str] = set()      # each item's first file must change: no edits there isn't an answer
+                for n in missing:            # (Nov 16, task 56: notes naming no file let every file say no edits)
+                    for i, rel in enumerate(files_for(n)):
                         by_file.setdefault(rel, []).append(n)
+                        if i == 0:
+                            first.add(rel)
                 before = dict(written)
                 for rel, nums in by_file.items():
                     for k in range(0, len(nums), 3):
+                        part = nums[k:k + 3]
+                        found = "\n".join(f"- {ticks[n][1]}" for n in part if ticks[n][1])
+                        here = bool(_names(found, [{"path": rel}], stems=True)) or rel in first   # named, or first
                         fix(rel, "Make only these changes, which aren't in the file yet:\n\n"
-                            + "\n\n".join(items[n] for n in nums[k:k + 3]))
+                            + "\n\n".join(items[n] for n in part)
+                            + (f"\n\nWhat the check of the files found missing:\n{found}" if found else "")
+                            + (f"\n\nThe check found this missing in {rel}, so send the edits it needs; "
+                               if here else "\n\n")
+                            + "a part that belongs only in another file is made there, not here", must=here)
                 if written == before and not problems:
                     # nothing went in, so checking again would give the same answer (task 40 asked again and
                     # got an empty reply that wiped out the first one's 6 DONE)
@@ -1932,10 +2141,11 @@ def carry_on(job_id: int) -> str:
         raise ValueError(f"Smithy task {job_id} isn't a build")
     # a finished build that didn't check clean (NOT COMPLETE, waiting for review) may carry on too: its checks
     # and fix rounds run again on the files it has, and its README is written again (Nov 15, task 51)
-    unfinished = row["status"] == "review" and bool(re.search(r"\bNOT complete\b", (row["summary"] or "") + _result_head(row), re.I))
+    # so may one that says done but is still waiting for review, not kept yet (Nov 15, task 56: a wrong check
+    # from this PC's model passed it; the user hadn't kept it, and continue refused it)
+    unfinished = row["status"] == "review"
     if row["status"] not in ("cancelled", "failed") and not unfinished:
-        raise ValueError(f"Smithy task {job_id} is {row['status']}, not stopped"
-                         + (" or NOT COMPLETE" if row["status"] == "review" else ""))
+        raise ValueError(f"Smithy task {job_id} is {row['status']}, not stopped or waiting for review")
     if not (SMITHY.results_dir / f"{job_id:05d}-plan.json").exists():
         raise ValueError(f"Smithy task {job_id} stopped before it had a plan, so there's nothing to carry on")
     # its old result and check are made again at the end; the files and the plan are kept

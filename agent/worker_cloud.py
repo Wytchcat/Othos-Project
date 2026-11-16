@@ -530,7 +530,12 @@ def pick(cfg: dict, raw_params: dict, task_type: str, local=None):
                 params = {"provider": n, "no_switch": True}
                 if n == name and raw_params.get("model"):
                     params["model"] = raw_params["model"]
-                b, m = pick(cfg, params, task_type)
+                try:
+                    b, m = pick(cfg, params, task_type)
+                except ProviderCapOut as e:            # its day is used: kept, out until midnight, so a long
+                    log.info("switch order: %s out until midnight (%s)", n, e)    # task gets it back then
+                    b, m = pick(cfg, {**params, "cap_later": True}, task_type)    # (Nov 16, task 56 ran past
+                    _mark_out(n, _to_midnight())                                  # midnight without Cerebras)
                 links.append((n, PROVIDERS[n].spoken, b, m))
             except ValueError as e:
                 log.info("switch order: %s skipped (%s)", n, e)
@@ -559,7 +564,8 @@ def pick(cfg: dict, raw_params: dict, task_type: str, local=None):
         key = key_for(p, _keys())
         if not key:
             raise ValueError(f"no key for {p.spoken}: save one in Providers…, or put {p.key_env} in .env")
-    _check_budget(cc, name, 0, whole_task=False)      # the task's own limit is checked on each call, once it's set
+    if not raw_params.get("cap_later"):                # (a switch link kept for after midnight: checked on each call)
+        _check_budget(cc, name, 0, whole_task=False)  # the task's own limit is checked on each call, once it's set
     backend = (AnthropicCloud if p.kind == "anthropic" else OpenAICompatible)(p, key, _base_url(p, cc), cc)
     return backend, model
 
@@ -656,6 +662,16 @@ PACE: dict[str, dict] = {
     # waits for an empty minute (task 55's ~30,000-token steps did go through), and only one over 90,000 never fits
     "cerebras": {"rpm": 5, "tpm": 30_000, "tpm_total": 90_000, "checked": "2026-11-15",
                  "source": "https://inference-docs.cerebras.ai/support/rate-limits"},
+    # Nov 15, the user: "Build this type of limit in for the widely used providers". Free-tier figures for each one's
+    # default model here; a different model can have other limits (set cloud.pace.<name> for it). Where the
+    # sources disagreed, the lowest is used.
+    # Groq: 8,000 tokens a minute, so a bigger step is never sent (it said "too large" every time, task 55)
+    "groq": {"rpm": 30, "tpm": 8_000, "checked": "2026-11-15", "source": "https://console.groq.com/docs/rate-limits"},
+    "gemini": {"rpm": 10, "checked": "2026-11-15", "source": "https://ai.google.dev/gemini-api/docs/rate-limits"},
+    "nvidia": {"rpm": 40, "checked": "2026-11-15", "source": "https://build.nvidia.com"},
+    "openrouter": {"rpm": 20, "checked": "2026-11-15", "source": "https://openrouter.ai/docs/api/reference/limits"},
+    "mistral": {"rpm": 60, "checked": "2026-11-15",
+                "source": "https://help.mistral.ai/en/articles/225174-what-are-the-limits-of-the-free-tier"},
 }
 _SENT: dict[str, list] = {}                            # provider -> [(time, tokens)] sent in the last minute
 
@@ -839,6 +855,12 @@ def check_fits(messages: list[dict], max_tokens: int, cfg: dict) -> None:
                          "files), or use a cloud provider (Switching), or a model with more context (context_tokens)")
 
 
+# A worker may make a step smaller for this PC's model (Nov 15, the user: "If it chews makes progress until free
+# resets that's the goal"): shrink(messages, tokens) -> messages that fit, or the same ones. The Smithy sets it
+# (other files as outlines); None leaves steps as they are.
+LOCAL_SHRINK = None
+
+
 class Chain:
     """The switch order as one back end: each step goes to the first provider that still has free
     tokens; when one says it's out, the same step goes to the next, and last to this PC's model.
@@ -863,17 +885,37 @@ class Chain:
     def close(self) -> None:
         pass
 
+    def _too_long_here(self, messages) -> str:
+        """Why this step can't go to this PC's model even made smaller, or "" when it can."""
+        why = too_long_for_local(messages, self.local_ctx)
+        if why and LOCAL_SHRINK is not None and not too_long_for_local(
+                LOCAL_SHRINK(messages, self.local_ctx - 512), self.local_ctx):
+            return ""
+        return why
+
     def _did(self, who: str) -> None:
         if not self.used or self.used[-1] != who:
             steps.info("%s %s.", "Now on" if self.used else "Working on", who)   # the first, and each switch
             self.used.append(who)
 
     def chat(self, model: str, messages: list[dict], threads: int, max_tokens: int, should_stop) -> str:
+        # a big step goes to the cloud smaller too (the other files as outlines): one over a provider's minute
+        # fell to weaker models (Nov 16, task 56: ~30,000-token steps against Cerebras's 30,000 a minute went to
+        # NVIDIA's 20B, which sent no edits). cloud.cloud_step_tokens, default 20,000; 0 = off
+        aim = int(self.cc.get("cloud_step_tokens", 20_000) or 0)
+        if aim and self.links and LOCAL_SHRINK is not None and prompt_tokens(messages) > aim:
+            smaller = LOCAL_SHRINK(messages, aim)
+            if prompt_tokens(smaller) < prompt_tokens(messages):
+                log.info("switching: step made smaller for the cloud: about %d -> %d tokens",
+                         prompt_tokens(messages), prompt_tokens(smaller))
+                steps.info("This step was made smaller (the other files as outlines): about %s tokens instead of "
+                           "%s.", f"{prompt_tokens(smaller):,}", f"{prompt_tokens(messages):,}")
+                messages = smaller
         while True:
             out = self._try_links(messages, threads, max_tokens, should_stop)
             if out is not None:
                 return out
-            too_long = too_long_for_local(messages, self.local_ctx) if self.local else ""
+            too_long = self._too_long_here(messages) if self.local else ""
             if self.ask is None:
                 return self._local(None, messages, threads, max_tokens, should_stop)
             size = prompt_tokens(messages)
@@ -922,6 +964,11 @@ class Chain:
                 try:
                     paced(name, size)
                     out = backend.chat(m, messages, threads, max_tokens, should_stop)
+                    if not str(out or "").strip():     # an empty reply isn't an answer (Nov 15, task 56: empty
+                        # replies were read as "no edits needed" for 6 files); the next provider, not marked out
+                        log.warning("switching: %s sent an empty reply; trying the next", spoken)
+                        steps.info("%s sent back nothing; trying the next provider.", spoken)
+                        break
                     self._did(f"{spoken} ({m})")
                     return out
                 except BudgetOut as e:                 # the user's own limit (dollars, one task): no provider can help
@@ -966,6 +1013,19 @@ class Chain:
         if not self.local:
             raise RuntimeError(str(why) if why else "every provider in the switch order is out of free tokens for now")
         too_long = too_long_for_local(messages, self.local_ctx)
+        # the answer needs room too, and a long prompt is slow here (Nov 15, task 56: a 31,001-token step in a
+        # 32,768 window had ~1,700 tokens left for a 6,000 answer, written at 1 token a second): made smaller
+        # to local_step_tokens (default 16,000), and never so big the answer can't fit
+        aim = min(self.local_ctx - min(int(max_tokens or 0), self.local_ctx // 4) - 256,
+                  int((self.cc or {}).get("local_step_tokens", 16_000)) or self.local_ctx)
+        if (too_long or prompt_tokens(messages) > aim) and LOCAL_SHRINK is not None:   # the other files as outlines
+            smaller = LOCAL_SHRINK(messages, aim)
+            if not too_long_for_local(smaller, self.local_ctx) and prompt_tokens(smaller) < prompt_tokens(messages):
+                log.info("switching: step made smaller for this PC's model: about %d -> %d tokens",
+                         prompt_tokens(messages), prompt_tokens(smaller))
+                steps.info("This step was made smaller for this PC's model (the other files as outlines): about "
+                           "%s tokens instead of %s.", f"{prompt_tokens(smaller):,}", f"{prompt_tokens(messages):,}")
+                messages, too_long = smaller, ""
         if too_long:                                   # never a silent cut-off on this PC's model
             log.warning("switching: not going to this PC's model: %s", too_long)
             steps.info("This PC's model can't take this step: %s.", too_long.split(", so")[0])
@@ -1038,13 +1098,34 @@ class _Base:
         _check_budget(self.cc, self.p.name, tin + chars // 4)
 
 
+_NO_SCHEMA: set[str] = set()                           # providers that refused an answer shape (this run)
+_SCHEMA_WORDS = re.compile(r"response_format|json_schema|schema|structured|grammar", re.I)
+
+
 class OpenAICompatible(_Base):
     def chat(self, model: str, messages: list[dict], threads: int, max_tokens: int, should_stop) -> str:
+        """With worker_shared.answer_shape(...): the answer is held to that JSON schema where the provider
+        supports it. One that refuses it is asked again without, and isn't asked with one again this run."""
+        schema = worker_shared.ANSWER_SCHEMA.get()
+        if schema and self.p.name not in _NO_SCHEMA:
+            try:
+                return self._chat(model, messages, max_tokens, should_stop, schema)
+            except Refused as e:
+                if e.status not in (400, 415, 422) or not _SCHEMA_WORDS.search(str(e)):
+                    raise
+                _NO_SCHEMA.add(self.p.name)
+                log.info("switching: %s doesn't take an answer shape; asked again without one", self.p.spoken)
+        return self._chat(model, messages, max_tokens, should_stop, None)
+
+    def _chat(self, model: str, messages: list[dict], max_tokens: int, should_stop, schema: dict | None) -> str:
         headers = {"Authorization": f"Bearer {self.key}"} if self.key else {}
         if self.p.name == "openrouter":
             headers["X-Title"] = "Othos"                # no personal details
         body = {"model": model, "messages": _clean(messages), "stream": True, "max_tokens": max_tokens,
                 "stream_options": {"include_usage": True}}
+        if schema:
+            body["response_format"] = {"type": "json_schema",
+                                       "json_schema": {"name": "answer", "schema": schema, "strict": True}}
         if self.p.local and not model:
             body.pop("model")
         out, tin, tout, accepted = [], 0, 0, False

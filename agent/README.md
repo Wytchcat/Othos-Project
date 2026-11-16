@@ -12,7 +12,8 @@ mixed and offline modes, the voice commands, privacy, hardware and troubleshooti
 | File | What it is |
 |---|---|
 | `agent.py` | the voice agent: conversation, tools chosen in code, news, weather, search, notes, camera |
-| `sources.py` | free sources tried before Tavily (weather, RSS, Stack Exchange, Wikipedia...) |
+| `sources.py` | free sources tried before Tavily (weather, RSS, Stack Exchange, Wikipedia, OpenStreetMap places near your town, Brave Search, quakes, air quality and smoke, built-in gardening, recipe, book and movie feeds...) |
+| `suggested-sources.json` | free web APIs for gardening, books, recipes and movies/TV that you can add yourself (suggestions only; read their terms first) |
 | `personal.py` | reads `personal.json` (your name, town, local feeds); `personal.example.json` shows the fields |
 | `gaming.py`, `gaming.json` | gaming mode |
 | `smithy.py`, `smithy_jobs.py`, `smithy.json`, `SMITHY.md` | The Smithy, the coding worker |

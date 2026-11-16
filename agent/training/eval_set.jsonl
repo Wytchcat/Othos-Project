@@ -1,0 +1,36 @@
+{"id":"chat-1","say":"Hello, how are you?","tools":[],"note":"greeting: no search"}
+{"id":"chat-2","say":"I'm fine, how are you?","tools":[],"note":"return inquiry: self-check, no search"}
+{"id":"chat-3","say":"Good morning","tools":[]}
+{"id":"chat-4","say":"Thanks, that was helpful","tools":[]}
+{"id":"chat-5","say":"Tell me a joke","tools":[]}
+{"id":"chat-6","say":"What's your name?","tools":[]}
+{"id":"about-1","say":"How old am I?","tools":[],"note":"answered from the profile"}
+{"id":"about-2","say":"Where do I live?","tools":[]}
+{"id":"about-3","say":"What did you just say?","tools":[]}
+{"id":"fact-1","say":"How tall is Mount Everest?","tools":["web_search"]}
+{"id":"fact-2","say":"Who won the World Series last year?","tools":["web_search"]}
+{"id":"fact-3","say":"What is the capital of Australia?","tools":["web_search"]}
+{"id":"fact-4","say":"Search for the best way to prune roses","tools":["web_search"]}
+{"id":"fact-5","say":"Please research the Steam Deck battery life","tools":["web_search"]}
+{"id":"fact-6","say":"I wonder how deep the Mariana Trench is","tools":["web_search"]}
+{"id":"wx-1","say":"Is it going to rain tomorrow?","tools":["web_search"]}
+{"id":"wx-2","say":"What's the weather like today?","tools":["web_search"]}
+{"id":"local-1","say":"Where's a butcher near me?","tools":["web_search"]}
+{"id":"local-2","say":"Find me a coffee shop nearby","tools":["web_search"]}
+{"id":"news-1","say":"Any news today?","tools":["web_search"]}
+{"id":"news-2","say":"Anything new on Wired?","tools":["web_search"]}
+{"id":"topic-1","say":"Any new recipes?","tools":["web_search"]}
+{"id":"topic-2","say":"What should I cook tonight?","tools":["web_search"]}
+{"id":"topic-3","say":"Any gardening tips?","tools":["web_search"]}
+{"id":"topic-4","say":"What should I read next?","tools":["web_search"]}
+{"id":"topic-5","say":"What should I watch tonight?","tools":["web_search"]}
+{"id":"haz-1","say":"Any earthquakes today?","tools":[],"note":"answered by code from USGS, no model tool call","code_only":true}
+{"id":"haz-2","say":"How's the air quality?","tools":[],"note":"answered by code from AirNow, no model tool call","code_only":true}
+{"id":"notes-1","say":"Save a note: call the dentist on Friday","tools":["save_note","search_notes"]}
+{"id":"notes-2","say":"What notes do I have about the dentist?","tools":["save_note","search_notes"]}
+{"id":"look-1","say":"What colour is my shirt?","tools":[],"note":"camera question: the look tool is offered only while the camera is on","camera_only":true}
+{"id":"look-2","say":"Look at the game and tell me what you see","tools":[],"camera_only":true}
+{"id":"nolook-1","say":"Look into the history of Rome","tools":["web_search"],"note":"'look into' is research, not the camera"}
+{"id":"repeat-1","say":"What were those names again?","tools":[],"has_results":true,"note":"answer from what was said"}
+{"id":"more-1","say":"Tell me more results","tools":["more_results","web_search"],"has_results":true}
+{"id":"more-2","say":"Give me the next one","tools":["more_results","web_search"],"has_results":true}

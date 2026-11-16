@@ -1007,7 +1007,10 @@ class WorkersVoice:
 
     def _away_answer(self, text: str) -> str | None:
         jobs = self.away or []
-        if _AWAY_NO.search(text):
+        # each sentence on its own; a no anywhere wins (Nov 16: "Sure. No. Not currently." was an answer to
+        # another question merged with this one, and the list was read)
+        parts = [p for p in re.split(r"[.!?;,]+", text) if p.strip()] or [text]
+        if _AWAY_NO.search(text) or any(_AWAY_NO.search(p) for p in parts):
             ans = "no"
         elif _AWAY_YES.search(text) or worker_shared.answer(text) == "yes":
             ans = "yes"
@@ -1204,13 +1207,29 @@ class WorkersVoice:
         if self.session is not None and self._announcer is None:
             self._announcer = asyncio.create_task(self._announce_loop())
 
+    def _othos_asking(self) -> bool:
+        """Othos's own last reply is a question she hasn't answered yet (Nov 16: "Can I look up some local
+        options for you?" and, 1.7 s later, the away question: her "Sure." answered both). Announcements that
+        ask something wait until she has."""
+        try:
+            items = list(getattr(self.session.history, "items", []) or [])
+        except Exception:
+            return False
+        for item in reversed(items):
+            role = getattr(item, "role", None)
+            if role == "user":
+                return False
+            if role == "assistant":
+                return (getattr(item, "text_content", "") or "").rstrip().endswith("?")
+        return False
+
     def _between_turns(self) -> bool:
         s = self.session
         return (getattr(s, "agent_state", "") == "listening" and getattr(s, "user_state", "") != "speaking"
                 and (s.current_speech is None or s.current_speech.done()))
 
     async def _announce_loop(self) -> None:
-        first = True
+        first, held = True, 0.0
         await asyncio.sleep(2)
         while True:
             try:
@@ -1220,7 +1239,8 @@ class WorkersVoice:
                 if self.away is not None:
                     pass                                # waiting for her answer: nothing else is announced
                 elif self._between_turns():
-                    for q, st in await asyncio.to_thread(self._waiting_out):
+                    asking = self._othos_asking()          # her answer to Othos comes first
+                    for q, st in ([] if asking else await asyncio.to_thread(self._waiting_out)):
                         key = (q.key, int(st["task_id"]))
                         if key in self._asked_out or st.get("out_choice"):
                             continue
@@ -1238,6 +1258,18 @@ class WorkersVoice:
                         continue
                     jobs = [(q, j) for q in INSTALLED for j in await asyncio.to_thread(q.unannounced)
                             if (q.key, int(j["id"])) not in self._away_skip]
+                    if jobs and first and asking:
+                        # held while Othos's question is open; dropped for the call if it stays open
+                        held = held or time.time()
+                        if time.time() - held > AWAY_HOLD_SECONDS:
+                            log.info("workers: away question held too long behind Othos's own; dropped")
+                            self._away_skip.update((q.key, int(j["id"])) for q, j in jobs)
+                            first = False
+                        await asyncio.sleep(5)
+                        continue
+                    if jobs and not first and asking and self._is_plan(*jobs[0]):
+                        await asyncio.sleep(5)              # a plan's "is ready" asks too: after her answer
+                        continue
                     if jobs:
                         if first:   # finished while the user was away: ask first (the user, Nov 14)
                             first = False
@@ -1301,9 +1333,10 @@ _AWAY_YES = re.compile(r"^\W*(?:(?:othos|osos|um+|uh+|oh|well)\W+)*(?:yes|yeah|y
                        r"let'?s\s+hear|i'?d\s+like\s+that|go\s+on|"
                        r"absolutely|of\s+course|definitely|what\s+(?:are|were)\s+they|what\s+(?:is|was)\s+it|"
                        r"which\s+ones?|what\s+finished)\b", re.I)
-_AWAY_NO = re.compile(r"^\W*(?:(?:othos|osos|um+|uh+|oh|well)\W+)*(?:no|nope|nah|not\s+(?:now|yet|right\s+now)|"
+_AWAY_NO = re.compile(r"^\W*(?:(?:othos|osos|um+|uh+|oh|well)\W+)*(?:no|nope|nah|not\s+(?:now|yet|right\s+now|currently)|"
                       r"later|maybe\s+later|skip|never\s*mind|don'?t\s+(?:bother|worry)|i'?m\s+good|pass)\b"
-                      r"|\b(?:not\s+now|later|no\s+thanks?)\W*$", re.I)
+                      r"|\b(?:not\s+now|not\s+currently|later|no\s+thanks?)\W*$", re.I)
+AWAY_HOLD_SECONDS = 120          # Othos's own question still open this long: the away question is dropped for the call
 
 # "task mode on", "turn on task mode", "go into task mode"; off: "task mode off", "stop task mode", "leave task mode"
 _TASK_MODE = re.compile(r"\btask\s*-?\s*mode\b", re.I)

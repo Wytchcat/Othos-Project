@@ -2,7 +2,7 @@
 
 the user's plan (Documents\\Othos_future\\research sources plan.md): search credits
 are limited, so free APIs and feeds come first and Tavily only when they have
-nothing. Brave will sit between them later (tabled for now).
+nothing. Brave Search (below) sits between them and Tavily.
 
 Only search words, a game name, or the town's map point leave the laptop; never
 anything personal. Keys come from .env (RAVELRY_USER / RAVELRY_KEY, YOUTUBE_API_KEY,
@@ -681,6 +681,68 @@ if STATE_FEEDS:
 OUTLETS = {k: v[1] for k, v in {**LOCAL_FEEDS, **STATE_FEEDS, **HARDWARE_FEEDS, **TECH_FEEDS, **DESIGN_FEEDS}.items()}
 OUTLETS.update({"developer.joomla.org": "Joomla", "joomla.org": "Joomla"})
 
+# ---- topic feeds that come with Othos (gardening, recipes, books, movies and TV). Checked working Nov 16, 2026 with
+# this reader. Only titles, a short snippet and the link are read, on the user's own PC, and the outlet is always named.
+# Add your own or drop one in personal.json ("topic_feeds"). APIs for these topics are suggestions (suggested-sources.json).
+GARDEN_FEEDS = {
+    "gardeningknowhow.com": ("https://www.gardeningknowhow.com/feeds.xml", "Gardening Know How", None),
+    "finegardening.com": ("https://www.finegardening.com/feed", "Fine Gardening", None),
+    "gardenerspath.com": ("https://gardenerspath.com/feed/", "Gardener's Path", None),
+    "gardenista.com": ("https://www.gardenista.com/rss/", "Gardenista", None),
+    "motherearthnews.com": ("https://www.motherearthnews.com/feed/", "Mother Earth News", None),
+}
+RECIPE_FEEDS = {
+    "budgetbytes.com": ("https://www.budgetbytes.com/feed/", "Budget Bytes", None),
+    "minimalistbaker.com": ("https://minimalistbaker.com/feed/", "Minimalist Baker", None),
+    "smittenkitchen.com": ("https://feeds.feedburner.com/smittenkitchen", "Smitten Kitchen", None),
+    "101cookbooks.com": ("https://www.101cookbooks.com/feed", "101 Cookbooks", None),
+    "cookieandkate.com": ("https://cookieandkate.com/feed/", "Cookie and Kate", None),
+    "skinnytaste.com": ("https://www.skinnytaste.com/feed/", "Skinnytaste", None),
+    "sallysbakingaddiction.com": ("https://sallysbakingaddiction.com/feed/", "Sally's Baking Addiction", None),
+    "bbcgoodfood.com": ("https://www.bbcgoodfood.com/feed", "BBC Good Food", None),
+    "epicurious.com": ("https://www.epicurious.com/feed/rss", "Epicurious", None),
+}
+BOOK_FEEDS = {
+    "guardian-books": ("https://www.theguardian.com/books/rss", "The Guardian", None),
+    "bookriot.com": ("https://bookriot.com/feed/", "Book Riot", None),
+    "gutenberg.org": ("https://www.gutenberg.org/cache/epub/feeds/today.rss", "Project Gutenberg", None),
+}
+SCREEN_FEEDS = {
+    "slashfilm.com": ("https://www.slashfilm.com/category/news/feed/", "Slash Film", None),
+    "indiewire.com": ("https://www.indiewire.com/feed/rss/", "IndieWire", None),
+    "avclub.com": ("https://www.avclub.com/rss", "The A.V. Club", None),
+    "nyt-movies": ("https://rss.nytimes.com/services/xml/rss/nyt/Movies.xml", "The New York Times", None),
+    "nyt-tv": ("https://rss.nytimes.com/services/xml/rss/nyt/Television.xml", "The New York Times", None),
+    "guardian-film": ("https://www.theguardian.com/film/rss", "The Guardian", None),
+    "guardian-tv": ("https://www.theguardian.com/tv-and-radio/rss", "The Guardian", None),
+}
+TOPIC_FEED_SETS = {"gardening": GARDEN_FEEDS, "recipes": RECIPE_FEEDS, "books": BOOK_FEEDS, "movies": SCREEN_FEEDS}
+TOPIC_QUERY = {"gardening": "gardening news", "recipes": "recipe ideas", "books": "book news", "movies": "movie and TV news"}
+TOPIC_DAYS = {"gardening": 14, "recipes": 21, "books": 14, "movies": 7}   # how far back a roundup looks (blogs post slowly)
+TOPIC_ASKS = {
+    "gardening": re.compile(
+        r"\bgardening\s+(?:news|tips|ideas|articles|advice|stories|inspiration)\b|\bgarden\s+(?:news|tips|ideas)\b|"
+        r"\bwhat(?:'s| is)\s+(?:new|good)\s+(?:in|for)\s+(?:the\s+)?garden(?:ing)?\b|\bany\s+(?:new\s+)?gardening\b", re.I),
+    "recipes": re.compile(
+        r"\b(?:new|latest|fresh|good|some)\s+recipes?\b(?!\s+(?:for|with|using)\b)|\brecipe\s+(?:ideas?|news|inspiration)\b|"
+        r"\bwhat\s+(?:should|can|could)\s+(?:i|we)\s+(?:cook|bake)\b|\bwhat(?:'s| is)\s+for\s+dinner\b|"
+        r"\bdinner\s+ideas?\b|\bany\s+(?:new\s+|good\s+)?recipes?\b(?!\s+(?:for|with|using)\b)", re.I),
+    "books": re.compile(
+        r"\bbook\s+(?:news|reviews?|recommendations?)\b|\bnew\s+books?\b|\bwhat\s+(?:should|can|could)\s+(?:i|we)\s+read\b|"
+        r"\bany\s+(?:new\s+|good\s+)?books\b(?!\s+(?:about|on|for|by|that|with|in)\b)|\bwhat(?:'s| is)\s+new\s+in\s+books\b", re.I),
+    "movies": re.compile(
+        r"\b(?:movie|movies|film|films|tv|television|streaming)\s+(?:news|reviews?|headlines|releases?)\b|"
+        r"\bnew\s+(?:movies|films|tv\s+shows|shows|releases)\b|\bwhat\s+(?:should|can|could)\s+(?:i|we)\s+watch\b|"
+        r"\bany\s+good\s+(?:movies|shows|films)\b|\bwhat(?:'s| is)\s+(?:new|good)\s+(?:in|on)\s+(?:movies|tv|television|streaming)\b",
+        re.I),
+}
+for _topic, _set in TOPIC_FEED_SETS.items():
+    for _site in personal.topic_feed_drops(_topic):
+        _set.pop(_site, None)
+    _set.update(personal.topic_feeds(_topic))
+    FEED_SETS[_topic] = _set
+    OUTLETS.update({k: v[1] for k, v in _set.items() if "." in k and "#" not in k and not k.startswith(("nyt-", "guardian-"))})
+
 def _alts(words: list[str]) -> str:
     return "|".join(re.escape(w).replace(r"\ ", r"\s+") for w in sorted(words, key=len, reverse=True))
 
@@ -714,7 +776,8 @@ async def feed_news(kind: str, hours: int = 36) -> list[dict]:
     oldest = datetime(1970, 1, 1, tzinfo=timezone.utc)
     per = []
     for items in lists:
-        fresh = [r for r in items if (_when(r["published_date"]) or oldest) >= cutoff and len(r["title"].split()) >= 4
+        fresh = [r for r in items if (_when(r["published_date"]) or oldest) >= cutoff
+                 and len(r["title"].split()) >= (2 if kind in TOPIC_FEED_SETS else 4)   # "Sweet Potato Recipes"
                  and not _NOT_NEWS.search(r["title"])]
         fresh.sort(key=lambda r: _when(r["published_date"]) or oldest, reverse=True)
         per.append(fresh)
@@ -819,3 +882,403 @@ async def tavily_usage() -> dict | None:
     if used is None:
         return None
     return {"used": int(used) + int(acct.get("paygo_usage") or 0), "limit": acct.get("plan_limit")}
+
+
+# ---------------------------------------------------------------- Brave Search (between the free sources and Tavily)
+# Only the search words leave the laptop (no location header, no cookies). The key is BRAVE_API_KEY in .env.
+# Brave's free allowance is prepaid credits that renew monthly (about 1,000 searches; the docs pages disagree on the
+# exact figure), so Othos keeps its own count in state\brave-usage.json, nags at BRAVE_WARN_AT (950), and stops
+# using Brave at BRAVE_MONTHLY_LIMIT (1,000), so it never runs past the free credits. If the replies carry
+# X-RateLimit-Remaining, that figure is kept too.
+BRAVE_URL = "https://api.search.brave.com/res/v1/web/search"
+BRAVE_LIMIT = int(os.getenv("BRAVE_MONTHLY_LIMIT", "1000"))
+BRAVE_WARN = int(os.getenv("BRAVE_WARN_AT", "950"))
+BRAVE_USAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state", "brave-usage.json")
+_brave_off_until = 0.0   # a bad key stops it for this run; a "too many requests" for a few minutes
+
+
+def _brave_state() -> dict:
+    month = time.strftime("%Y-%m")
+    try:
+        import json
+        with open(BRAVE_USAGE, encoding="utf-8") as f:
+            s = json.load(f)
+        if s.get("month") == month:
+            return s
+    except Exception:
+        pass
+    return {"month": month, "used": 0}
+
+
+def _brave_save(s: dict) -> None:
+    try:
+        import json
+        os.makedirs(os.path.dirname(BRAVE_USAGE), exist_ok=True)
+        tmp = BRAVE_USAGE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(s, f)
+        os.replace(tmp, BRAVE_USAGE)
+    except Exception as e:
+        log.info("brave usage not saved: %s", e)
+
+
+def brave_used() -> int:
+    """Searches this month (Brave's own figure when its replies gave one, else Othos's count)."""
+    s = _brave_state()
+    if s.get("limit") and s.get("remaining") is not None:
+        return max(int(s["used"]), int(s["limit"]) - int(s["remaining"])) if int(s["limit"]) <= BRAVE_LIMIT * 2 \
+            else int(s["used"])
+    return int(s["used"])
+
+
+def brave_ready() -> bool:
+    """A key is set, Brave hasn't refused us, and this month's allowance isn't used up."""
+    if not os.getenv("BRAVE_API_KEY") or time.time() < _brave_off_until:
+        return False
+    s = _brave_state()
+    if s.get("remaining") is not None and int(s["remaining"]) <= 0:
+        return False
+    return brave_used() < BRAVE_LIMIT
+
+
+def _brave_ints(v: str) -> list[int]:
+    return [int(x) for x in re.findall(r"\d+", v or "")]
+
+
+async def brave_search(q: str, n: int = 6, fresh: str = "") -> list[dict]:
+    """Brave web results in Tavily's shape: {"title", "url", "content", "published_date"}; [] on any failure."""
+    global _brave_off_until
+    key = os.getenv("BRAVE_API_KEY")
+    if not key or not brave_ready():
+        return []
+    params = {"q": q[:400], "count": max(1, min(int(n), 20)), "extra_snippets": "true", "text_decorations": "false"}
+    if fresh:
+        params["freshness"] = fresh
+    headers = {"X-Subscription-Token": key, "Accept": "application/json"}
+    r = None
+    for attempt in (0, 1):
+        try:
+            r = await _client().get(BRAVE_URL, params=params, headers=headers)
+        except Exception as e:
+            log.info("brave search failed: %s", e)
+            return []
+        if r.status_code == 422 and attempt == 0:   # an optional setting this version doesn't know: ask plainly
+            params.pop("text_decorations", None)
+            params.pop("extra_snippets", None)
+            continue
+        break
+    s = _brave_state()
+    if r.status_code in (401, 403):
+        _brave_off_until = time.time() + 86400
+        log.warning("brave search: the key was refused (%s); Brave is off for this run", r.status_code)
+        return []
+    if r.status_code in (402, 429):
+        _brave_off_until = time.time() + 600
+        log.warning("brave search: %s (rate or allowance); Brave is off for 10 minutes", r.status_code)
+        return []
+    if r.status_code != 200:
+        log.info("brave search: HTTP %s", r.status_code)
+        return []
+    s["used"] = int(s.get("used", 0)) + 1
+    lim, rem = _brave_ints(r.headers.get("x-ratelimit-limit", "")), _brave_ints(r.headers.get("x-ratelimit-remaining", ""))
+    # real headers on a credits plan: limit "50, 0" and remaining "49, 0" (per second, then per month: 0 = no monthly
+    # count), so only a monthly limit above 0 is used
+    if lim and rem and lim[-1] > 0:
+        s["limit"], s["remaining"] = lim[-1], rem[-1]
+    _brave_save(s)
+    try:
+        items = (r.json().get("web") or {}).get("results") or []
+    except Exception:
+        return []
+    out = []
+    for it in items[:n]:
+        text = _plain(" ".join([it.get("description") or ""] + list(it.get("extra_snippets") or [])), 500)
+        out.append({"title": _plain(it.get("title") or ""), "url": it.get("url") or "", "content": text,
+                    "published_date": it.get("page_age") or it.get("age") or ""})
+    return [x for x in out if x["url"]]
+
+
+# ---------------------------------------------------------------- OpenStreetMap: places near the user's town
+# "Where's a butcher near me?" -> the shops OpenStreetMap lists around the town's map point (the same point the
+# weather lookup uses, rounded to about 100 m), with no key. Overpass (public, free, fair use) is asked for named
+# places of one kind within about 15 km. OpenStreetMap has addresses and distances but NO reviews, so Othos says
+# so and offers a web search for those. Only the map point and the kind of place leave the laptop.
+OSM_URLS = ["https://overpass-api.de/api/interpreter", "https://overpass.kumi.systems/api/interpreter"]
+# (words that ask for it, singular, plural, OpenStreetMap tags)
+_OSM_KINDS = [
+    (r"butcher|meat (?:market|shop)", "butcher", "butchers", ['"shop"="butcher"']),
+    (r"bakery|bakeries|baker\b", "bakery", "bakeries", ['"shop"="bakery"']),
+    (r"grocery|grocer|supermarket", "grocery store", "grocery stores", ['"shop"~"^(supermarket|grocery|greengrocer)$"']),
+    (r"farm ?stand|farm shop|farmers?'? market", "farm stand", "farm stands",
+     ['"shop"="farm"', '"amenity"="marketplace"']),
+    (r"pharmacy|chemist|drug ?store", "pharmacy", "pharmacies", ['"amenity"="pharmacy"']),
+    (r"hardware|home improvement", "hardware store", "hardware stores", ['"shop"~"^(hardware|doityourself)$"']),
+    (r"garden (?:center|centre|shop|store)|nursery|plant shop", "garden center", "garden centers",
+     ['"shop"~"^(garden_centre|nursery)$"']),
+    (r"yarn|wool shop|knitting (?:shop|store)", "yarn shop", "yarn shops", ['"shop"~"^(wool|yarn)$"']),
+    (r"fabric|sewing (?:shop|store)", "fabric store", "fabric stores", ['"shop"~"^(fabric|sewing)$"']),
+    (r"craft (?:shop|store)|hobby", "craft store", "craft stores", ['"shop"~"^(craft|hobby)$"']),
+    (r"thrift|second.?hand|consignment", "thrift store", "thrift stores", ['"shop"~"^(second_hand|charity)$"']),
+    (r"florist|flower shop", "florist", "florists", ['"shop"="florist"']),
+    (r"hair (?:salon|dresser|cut)|barber|hairdresser", "hair salon", "hair salons", ['"shop"~"^(hairdresser|barber)$"']),
+    (r"vet\b|veterinar|animal hospital", "vet", "vets", ['"amenity"="veterinary"']),
+    (r"dentist", "dentist", "dentists", ['"amenity"="dentist"']),
+    (r"doctor|clinic|urgent care", "clinic", "clinics", ['"amenity"~"^(clinic|doctors)$"']),
+    (r"gas station|petrol|fuel", "gas station", "gas stations", ['"amenity"="fuel"']),
+    (r"coffee|cafe|café", "cafe", "cafes", ['"amenity"="cafe"']),
+    (r"pizza", "pizza place", "pizza places", ['"amenity"="restaurant"]["cuisine"~"pizza"']),
+    (r"restaurant|place to eat|diner", "restaurant", "restaurants", ['"amenity"="restaurant"']),
+    (r"library|libraries", "library", "libraries", ['"amenity"="library"']),
+    (r"post office", "post office", "post offices", ['"amenity"="post_office"']),
+    (r"bank\b|atm\b", "bank", "banks", ['"amenity"~"^(bank|atm)$"']),
+    (r"car repair|mechanic|auto shop|garage", "car repair shop", "car repair shops", ['"shop"="car_repair"']),
+    (r"bike shop|bicycle", "bike shop", "bike shops", ['"shop"="bicycle"']),
+    (r"book ?store|bookshop", "bookstore", "bookstores", ['"shop"="books"']),
+    (r"laundromat|laundry", "laundromat", "laundromats", ['"shop"="laundry"']),
+]
+_osm_cache: dict = {}
+
+
+def osm_kind(text: str):
+    """(singular, plural, tags) for the kind of place asked for, or None."""
+    for rx, one, many, tags in _OSM_KINDS:
+        if re.search(rf"\b(?:{rx})", text or "", re.I):
+            return one, many, tags
+    return None
+
+
+def _km(lat1, lon1, lat2, lon2) -> float:
+    import math
+    p = math.pi / 180
+    a = math.sin((lat2 - lat1) * p / 2) ** 2 + math.cos(lat1 * p) * math.cos(lat2 * p) * math.sin((lon2 - lon1) * p / 2) ** 2
+    return 12742 * math.asin(math.sqrt(a))
+
+
+_osm_down_until = 0.0   # Overpass failed on every server: skip it for a few minutes and go straight to Nominatim
+NOMINATIM = "https://nominatim.openstreetmap.org/search"
+
+
+def _osm_place(t: dict, la, lo, ll, el_id: str) -> dict:
+    street = " ".join(x for x in (t.get("addr:housenumber"), t.get("addr:street")) if x)
+    return {"name": (t.get("name") or "").strip(), "km": _km(ll[0], ll[1], la, lo), "street": street,
+            "city": t.get("addr:city", ""), "phone": t.get("phone") or t.get("contact:phone") or "",
+            "website": t.get("website") or t.get("contact:website") or "",
+            "hours": t.get("opening_hours") or "", "id": el_id}
+
+
+async def _overpass(kind, lat: float, lon: float, radius_km: int, ll) -> list[dict] | None:
+    union = "".join(f"nwr(around:{radius_km * 1000},{lat},{lon})[{t}][\"name\"];" for t in kind[2])
+    body = {"data": f"[out:json][timeout:15];({union});out center 60;"}
+    for url, wait in zip(OSM_URLS, (8.0, 6.0)):
+        try:
+            r = await _client().post(url, data=body, timeout=wait)
+            if r.status_code == 200:
+                places = []
+                for el in r.json().get("elements") or []:
+                    t = el.get("tags") or {}
+                    la = el.get("lat") or (el.get("center") or {}).get("lat")
+                    lo = el.get("lon") or (el.get("center") or {}).get("lon")
+                    if (t.get("name") or "").strip() and la is not None and lo is not None:
+                        places.append(_osm_place(t, la, lo, ll, f"{el.get('type', 'node')}/{el.get('id')}"))
+                return places
+            log.info("openstreetmap %s: HTTP %s", url.split("/")[2], r.status_code)
+        except Exception as e:
+            log.info("openstreetmap %s failed: %s", url.split("/")[2], type(e).__name__)
+    return None
+
+
+async def _nominatim(kind, lat: float, lon: float, ll) -> list[dict]:
+    """OpenStreetMap's own search, boxed around the town (one request, identified, per their usage policy)."""
+    try:
+        r = await _client().get(NOMINATIM, timeout=8.0, params={
+            "q": kind[0], "format": "jsonv2", "addressdetails": 1, "extratags": 1, "limit": 30, "bounded": 1,
+            "viewbox": f"{lon - 0.25:.3f},{lat + 0.18:.3f},{lon + 0.25:.3f},{lat - 0.18:.3f}"})
+        r.raise_for_status()
+        out = []
+        for it in r.json():
+            ad, ex = it.get("address") or {}, it.get("extratags") or {}
+            name = (it.get("name") or "").strip()
+            if not name:
+                continue
+            t = {"name": name, "addr:street": ad.get("road", ""), "addr:housenumber": ad.get("house_number", ""),
+                 "addr:city": ad.get("city") or ad.get("town") or ad.get("village") or "",
+                 "phone": ex.get("phone") or ex.get("contact:phone", ""), "website": ex.get("website") or ex.get("contact:website", ""),
+                 "opening_hours": ex.get("opening_hours", "")}
+            out.append(_osm_place(t, float(it["lat"]), float(it["lon"]), ll, f"{it.get('osm_type', 'node')}/{it.get('osm_id')}"))
+        return out
+    except Exception as e:
+        log.info("nominatim failed: %s", type(e).__name__)
+        return []
+
+
+async def osm_places(kind, n: int = 6, radius_km: int = 15) -> list[dict]:
+    """Named places of one kind around the town's map point, nearest first; [] on any failure or no map point.
+    Overpass (exact kinds) first, then Nominatim if every Overpass server fails."""
+    global _osm_down_until
+    ll = _latlon()
+    if not ll or not kind:
+        return []
+    lat, lon = round(ll[0], 3), round(ll[1], 3)
+    key = (kind[0], lat, lon)
+    hit = _osm_cache.get(key)
+    if hit and time.time() - hit[0] < 600:
+        return hit[1][:n]
+    places = None
+    if time.time() >= _osm_down_until:
+        places = await _overpass(kind, lat, lon, radius_km, (lat, lon))
+        if places is None:
+            _osm_down_until = time.time() + 300
+    if places is None:
+        places = await _nominatim(kind, lat, lon, (lat, lon))
+    seen, uniq = set(), []
+    for p in sorted(places, key=lambda p: p["km"]):
+        sig = (p["name"].lower(), round(p["km"], 1))
+        if sig not in seen and p["km"] <= radius_km * 1.5:
+            seen.add(sig)
+            uniq.append(p)
+    if uniq:
+        _osm_cache[key] = (time.time(), uniq)
+    return uniq[:n]
+
+
+# ---------------------------------------------------------------- earthquakes (USGS), air quality (AirNow), smoke (NOAA)
+# Earthquakes: USGS's real-time feeds (public domain, no key, updated every minute). The whole feed is downloaded and
+# the distances are worked out HERE, so the user's location never leaves the laptop.
+# Smoke: NOAA's Hazard Mapping System satellite smoke map (KMZ, no key, refreshed every 10 minutes), checked against the
+# town's map point here too. Air quality: EPA AirNow's public data file reportingarea.dat (no key, updated twice an
+# hour; AirNow's web service for this was retired Oct 1, 2026): downloaded whole, nearest reporting area found here, so
+# nothing about the location is sent. Credit: "U.S. Geological Survey", "NOAA", "AirNow".
+USGS_FEED = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/{}.geojson"
+SMOKE_KMZ = "https://www.ospo.noaa.gov/data/spl/kmlfiles/fire/smoke.kmz"
+AIRNOW_FILE = "https://files.airnowtech.org/airnow/today/reportingarea.dat"
+_cache2: dict = {}
+
+
+def _cached(key: str, seconds: int):
+    hit = _cache2.get(key)
+    return hit[1] if hit and time.time() - hit[0] < seconds else None
+
+
+def compass(lat1: float, lon1: float, lat2: float, lon2: float) -> str:
+    """'north', 'northeast'... : the direction from point 1 to point 2."""
+    import math
+    p = math.pi / 180
+    y = math.sin((lon2 - lon1) * p) * math.cos(lat2 * p)
+    x = math.cos(lat1 * p) * math.sin(lat2 * p) - math.sin(lat1 * p) * math.cos(lat2 * p) * math.cos((lon2 - lon1) * p)
+    names = ["north", "northeast", "east", "southeast", "south", "southwest", "west", "northwest"]
+    return names[int(((math.atan2(y, x) / p) + 360 + 22.5) % 360 // 45)]
+
+
+async def usgs_quakes(lat: float, lon: float, radius_km: float = 160, hours: float = 24, feed: str = "all_day") -> list[dict] | None:
+    """Earthquakes within radius_km of the point in the last `hours`, newest first; None if the feed can't be read."""
+    data = _cached("usgs:" + feed, 60)
+    if data is None:
+        r = await _get(USGS_FEED.format(feed))
+        if r is None:
+            return None
+        try:
+            data = r.json().get("features") or []
+        except Exception:
+            return None
+        _cache2["usgs:" + feed] = (time.time(), data)
+    now, out = time.time(), []
+    for f in data:
+        pr, co = f.get("properties") or {}, (f.get("geometry") or {}).get("coordinates") or []
+        if len(co) < 2 or pr.get("mag") is None or pr.get("time") is None:
+            continue
+        age_h = (now - pr["time"] / 1000) / 3600
+        km = _km(lat, lon, co[1], co[0])
+        if age_h <= hours and km <= radius_km:
+            place = pr.get("place") or ""
+            out.append({"mag": float(pr["mag"]), "km": km, "age_h": age_h, "tsunami": bool(pr.get("tsunami")),
+                        "town": place.split(" of ", 1)[1] if " of " in place else place,
+                        "dir": compass(lat, lon, co[1], co[0]), "url": pr.get("url") or ""})
+    return sorted(out, key=lambda q: q["age_h"])
+
+
+async def airnow_current(lat: float, lon: float, max_km: float = 80) -> list[dict] | None:
+    """AirNow's current observations for the reporting area nearest the point (within max_km), from AirNow's public
+    reportingarea.dat file (the retired web service needed a key; this needs none and sends no location: the nearest
+    area is found here). [] if no area is that close; None if the file can't be read. Shape: AQI, Category{Name},
+    ParameterName, ReportingArea, StateCode, HourObserved."""
+    rows = _cached("airnow-file", 1500)   # the file changes at :25 and :55 past the hour
+    if rows is None:
+        try:
+            r = await _client().get(AIRNOW_FILE, timeout=25.0)
+            r.raise_for_status()
+            text = r.text
+        except Exception as e:
+            log.info("airnow file failed: %s", type(e).__name__)
+            return None
+        rows = []
+        for line in text.splitlines():
+            f = line.split("|")
+            if len(f) < 15 or f[5] != "O":      # O = a current observation (F forecast, Y yesterday)
+                continue
+            try:
+                hour = int(f[2].split(":")[0]) if f[2] else None
+                rows.append({"AQI": int(f[12]), "Category": {"Name": f[13]}, "ParameterName": f[11], "ReportingArea": f[7],
+                             "StateCode": f[8], "HourObserved": hour, "_lat": float(f[9]), "_lon": float(f[10])})
+            except ValueError:
+                continue
+        _cache2["airnow-file"] = (time.time(), rows)
+    near = [(_km(lat, lon, o["_lat"], o["_lon"]), o) for o in rows]
+    near = [(d, o) for d, o in near if d <= max_km]
+    if not near:
+        return []
+    key = min(near, key=lambda t: t[0])[1]
+    return [{k: v for k, v in o.items() if not k.startswith("_")} for _, o in near
+            if (o["ReportingArea"], o["StateCode"]) == (key["ReportingArea"], key["StateCode"])]
+
+
+def _in_poly(x: float, y: float, ring: list[tuple[float, float]]) -> bool:
+    inside, j = False, len(ring) - 1
+    for i in range(len(ring)):
+        xi, yi, xj, yj = ring[i][0], ring[i][1], ring[j][0], ring[j][1]
+        if (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / ((yj - yi) or 1e-12) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+async def smoke_map(lat: float, lon: float) -> dict | None:
+    """NOAA's satellite smoke map against the point: {'overhead': 'Light'|'Medium'|'Heavy'|None, 'nearest_km': km to the
+    closest smoke outline (None if none at all), 'date': 'YYYYMMDD'}. None if the map can't be read."""
+    polys = _cached("smoke", 600)
+    if polys is None:
+        try:
+            r = await _client().get(SMOKE_KMZ, timeout=20.0)
+            r.raise_for_status()
+            import io
+            import zipfile
+            z = zipfile.ZipFile(io.BytesIO(r.content))
+            text = z.read(next(n for n in z.namelist() if n.endswith(".kml"))).decode("utf-8", "replace")
+        except Exception as e:
+            log.info("noaa smoke map failed: %s", type(e).__name__)
+            return None
+        date = (re.search(r"HMS Smoke Mapping-(\d{8})", text) or [None, ""])[1]
+        polys = {"date": date, "rings": []}
+        for pm in re.findall(r"<Placemark>.*?</Placemark>", text, re.S):
+            d = re.search(r"Density:\s*(\w+)", pm)
+            c = re.search(r"<outerBoundaryIs>.*?<coordinates>(.*?)</coordinates>", pm, re.S)
+            if not d or not c:
+                continue
+            ring = []
+            for tok in c.group(1).split():
+                parts = tok.split(",")
+                if len(parts) >= 2:
+                    try:
+                        ring.append((float(parts[0]), float(parts[1])))
+                    except ValueError:
+                        pass
+            if len(ring) >= 3:
+                polys["rings"].append((d.group(1).capitalize(), ring))
+        _cache2["smoke"] = (time.time(), polys)
+    rank = {"Light": 1, "Medium": 2, "Heavy": 3}
+    overhead, nearest = None, None
+    for dens, ring in polys["rings"]:
+        if _in_poly(lon, lat, ring) and rank.get(dens, 0) > rank.get(overhead, 0):
+            overhead = dens
+        d = min(_km(lat, lon, y, x) for x, y in ring)
+        nearest = d if nearest is None else min(nearest, d)
+    return {"overhead": overhead, "nearest_km": nearest, "date": polys["date"], "outlines": len(polys["rings"])}

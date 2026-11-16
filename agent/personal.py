@@ -148,3 +148,15 @@ def pronunciations() -> dict:
 def keyterms() -> list[str]:
     """Words speech-to-text should listen for (place names it mishears)."""
     return _words(DATA.get("keyterms"))
+
+
+def topic_feeds(topic: str) -> dict:
+    """Extra feeds a user adds for gardening / recipes / books / movies (personal.json "topic_feeds"), same shape as
+    local_news: {"gardening": {"feeds": [{"url": ..., "name": ...}], "drop": ["gardenista.com"]}}."""
+    return _feeds(((DATA.get("topic_feeds") or {}).get(topic)) or {})
+
+
+def topic_feed_drops(topic: str) -> list[str]:
+    """Built-in feeds (by their site key) the user doesn't want for a topic."""
+    drops = (((DATA.get("topic_feeds") or {}).get(topic)) or {}).get("drop") or []
+    return [str(d).lower() for d in drops if d]

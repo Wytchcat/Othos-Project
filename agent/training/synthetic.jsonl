@@ -1,0 +1,111 @@
+{"say": "Where's the closest fabric store?", "tools": ["web_search"], "has_results": false}
+{"say": "Remember that the meeting moved to noon", "tools": ["save_note", "search_notes"], "has_results": false}
+{"say": "Tell me what the boiling point of water is at altitude", "tools": ["web_search"], "has_results": false}
+{"say": "Good evening", "tools": [], "has_results": false}
+{"say": "Find me a butcher near me", "tools": ["web_search"], "has_results": false}
+{"say": "Tell me how far the moon is", "tools": ["web_search"], "has_results": false}
+{"say": "Where's the closest plumber?", "tools": ["web_search"], "has_results": false}
+{"say": "Is there a plumber nearby?", "tools": ["web_search"], "has_results": false}
+{"say": "Find me a tailor near me", "tools": ["web_search"], "has_results": false}
+{"say": "Hi there", "tools": [], "has_results": false}
+{"say": "Where's the closest pharmacy?", "tools": ["web_search"], "has_results": false}
+{"say": "Do you know how far the moon is?", "tools": ["web_search"], "has_results": false}
+{"say": "Any hardware stores around here?", "tools": ["web_search"], "has_results": false}
+{"say": "Is there a fabric store nearby?", "tools": ["web_search"], "has_results": false}
+{"say": "Read me my notes about the ferns", "tools": ["save_note", "search_notes"], "has_results": false}
+{"say": "Where's the closest tire shop?", "tools": ["web_search"], "has_results": false}
+{"say": "Can you recommend a florist in my area?", "tools": ["web_search"], "has_results": false}
+{"say": "Is there a tailor nearby?", "tools": ["web_search"], "has_results": false}
+{"say": "Look up how far the moon is", "tools": ["web_search"], "has_results": false}
+{"say": "Keep going", "tools": ["more_results", "web_search"], "has_results": true}
+{"say": "Where's the closest butcher?", "tools": ["web_search"], "has_results": false}
+{"say": "I'd like to know how far the moon is", "tools": ["web_search"], "has_results": false}
+{"say": "Is there a butcher nearby?", "tools": ["web_search"], "has_results": false}
+{"say": "Make a note: water the ferns", "tools": ["save_note", "search_notes"], "has_results": false}
+{"say": "Say that again", "tools": [], "has_results": true}
+{"say": "Where's the closest bike shop?", "tools": ["web_search"], "has_results": false}
+{"say": "Find me a hardware store near me", "tools": ["web_search"], "has_results": false}
+{"say": "Say something nice", "tools": [], "has_results": false}
+{"say": "Find me a tire shop near me", "tools": ["web_search"], "has_results": false}
+{"say": "Thank you", "tools": [], "has_results": false}
+{"say": "Is there a vet nearby?", "tools": ["web_search"], "has_results": false}
+{"say": "I'd like to know who painted the Mona Lisa", "tools": ["web_search"], "has_results": false}
+{"say": "Any fabric stores around here?", "tools": ["web_search"], "has_results": false}
+{"say": "What's new in books?", "tools": ["web_search"], "has_results": false}
+{"say": "Do you know what the boiling point of water is at altitude?", "tools": ["web_search"], "has_results": false}
+{"say": "Is there a pharmacy nearby?", "tools": ["web_search"], "has_results": false}
+{"say": "What's new in gardening?", "tools": ["web_search"], "has_results": false}
+{"say": "Can you recommend a bike shop in my area?", "tools": ["web_search"], "has_results": false}
+{"say": "Any tire shops around here?", "tools": ["web_search"], "has_results": false}
+{"say": "Can you recommend a fabric store in my area?", "tools": ["web_search"], "has_results": false}
+{"say": "Look up how many bones a human has", "tools": ["web_search"], "has_results": false}
+{"say": "Look up what the boiling point of water is at altitude", "tools": ["web_search"], "has_results": false}
+{"say": "What's new in movies?", "tools": ["web_search"], "has_results": false}
+{"say": "What did I note about the car?", "tools": ["save_note", "search_notes"], "has_results": false}
+{"say": "What was the second one again?", "tools": [], "has_results": true}
+{"say": "Tell me who wrote Dracula", "tools": ["web_search"], "has_results": false}
+{"say": "Can you recommend a barber in my area?", "tools": ["web_search"], "has_results": false}
+{"say": "Look up how long a marathon is", "tools": ["web_search"], "has_results": false}
+{"say": "Any tailors around here?", "tools": ["web_search"], "has_results": false}
+{"say": "Find me a pharmacy near me", "tools": ["web_search"], "has_results": false}
+{"say": "Any barbers around here?", "tools": ["web_search"], "has_results": false}
+{"say": "Never mind", "tools": [], "has_results": false}
+{"say": "Any bike shops around here?", "tools": ["web_search"], "has_results": false}
+{"say": "Can you recommend a tire shop in my area?", "tools": ["web_search"], "has_results": false}
+{"say": "Is there a bike shop nearby?", "tools": ["web_search"], "has_results": false}
+{"say": "I'd like to know who wrote Dracula", "tools": ["web_search"], "has_results": false}
+{"say": "Look up who wrote Dracula", "tools": ["web_search"], "has_results": false}
+{"say": "Can you recommend a butcher in my area?", "tools": ["web_search"], "has_results": false}
+{"say": "Is there a florist nearby?", "tools": ["web_search"], "has_results": false}
+{"say": "Okay, got it", "tools": [], "has_results": false}
+{"say": "Find me a barber near me", "tools": ["web_search"], "has_results": false}
+{"say": "Find me a florist near me", "tools": ["web_search"], "has_results": false}
+{"say": "I'd like to know what the boiling point of water is at altitude", "tools": ["web_search"], "has_results": false}
+{"say": "Where's the closest barber?", "tools": ["web_search"], "has_results": false}
+{"say": "Any pharmacys around here?", "tools": ["web_search"], "has_results": false}
+{"say": "Can you recommend a hardware store in my area?", "tools": ["web_search"], "has_results": false}
+{"say": "Can you recommend a pharmacy in my area?", "tools": ["web_search"], "has_results": false}
+{"say": "Any florists around here?", "tools": ["web_search"], "has_results": false}
+{"say": "Tell me how long a marathon is", "tools": ["web_search"], "has_results": false}
+{"say": "I'd like to know when the Berlin Wall fell", "tools": ["web_search"], "has_results": false}
+{"say": "Can you recommend a vet in my area?", "tools": ["web_search"], "has_results": false}
+{"say": "How was your day?", "tools": [], "has_results": false}
+{"say": "Where's the closest florist?", "tools": ["web_search"], "has_results": false}
+{"say": "Where's the closest vet?", "tools": ["web_search"], "has_results": false}
+{"say": "Look up when the Berlin Wall fell", "tools": ["web_search"], "has_results": false}
+{"say": "Find me a bakery near me", "tools": ["web_search"], "has_results": false}
+{"say": "I'd like to know how long a marathon is", "tools": ["web_search"], "has_results": false}
+{"say": "More please", "tools": ["more_results", "web_search"], "has_results": true}
+{"say": "Read the next one", "tools": ["more_results", "web_search"], "has_results": true}
+{"say": "Tell me who painted the Mona Lisa", "tools": ["web_search"], "has_results": false}
+{"say": "I'd like to know how many bones a human has", "tools": ["web_search"], "has_results": false}
+{"say": "What's new in recipes?", "tools": ["web_search"], "has_results": false}
+{"say": "Save a note that the car needs oil", "tools": ["save_note", "search_notes"], "has_results": false}
+{"say": "Do you know how long a marathon is?", "tools": ["web_search"], "has_results": false}
+{"say": "Do you know who painted the Mona Lisa?", "tools": ["web_search"], "has_results": false}
+{"say": "Can you recommend a tailor in my area?", "tools": ["web_search"], "has_results": false}
+{"say": "Find me a vet near me", "tools": ["web_search"], "has_results": false}
+{"say": "Do you know how many bones a human has?", "tools": ["web_search"], "has_results": false}
+{"say": "I'm tired today", "tools": [], "has_results": false}
+{"say": "Any plumbers around here?", "tools": ["web_search"], "has_results": false}
+{"say": "Tell me when the Berlin Wall fell", "tools": ["web_search"], "has_results": false}
+{"say": "That's funny", "tools": [], "has_results": false}
+{"say": "Find me a bike shop near me", "tools": ["web_search"], "has_results": false}
+{"say": "Can you recommend a bakery in my area?", "tools": ["web_search"], "has_results": false}
+{"say": "Can you recommend a plumber in my area?", "tools": ["web_search"], "has_results": false}
+{"say": "Find me a fabric store near me", "tools": ["web_search"], "has_results": false}
+{"say": "Is there a hardware store nearby?", "tools": ["web_search"], "has_results": false}
+{"say": "Any butchers around here?", "tools": ["web_search"], "has_results": false}
+{"say": "Where's the closest tailor?", "tools": ["web_search"], "has_results": false}
+{"say": "Do you know who wrote Dracula?", "tools": ["web_search"], "has_results": false}
+{"say": "Where's the closest bakery?", "tools": ["web_search"], "has_results": false}
+{"say": "Tell me how many bones a human has", "tools": ["web_search"], "has_results": false}
+{"say": "Is there a barber nearby?", "tools": ["web_search"], "has_results": false}
+{"say": "Where's the closest hardware store?", "tools": ["web_search"], "has_results": false}
+{"say": "Do you know when the Berlin Wall fell?", "tools": ["web_search"], "has_results": false}
+{"say": "Any bakerys around here?", "tools": ["web_search"], "has_results": false}
+{"say": "Is there a bakery nearby?", "tools": ["web_search"], "has_results": false}
+{"say": "Look up who painted the Mona Lisa", "tools": ["web_search"], "has_results": false}
+{"say": "Find me a plumber near me", "tools": ["web_search"], "has_results": false}
+{"say": "Any vets around here?", "tools": ["web_search"], "has_results": false}
+{"say": "Is there a tire shop nearby?", "tools": ["web_search"], "has_results": false}

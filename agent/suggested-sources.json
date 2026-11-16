@@ -1,0 +1,49 @@
+{
+  "about": "Suggestions only: Othos does not call any of these yet. They are free (or free to try) web APIs that fit gardening, books, recipes and movies/TV. Each person decides which to use and gets their own key. Terms were read on Nov 16, 2026; check them again before you use one. Othos's built-in RSS feeds for these topics are separate and need nothing from you (personal.json \"topic_feeds\" adds or drops feeds).",
+  "topics": {
+    "books": [
+      {"name": "Open Library", "url": "https://openlibrary.org/developers/api", "key": "none",
+       "terms": "1 request a second (3 if you identify your app with a User-Agent and email). Cache responses. Not meant as the backend for another service. Data licence: see openlibrary.org/developers/licensing.",
+       "good_for": "who wrote a book, books on a subject"},
+      {"name": "Google Books", "url": "https://developers.google.com/books/docs/v1/using", "key": "free key from the Google API Console",
+       "terms": "Its own page says public-data requests need a key. Quota and licence terms are not on that page.",
+       "good_for": "book search by title, author or ISBN"}
+    ],
+    "movies_tv": [
+      {"name": "TVmaze", "url": "https://www.tvmaze.com/api", "key": "none",
+       "terms": "20 calls per 10 seconds per IP. Data is CC BY-SA 4.0: link back to TVmaze. A User-Agent that names your app is recommended.",
+       "good_for": "TV shows, schedules, when the next episode is on"},
+      {"name": "OMDb", "url": "https://www.omdbapi.com/", "key": "free key by email",
+       "terms": "Content is CC BY-NC 4.0 (non-commercial). The free daily limit is on its key page.",
+       "good_for": "movie and series details by title"},
+      {"name": "Apple iTunes Search", "url": "https://performance-partners.apple.com/search-api", "key": "none",
+       "terms": "About 20 calls a minute. Previews may be streamed, not saved. No licence for the data itself is stated.",
+       "good_for": "movie, TV and ebook search"},
+      {"name": "TMDB", "url": "https://www.themoviedb.org/api-terms-of-use", "key": "free key, with terms",
+       "terms": "Non-commercial only, needs its logo and a notice, no caching longer than 6 months. Its terms forbid use with LLM or chatbot applications, so check them before using it with a voice assistant.",
+       "good_for": "the largest movie and TV database (see the terms first)"}
+    ],
+    "recipes": [
+      {"name": "Open Food Facts", "url": "https://openfoodfacts.github.io/openfoodfacts-server/api/", "key": "none",
+       "terms": "15 product reads and 10 searches a minute. Always send a User-Agent like AppName/1.0 (your email). Data is ODbL, images CC BY-SA.",
+       "good_for": "what is in a packaged food, by barcode"},
+      {"name": "USDA FoodData Central", "url": "https://fdc.nal.usda.gov/api-guide", "key": "free key from data.gov",
+       "terms": "1,000 requests an hour per IP. Public domain (CC0). Keep your key out of public code.",
+       "good_for": "nutrition facts for foods"},
+      {"name": "TheMealDB", "url": "https://www.themealdb.com/api.php", "key": "test key \"1\" for development and education",
+       "terms": "Its page asks you to become a supporter before releasing an app publicly. Rate limits and attribution are in its terms page.",
+       "good_for": "recipes by name or ingredient"}
+    ],
+    "gardening": [
+      {"name": "Open-Meteo", "url": "https://open-meteo.com/en/docs", "key": "none",
+       "terms": "Non-commercial use only (no ads or subscriptions), under 10,000 calls a day, CC BY 4.0.",
+       "good_for": "soil temperature and moisture, evapotranspiration for your location"},
+      {"name": "phzmapi (USDA hardiness zone by ZIP)", "url": "https://phzmapi.org/", "key": "none",
+       "terms": "No stated limit; please cache. Based on the 2023 map; not the official USDA map. Not every ZIP is covered.",
+       "good_for": "your plant hardiness zone"},
+      {"name": "Perenual", "url": "https://perenual.com/docs/api", "key": "free key",
+       "terms": "Free-tier limits are on its pricing page. Plant images carry their own licences.",
+       "good_for": "plant care facts for thousands of species"}
+    ]
+  }
+}

@@ -27,6 +27,13 @@
     "feeds": []
   },
 
+  "topic_feeds": {
+    "gardening": {"feeds": [], "drop": []},
+    "recipes": {"feeds": [], "drop": []},
+    "books": {"feeds": [], "drop": []},
+    "movies": {"feeds": [], "drop": []}
+  },
+
   "pronunciations": {},
 
   "keyterms": [],

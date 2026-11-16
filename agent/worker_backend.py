@@ -23,6 +23,8 @@ from pathlib import Path
 import httpx
 import psutil
 
+import worker_shared
+
 log = logging.getLogger("worker")
 
 CPU_ONLY_ENV = {"CUDA_VISIBLE_DEVICES": "-1", "HIP_VISIBLE_DEVICES": "-1", "GGML_VK_VISIBLE_DEVICES": ""}
@@ -119,6 +121,9 @@ class OllamaBackend:
                 "keep_alive": self.cfg.get("keep_alive", "10m"),
                 "options": {"num_gpu": 0, "num_thread": threads,
                             "num_ctx": int(self.cfg.get("context_tokens", 8192)), "num_predict": max_tokens}}
+        schema = worker_shared.ANSWER_SCHEMA.get()
+        if schema:
+            body["format"] = schema                    # Ollama holds the answer to this shape
         out = []
         with httpx.stream("POST", f"{self.url}/api/chat", json=body, timeout=_read_timeout(self.cfg)) as r:
             if r.status_code != 200:
@@ -183,6 +188,9 @@ class LlamaServerBackend:
     def chat(self, model: str, messages: list[dict], threads: int, max_tokens: int, should_stop) -> str:
         self._ensure(model, threads)
         body = {"model": model, "messages": messages, "stream": True, "max_tokens": max_tokens}
+        schema = worker_shared.ANSWER_SCHEMA.get()
+        if schema:
+            body["json_schema"] = schema               # llama-server holds the answer to this shape
         out = []
         with httpx.stream("POST", f"{self.url}/v1/chat/completions", json=body,
                           timeout=_read_timeout(self.cfg)) as r:

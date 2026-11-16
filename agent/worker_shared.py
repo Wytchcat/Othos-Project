@@ -16,10 +16,28 @@ import json
 import os
 import re
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 import gaming
 import personal
+
+# The shape an answer must have (a JSON schema), for the calls made inside `with answer_shape(schema):`. Ollama,
+# llama-server and the cloud providers that support it hold the model to it; others answer as before, so the
+# caller still reads a plain answer (Nov 16, checkers plan phase 2: weak models answered "no edits" or broke the
+# edit format).
+ANSWER_SCHEMA: ContextVar = ContextVar("answer_schema", default=None)
+
+
+@contextmanager
+def answer_shape(schema: dict | None):
+    token = ANSWER_SCHEMA.set(schema)
+    try:
+        yield
+    finally:
+        ANSWER_SCHEMA.reset(token)
+
 
 HERE = Path(__file__).parent
 STATE_DIR = HERE / "state"
