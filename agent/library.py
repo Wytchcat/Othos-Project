@@ -8,7 +8,8 @@ One page = one UTF-8 markdown file under library\\<source>\\<slug>.md with a sho
     library.add_page("wordpress/extensions/woocommerce", "orders", "Orders", "https://...", text,
                      licence="GPL-2.0", version="9.4")
     library.search("refund an order", source="wordpress/extensions/woocommerce")
-    # -> [{"title", "url", "source", "slug", "snippet", "fetched", "licence", "version", "score"}]
+    # -> [{"title", "url", "source", "slug", "snippet", "text", "path", "fetched", "licence", "version", "score"}]
+    # ("text" is the whole best-matching passage, up to about 1,200 characters; "snippet" is the short highlighted piece)
 
 A source is a folder path ("joomla/extensions/zoo"). search(source=X) matches X and everything under it,
 so "joomla" searches all of Joomla and "joomla/extensions/zoo" only ZOO.
@@ -108,7 +109,7 @@ def remove(source: str, slug: str) -> bool:
     return False
 
 
-def add_file(path, source: str, licence: str = "unknown", title: str = "") -> Path:
+def add_file(path, source: str, licence: str = "unknown", title: str = "", url: str = "") -> Path:
     """Add one of the person's own files (.txt, .md, .pdf) as a page. PDFs need the pypdf package."""
     path = Path(path)
     ext = path.suffix.lower()
@@ -121,7 +122,7 @@ def add_file(path, source: str, licence: str = "unknown", title: str = "") -> Pa
         raise ValueError(f"{ext or 'that'} files aren't supported yet (use .txt, .md or .pdf)")
     if len(text.strip()) < 40:
         raise ValueError(f"{path.name} has no readable text (a scanned PDF would need OCR)")
-    return add_page(source, path.stem, title or path.stem, "file:" + path.name, text, licence=licence)
+    return add_page(source, path.stem, title or path.stem, url or "file:" + path.name, text, licence=licence)
 
 
 def _pdf_text(path: Path) -> tuple[str, str]:
@@ -213,29 +214,43 @@ def _match_query(query: str, any_word: bool = False) -> str:
     return (" OR " if any_word else " ").join(f'"{w}"' for w in words)
 
 
-def search(query: str, source: str = "", limit: int = 5) -> list[dict]:
-    """Best matching pages for a question, one result per page. source limits to a folder and everything under it."""
+def available() -> bool:
+    """True if the library has any pages (cheap: no index is created or opened)."""
+    try:
+        return any(LIBRARY.rglob("*.md"))
+    except OSError:
+        return False
+
+
+def keywords(query: str) -> list[str]:
+    return re.findall(r"[a-z0-9_]+", _match_query(query).replace('"', " "))
+
+
+def search(query: str, source: str = "", limit: int = 5, strict: bool = False) -> list[dict]:
+    """Best matching pages for a question, one result per page. source limits to a folder and everything under it.
+    strict=True only returns pages that contain every keyword (no any-word fallback)."""
     if time.monotonic() - _last_sync > 60:
         reindex()
     src = clean_source(source) if source else ""
     results: dict[str, dict] = {}
     with _db() as db:
-        for any_word in (False, True):           # every word first; if nothing, any word
+        for any_word in ((False,) if strict else (False, True)):   # every word first; if nothing, any word
             match = _match_query(query, any_word)
             if not match:
                 return []
             sql = ("SELECT title, source, slug, url, fetched, licence, version, path, "
-                   "snippet(chunks, 1, '', '', ' ... ', 24), bm25(chunks, 4.0, 1.0) FROM chunks WHERE chunks MATCH ?")
+                   "snippet(chunks, 1, '', '', ' ... ', 24), bm25(chunks, 4.0, 1.0), text FROM chunks WHERE chunks MATCH ?")
             args: list = [match]
             if src:
                 sql += " AND (source = ? OR source LIKE ?)"
                 args += [src, src + "/%"]
             sql += " ORDER BY bm25(chunks, 4.0, 1.0) LIMIT ?"
             args.append(limit * 6)
-            for t, s, sl, u, f, lic, v, path, snip, score in db.execute(sql, args):
+            for t, s, sl, u, f, lic, v, path, snip, score, body in db.execute(sql, args):
                 if path not in results:
                     results[path] = {"title": t, "source": s, "slug": sl, "url": u, "fetched": f, "licence": lic,
-                                     "version": v, "snippet": snip.replace("\n", " ").strip(), "score": round(-score, 3)}
+                                     "version": v, "snippet": snip.replace("\n", " ").strip(), "score": round(-score, 3),
+                                     "text": body, "path": path}
             if results:
                 break
     return list(results.values())[:limit]

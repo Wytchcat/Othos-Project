@@ -938,6 +938,7 @@ class FirestarterForm : Form
     readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
     Process worker;
     bool loadingModels, stopping;
+    string runningTask = "";   // the task the worker is on now ("" = none), for the Close button's question
     string askedOut = "";      // the task already asked about free tokens (worker_cloud.Chain)
     ProgressForm progress;     // the live steps window (one at a time)
 
@@ -949,7 +950,7 @@ class FirestarterForm : Form
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
 #if SMITHY
-        ClientSize = new Size(420, 176 + 36 * FirestarterApp.Tiers.Length + 128 + 62 + 38 + 38);
+        ClientSize = new Size(420, 176 + 36 * FirestarterApp.Tiers.Length + 128 + 62 + 38 + 38 + 38);
 #else
         ClientSize = new Size(420, 176 + 36 * FirestarterApp.Tiers.Length + 116 + 166 + 76);
 #endif
@@ -1019,6 +1020,16 @@ class FirestarterForm : Form
         // a build's plan, for her yes, no, or answers (PlanForm)
         plansButton = MakeButton("Plans…", 150, y2 + 120, 250);
         plansButton.Click += (s, e) => LoadPlans(true);
+        // close The Smithy and its worker, the same as the window's X (Nov 16, the user: there was no Close button)
+        var closeButton = MakeButton("Close The Smithy", 150, y2 + 158, 250);
+        closeButton.Click += (s, e) =>
+        {
+            if (runningTask != "" && ThemedBox.Show(this, "Task " + runningTask + " is running. Close The Smithy? " +
+                    "The task stops here and goes back in the queue; it picks up where it left off when The Smithy " +
+                    "starts again.", Text, MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+                return;
+            Close();
+        };
 #else
         var wpButton = MakeButton("WordPress drafts\u2026", 150, y2 + 82, 250);
         wpButton.Click += (s, e) => { using (var d = new WordPressForm()) d.ShowDialog(this); };
@@ -1399,6 +1410,7 @@ class FirestarterForm : Form
                               st == "waiting for free tokens" ? Gold : Ember;
         }
         string tid = Get(s, "task_id");
+        runningTask = alive ? tid : "";
         string pct = Get(s, "progress") != "" ? " " + (int)(Convert.ToDouble(Get(s, "progress")) * 100) + "%" : "";
         string el = Get(s, "elapsed") != "" ? ", " + Get(s, "elapsed") + " s" : "";
         var paused = s != null && s.ContainsKey("paused_task") ? s["paused_task"] as Dictionary<string, object> : null;
@@ -2297,7 +2309,8 @@ class DocsForm : Form
             {
                 if (stopping) break;
                 string name = names[key], final = null; bool ok = false;
-                var p = FirestarterApp.Start("ext_docs.py fetch " + site + " " + key);
+                // she ticked it and pressed Download: that's the approval docs_fetch needs
+                var p = FirestarterApp.Start("ext_docs.py fetch " + site + " " + key + " --approved");
                 job = p;
                 string line;
                 while ((line = p.StandardOutput.ReadLine()) != null)

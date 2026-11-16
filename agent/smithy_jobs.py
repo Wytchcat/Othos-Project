@@ -1501,6 +1501,29 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
     stdlib_only = bool(_STDLIB_ONLY.search(p.get("request", "")))
     wants_tests = only is None and bool(_WANTS_TESTS.search(p.get("request", "")))
 
+    def _adds_problems(rel: str, old: str, new: str) -> str:
+        """The build problems an edit adds to this file ('' when none: the same number or fewer), from the build
+        check on this file alone (Nov 16, task 56: a Sandbox fix pasted academy_readme.py's code into the top of
+        test_academy.py with none of its imports, so 12 undefined names in a file that was clean, and the run ended
+        there)."""
+        if new == old or not rel.lower().endswith((".py", ".cs", ".ps1", ".psm1", ".json")):
+            return ""
+        path = inside(folder, rel)
+        try:
+            before = build_problems(folder, [rel], stdlib_only)[0]
+            path.write_text(new, encoding="utf-8")
+            after = build_problems(folder, [rel], stdlib_only)[0]
+        except Exception:
+            return ""
+        finally:
+            path.write_text(old, encoding="utf-8")
+        if len(after) <= len(before):
+            return ""
+        old_kinds = {re.sub(r"line \d+", "", x) for x in before}
+        added = [x for x in after if re.sub(r"line \d+", "", x) not in old_kinds] or after[len(before):]
+        return f"{len(after) - len(before)} new build problem{'s' if len(after) - len(before) != 1 else ''}: " \
+               + "; ".join(added[:6])
+
     def fix(rel: str, what: str, must: bool = False) -> None:
         """`must`: the check named this file for a change it found missing, so "no edits" isn't an answer: the
         file is then written whole (Nov 15, task 56: models answered no edits while the glossary had no ids)."""
@@ -1526,7 +1549,7 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
             notes.append(f"`{rel}`: no edits came back for a change the check found missing here"
                          + (f"; the file was then written whole ({whole})" if whole else "; kept as it was"))
             return
-        broke = _breaks(rel, written[rel], body)
+        broke = _breaks(rel, written[rel], body) or _adds_problems(rel, written[rel], body)
         if broke:
             # edits that turn a file that parsed into one that doesn't aren't kept (Nov 16, task 56: the last
             # round's edit replaced unittest.main() with new tests, leaving `if __name__ == ...:` empty, and the
@@ -1540,7 +1563,7 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
                     rel, written[rel], none_ok=True)
             except ValueError:
                 body = written[rel]
-            again = _breaks(rel, written[rel], body)
+            again = _breaks(rel, written[rel], body) or _adds_problems(rel, written[rel], body)
             if again:
                 notes.append(f"`{rel}`: its edits broke the file twice ({again}), so they weren't kept")
                 return

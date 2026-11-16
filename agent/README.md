@@ -15,6 +15,7 @@ mixed and offline modes, the voice commands, privacy, hardware and troubleshooti
 | `sources.py` | free sources tried before Tavily (weather, RSS, Stack Exchange, Wikipedia, OpenStreetMap places near your town, Brave Search, quakes, air quality and smoke, built-in gardening, recipe, book and movie feeds...) |
 | `download_scan.py` | virus scan for downloads: Microsoft Defender or ClamAV scan each file before it is used; a hit is set aside; models must be real GGUF files. If Defender is off you pick your antivirus from a list (`personal.json` "antivirus") |
 | `library.py` | the local reference library: pages kept in `library\` (never committed) and searched without the internet; shared by Othos and its workers; your own .txt, .md and .pdf files can be added |
+| `library_window.py` | the Add documents window (open with `library-add.ps1`): put PDFs, .txt and .md files into the library from this computer, or from your own AWS S3 bucket with a read-only key (the window shows how to make one) |
 | `suggested-sources.json` | free web APIs for gardening, books, recipes and movies/TV that you can add yourself (suggestions only; read their terms first) |
 | `personal.py` | reads `personal.json` (your name, town, local feeds); `personal.example.json` shows the fields |
 | `gaming.py`, `gaming.json` | gaming mode |

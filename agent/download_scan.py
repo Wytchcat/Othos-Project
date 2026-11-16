@@ -146,6 +146,15 @@ def check_gguf(path: Path) -> bool:
         return False
 
 
+def check_pdf(path: Path) -> bool:
+    """A PDF starts with %PDF (within its first kilobyte)."""
+    try:
+        with open(path, "rb") as fh:
+            return b"%PDF-" in fh.read(1024)
+    except OSError:
+        return False
+
+
 def quarantine(path: Path) -> Path:
     q = path.parent / "quarantine"
     q.mkdir(exist_ok=True)
@@ -211,6 +220,9 @@ def vet_download(path, kind: str = "data") -> dict:
     if kind == "data" and re.search(r"\.gguf(\.part)?$", path.name, re.I) and not check_gguf(path):
         q = quarantine(path)
         return {"status": "found", "ok": False, "engine": "", "detail": f"{path.name} isn't a real GGUF model file, so it was set aside in {q.parent}."}
+    if path.suffix.lower() == ".pdf" and not check_pdf(path):
+        q = quarantine(path)
+        return {"status": "found", "ok": False, "engine": "", "detail": f"{path.name} isn't a real PDF, so it was set aside in {q.parent}."}
     r = scan(path, kind)
     if r["status"] == "found":
         if path.exists():

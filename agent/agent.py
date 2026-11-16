@@ -44,6 +44,7 @@ from workers_voice import WorkersVoice  # Firestarter (site work) and the Smithy
 import workers_voice  # (its INSTALLED list, for the self-check)
 import selfcheck  # the quiet self-check behind "How are you?"
 import searchctx  # searches keep the topic and the user's town: searchctx.py
+import library  # the user's own saved reference pages: library.py
 import sources  # free sources tried before Tavily: sources.py
 import personal  # the user's name, town, feeds and respellings: personal.json
 
@@ -106,6 +107,12 @@ _ANSWER_FROM_RESULTS = (
     "\nAnswer the user's question from these results only, in one or two sentences, "
     "the way you'd tell a friend. Don't mention 'the results' or number them. "
     "If they don't answer it, say so."
+)
+# Pages from the user's own library (reference copies saved on this PC; they can be out of date)
+_ANSWER_FROM_LIBRARY = (
+    "\nThese are pages the user saved in their own library. Answer the user's question from them only, in one to three "
+    "sentences, and say it comes from their library (name the page if that helps). They may be out of date: if they "
+    "don't answer the question, say so."
 )
 # Answers from Stack Exchange (free) are people's advice, not checked facts: said that way
 _ANSWER_FROM_QA = (
@@ -2878,6 +2885,12 @@ class Assistant(Agent):
                 free = None
             if free is not None:
                 return free
+        # the user's own library (library.py): reference pages kept on this PC, found only when every keyword matches
+        if (not force_web and not local_ask and not recent and not _WEATHER_TOPIC.search(clean)
+                and not _PRICE_ASK.search(user or clean) and library.available()):
+            lib = await self._library_answer(clean, user or clean)
+            if lib is not None:
+                return lib
         # OpenStreetMap (sources.py): "Where's a butcher near me?" lists the nearest named places around the user's town,
         # by code. It has no reviews, so it offers a web search for those (Brave).
         brave_next, self._brave_next = self._brave_next, False
@@ -2979,6 +2992,28 @@ class Assistant(Agent):
         if weather:
             extra += " Give temperatures in Fahrenheit."
         return self._answer_page(max(3, min(asked_n or 3, 5))) + _ANSWER_FROM_RESULTS + extra
+
+    async def _library_answer(self, clean: str, user: str) -> str | None:
+        """Passages from the user's own library (library\\), for the model to answer from; None if nothing fits.
+        Needs two or more keywords and every one of them in the page, so a stray word doesn't pull in a page."""
+        if len(library.keywords(clean)) < 2:
+            return None
+        try:
+            hits = await asyncio.wait_for(asyncio.to_thread(library.search, clean, "", 3, True), timeout=4)
+        except Exception as e:
+            log.info("library search failed: %s", e)
+            return None
+        if not hits:
+            return None
+        log.info("library answer for %r from %s", clean, [h["path"].rsplit("library", 1)[-1] for h in hits])
+        self._results = [{"title": h["title"], "url": h["url"] if h["url"].startswith("http") else "",
+                          "content": h["text"], "outlet": "your library"} for h in hits]
+        self._cursor = len(self._results)
+        lines = []
+        for i, h in enumerate(hits, 1):
+            when = f", saved {h['fetched']}" if h.get("fetched") else ""
+            lines.append(f"{i}. {h['title']}: {_clean_text(h['text'])[:320]} (from your library, {h['source'].split('/')[0]}{when})")
+        return "\n".join(lines) + _ANSWER_FROM_LIBRARY
 
     def _osm_reply(self, kind, places: list[dict]) -> str:
         """The places OpenStreetMap lists near the user's town, worded by code. It has no reviews: says so."""

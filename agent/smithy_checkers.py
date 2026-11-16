@@ -79,11 +79,13 @@ def _cap(found: list[tuple[str, int, str]]) -> list[str]:
 # ---------------------------------------------------------------- Python
 def ruff_errors(folder: Path, rels: list[str]) -> list[str] | None:
     """ruff's serious checks only: syntax, undefined names, `return` outside a function and the like (E9, F63,
-    F7, F82), not style."""
+    F7, F82), and a name defined again before it's used (F811: Nov 16, task 56's test file held a pasted copy of
+    academy_readme.py's functions, overwritten by the import below them; it also catches two tests with one name,
+    where only the second runs), not style."""
     exe = _tool("ruff", Path(sys.executable).parent / "ruff.exe")
     if not exe:
         return None
-    r = _run([exe, "check", "--no-cache", "--isolated", "--output-format", "json", "--select", "E9,F63,F7,F82",
+    r = _run([exe, "check", "--no-cache", "--isolated", "--output-format", "json", "--select", "E9,F63,F7,F82,F811",
               "--target-version", "py312", *rels], folder)
     if r is None:
         return None
