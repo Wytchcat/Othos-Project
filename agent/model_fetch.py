@@ -180,7 +180,28 @@ def _download(url: str, dest: Path, size: int = 0, sha256: str = "", label: str 
             part.unlink()
             raise RuntimeError(f"{label}: checksum doesn't match Hugging Face's, so the file was deleted. "
                                "Try again to download it fresh.")
+    _vet(part, label)
     part.replace(dest)
+
+
+def _vet(part: Path, label: str) -> None:
+    """Virus scan and file-type check before a download is used (download_scan.py). Skipped quietly if
+    that file isn't beside this one (a copy without it)."""
+    try:
+        import download_scan
+    except ImportError:
+        return
+    emit(event="progress", done=0, total=0, status=f"Scanning {label}")
+    r = download_scan.vet_download(part, "data")
+    if r["status"] == "ask":
+        # Defender is off and no product is chosen: the window shows a drop-down (r["products"]) and
+        # saves the pick with `download_scan.py choose NAME`. This download carries on (a model file is
+        # data and has passed the type check); the next one uses the pick.
+        emit(event="av_needed", products=r["products"])
+    elif not r["ok"]:
+        raise RuntimeError(f"{label}: {r['detail']}")
+    elif r["status"] == "unchecked":
+        emit(event="progress", done=0, total=0, status=r["detail"])
 
 
 def get_hf(repo: str, name: str) -> None:

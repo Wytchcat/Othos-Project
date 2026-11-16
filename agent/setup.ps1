@@ -63,6 +63,13 @@ else {
     $zip = Join-Path $env:TEMP $asset.name
     Write-Host "   downloading $($asset.name) ($([math]::Round($asset.size / 1MB)) MB) from GitHub"
     Invoke-WebRequest $asset.browser_download_url -OutFile $zip
+    # virus scan with Microsoft Defender if it is running (download_scan.py handles other products later, once Python is set up)
+    $mp = Join-Path $env:ProgramData "Microsoft\Windows Defender\Platform\CurrentVersion\MpCmdRun.exe"
+    if ((Test-Path $mp) -and ((Get-MpComputerStatus -ErrorAction SilentlyContinue).AMServiceEnabled)) {
+        & $mp -Scan -ScanType 3 -File $zip -DisableRemediation | Out-Null
+        if ($LASTEXITCODE -eq 2) { Remove-Item $zip -Force; Stop-Setup "Microsoft Defender reported a threat in the LiveKit download, so it was deleted. Try again later." }
+        Ok "Microsoft Defender scanned the download: nothing found"
+    } else { Warn "no virus scan: Microsoft Defender isn't running. The file came from LiveKit's official GitHub release." }
     Expand-Archive $zip -DestinationPath $Lk -Force
     Remove-Item $zip
     Ok "LiveKit server $($rel.tag_name) in $Lk"

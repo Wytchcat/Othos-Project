@@ -295,6 +295,77 @@ static class ThemedBox
     }
 }
 
+// "Which antivirus do you use?" (Nov 16, download_scan.py): shown when model_fetch says av_needed
+// (Defender is off and nothing is chosen). A themed, resizable drop-down of the products, the
+// installed one picked first, each with its price and what Othos can do with it; "Something else"
+// and "None" come last. OK saves the pick (download_scan.py choose); Escape, X or Cancel saves
+// nothing, so it's asked again next time.
+static class AntivirusPicker
+{
+    static readonly Color Bg = Color.FromArgb(2, 7, 5), Ink = Color.FromArgb(200, 230, 210),
+        Dim = Color.FromArgb(120, 140, 130), PurpleFill = Color.FromArgb(14, 16, 25),
+        PurpleLine = Color.FromArgb(64, 53, 105), PurpleHover = Color.FromArgb(25, 24, 43);
+
+    static string S(Dictionary<string, object> d, string k)
+    { return d != null && d.ContainsKey(k) && d[k] != null ? Convert.ToString(d[k]) : ""; }
+
+    // the chosen name, or null when nothing was chosen
+    public static string Ask(IWin32Window owner, System.Collections.IEnumerable products)
+    {
+        var list = new List<Dictionary<string, object>>();
+        foreach (var o in products) { var d = o as Dictionary<string, object>; if (d != null && S(d, "name") != "") list.Add(d); }
+        if (list.Count == 0) return null;
+        using (var f = new Form())
+        {
+            f.Text = FirestarterApp.Name + ": antivirus";
+            f.FormBorderStyle = FormBorderStyle.FixedDialog; f.MaximizeBox = false; f.MinimizeBox = false;
+            f.ShowInTaskbar = false;
+            try { f.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
+            f.BackColor = Bg; f.ForeColor = Ink; f.Font = new Font("Segoe UI", 10f);
+            f.ClientSize = new Size(500, 236);
+
+            var msg = new Label(); msg.ForeColor = Ink; msg.SetBounds(30, 18, 450, 44);
+            msg.Text = "Microsoft Defender isn't running, so downloads can't be scanned. Which antivirus do you use?";
+            f.Controls.Add(msg);
+            var pick = new ComboBox(); pick.DropDownStyle = ComboBoxStyle.DropDownList; pick.FlatStyle = FlatStyle.Flat;
+            pick.BackColor = PurpleFill; pick.ForeColor = Ink; pick.SetBounds(30, 68, 450, 28);
+            int start = -1;
+            for (int i = 0; i < list.Count; i++)
+            {
+                var d = list[i]; bool have = Convert.ToBoolean(d.ContainsKey("installed") ? d["installed"] : false);
+                pick.Items.Add(S(d, "name") + (S(d, "price") != "" ? "   (" + S(d, "price") + ")" : "") + (have ? "   installed" : ""));
+                if (have && start < 0) start = i;
+            }
+            pick.SelectedIndex = start >= 0 ? start : 0;
+            f.Controls.Add(pick);
+            var note = new Label(); note.ForeColor = Dim; note.SetBounds(30, 104, 450, 66); f.Controls.Add(note);
+            EventHandler show = (s, e) => { note.Text = S(list[pick.SelectedIndex], "note"); };
+            pick.SelectedIndexChanged += show; show(null, null);
+
+            Func<string, DialogResult, int, bool, Button> make = (t, r, x, main) =>
+            {
+                var b = new Button(); b.Text = t; b.DialogResult = r; b.SetBounds(x, 186, 100, 30);
+                b.FlatStyle = FlatStyle.Flat; b.BackColor = PurpleFill; b.ForeColor = Ink;
+                b.FlatAppearance.BorderColor = main ? FirestarterApp.Accent : PurpleLine;
+                b.FlatAppearance.MouseOverBackColor = PurpleHover; f.Controls.Add(b); return b;
+            };
+            var ok = make("OK", DialogResult.OK, 500 - 24 - 210, true);
+            var cancel = make("Cancel", DialogResult.Cancel, 500 - 24 - 100, false);
+            f.AcceptButton = ok; f.CancelButton = cancel;
+            var stripe = new Panel(); stripe.BackColor = FirestarterApp.Accent; stripe.SetBounds(0, 0, 6, f.ClientSize.Height);
+            f.Controls.Add(stripe);
+            f.Shown += (s, e) => pick.Focus();
+            AutoAnchor.Fit(f, true);                        // sizable, like every window
+            var o2 = owner as Form;
+            bool hidden = o2 == null || !o2.Visible || o2.WindowState == FormWindowState.Minimized;
+            f.StartPosition = hidden ? FormStartPosition.CenterScreen : FormStartPosition.CenterParent;
+            f.TopMost = hidden;
+            var answer = hidden ? f.ShowDialog() : f.ShowDialog(owner);
+            return answer == DialogResult.OK ? S(list[pick.SelectedIndex], "name") : null;
+        }
+    }
+}
+
 // "Get models" window: Hugging Face (GGUF), the Ollama library, or a direct https
 // link to a .gguf. The work is done by model_fetch.py, which prints progress lines.
 class DownloaderForm : Form
@@ -472,6 +543,24 @@ class DownloaderForm : Form
                 string kind = Str(ev, "event");
                 if (kind == "done") { ok = true; final = "Done: " + Str(ev, "model") + " is ready in the model switcher."; }
                 else if (kind == "error") final = "Failed: " + Str(ev, "message");
+                else if (kind == "av_needed" && ev.ContainsKey("products") && ev["products"] is System.Collections.IEnumerable)
+                {
+                    // Defender is off and no antivirus is chosen: ask which (download_scan.py); this
+                    // download carries on, the next one uses the pick
+                    var prods = (System.Collections.IEnumerable)ev["products"];
+                    try { BeginInvoke((Action)(() => {
+                        string name = AntivirusPicker.Ask(this, prods);
+                        if (name == null) return;
+                        ThreadPool.QueueUserWorkItem(__ => {
+                            string r = FirestarterApp.RunScript("download_scan.py choose \"" + name.Replace("\"", "") + "\"");
+                            bool saved = Parse(r) != null && Str(Parse(r), "chosen") == name;
+                            try { BeginInvoke((Action)(() => {
+                                if (!saved) ThemedBox.Show(this, "Couldn't save the antivirus choice. It will be asked again next time.",
+                                                           FirestarterApp.Name + ": antivirus", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                            })); } catch { }
+                        });
+                    })); } catch { }
+                }
                 else if (kind == "progress")
                 {
                     double done = Convert.ToDouble(ev["done"]), total = Convert.ToDouble(ev["total"]);
@@ -490,6 +579,11 @@ class DownloaderForm : Form
                 status.Text = final ?? "Stopped.";
                 if (ok) bar.Value = bar.Maximum;
                 UpdateInfo();
+                // a file the virus scan or the file-type check stopped (download_scan.py): said in a box, not
+                // only on the status line
+                if (!ok && final != null && final.StartsWith("Failed: ") && System.Text.RegularExpressions.Regex.IsMatch(final, "quarantine|set aside|threat|isn't a real GGUF|disappeared", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+                    ThemedBox.Show(this, "This download was blocked and not used.\n\n" + final.Substring("Failed: ".Length),
+                                   FirestarterApp.Name + ": download blocked", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             })); } catch { }
         });
     }

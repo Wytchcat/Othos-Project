@@ -40,6 +40,8 @@
 
   "model_check": "ask",
 
+  "antivirus": "",
+
   "_example": {
     "name": "Alex",
     "assistant": {"name": "Jarvis", "heard_as": ["Jervis"], "logo": "my-logo.png", "color": "#9d7bff"},

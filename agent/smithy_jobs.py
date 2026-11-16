@@ -1181,7 +1181,6 @@ _STDLIB_ONLY = re.compile(r"(?i)\bstandard[ -]library\b[^.\n]{0,20}\bonly\b|\bon
 _WANTS_TESTS = re.compile(r"(?i)\b(?:tests?|test_\w+\.py|\w+_test\.py)\b[^.\n]{0,40}\bpass(?:es|ing)?\b")
 _ITEM = re.compile(r"(?m)^\s*(\d{1,2})[.)]\s+(\S.*)$")
 _README_ITEM = re.compile(r"(?i)^\s*\d{1,2}[.)]\s+[`*]*README(?:\.md)?\b")
-_TICK = re.compile(r"(?mi)^[^\w\n]*(?:item[ \t]*)?(\d{1,2})[ \t]*[:.)\-][ \t]*\**(DONE|MISSING)\**\b[ \t:\-â€“]*([^\n]*)$")
 
 
 def numbered_items(change: str) -> dict[int, str]:
@@ -1193,41 +1192,185 @@ def numbered_items(change: str) -> dict[int, str]:
     return items
 
 
+_SUB = re.compile(r"\(([a-z])\)\s*(.+?)(?=;?\s*\([a-z]\)\s|\s*$)", re.S)
+_CHECKS_LINE = re.compile(r"(?mi)^\s*[-*]?\s*Checks?:\s*(.+(?:\n(?!\s*[-*]\s|\s*\d{1,2}[.)]\s).+)*)")
+# "2f: DONE - test_a.py: `assert x`", "2 (f): DONE ...", "**2.f** — DONE ..."
+_PROOF = re.compile(r"(?i)^[\s*|>\-]*(?:item\s*)?(\d{1,2})\s*[.\s]?\(?([a-z])?\)?[\s*]*[:.)\-–—|]+[\s*]*"
+                    r"(DONE|MISSING)\b\**[\s:\-–—|]*(.*)$")
+_PROOF_FILE = re.compile(r"[\w./\\-]+\.(?:py|json|ps1|psm1|cs|ts|js|java|xml|txt|ini|toml|cfg)\b")
+_SPLIT_CHECKLIST = 12_000      # tokens: a bigger checklist is asked one item at a time, so its files stay whole
+
+
+def sub_points(item: str) -> dict[str, str]:
+    """The lettered checks in an item's "Checks:" line: {"a": "...", "b": "..."} (task 56: "Checks: (a) ...; (b)
+    ...", seven in item 2; one tick for the whole item let (f) and (g) pass unwritten)."""
+    m = _CHECKS_LINE.search(item or "")
+    if not m:
+        return {}
+    return {k: re.sub(r"\s+", " ", v).strip(" ;.") for k, v in _SUB.findall(" ".join(m.group(1).split()))}
+
+
+def _is_test(rel: str) -> bool:
+    name = PurePosixPath(rel).name.lower()
+    return name.endswith(".py") and (name.startswith("test_") or name.endswith("_test.py"))
+
+
+def _norm(text: str) -> str:
+    return " ".join((text or "").split())
+
+
+def quote_shown(written: dict[str, str], where: str, quote: str, test: bool = False) -> str:
+    """Where a checker's quote really is: the file it's in, or '' (Nov 16, the user: "cite it or it's missing").
+    The quote must be at least 12 characters, found exactly (spaces aside) in a build file that isn't Markdown, not
+    only in comments; for a lettered check, inside a test_ function of a test file. The named file first, then
+    any (a model names the wrong file more often than it invents a line)."""
+    q = _norm(quote)
+    if len(q) < 12:
+        return ""
+    files = [r for r in written if not r.lower().endswith(".md")]
+    named = [r for r in files if where and (r == where or PurePosixPath(r).name == PurePosixPath(where).name)]
+    for rel in named + [r for r in files if r not in named]:
+        if test and not _is_test(rel):
+            continue
+        body = written[rel]
+        if q not in _norm(body):
+            continue
+        lines = body.splitlines()
+        first = _norm(quote.strip().splitlines()[0]) if quote.strip() else q
+        at = [i for i, l in enumerate(lines) if first[:60] in _norm(l) or _norm(l) and _norm(l) in first]
+        if at and all(lines[i].lstrip().startswith("#") for i in at):
+            continue                                   # only in a comment
+        if test:
+            try:
+                tree = ast.parse(body)
+            except SyntaxError:
+                continue
+            spans = [(n.lineno, n.end_lineno or n.lineno) for n in ast.walk(tree)
+                     if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test")]
+            if not any(a <= i + 1 <= b for i in at for a, b in spans):
+                continue
+        return rel
+    return ""
+
+
+def _parse_proofs(reply: str) -> dict[str, tuple[str, str, str, str]]:
+    """{"2" or "2f": (DONE|MISSING, file, quote, note)} from a checklist reply."""
+    got = {}
+    for line in (reply or "").splitlines():
+        m = _PROOF.match(line)
+        if not m:
+            continue
+        rest = m.group(4).strip()
+        quote = ""
+        tick = re.search(r"`([^`]+)`", rest)
+        if tick:
+            quote = tick.group(1)
+        elif rest.count('"') >= 2:
+            quote = rest[rest.index('"') + 1:rest.rindex('"')]
+        f = _PROOF_FILE.search(rest.replace(quote, "") if quote else rest)
+        key = m.group(1) + (m.group(2) or "").lower()
+        got.setdefault(key, (m.group(3).upper(), f.group(0).replace("\\", "/") if f else "", quote,
+                             re.sub(r"[`*]+", "", rest)[:200]))
+    return got
+
+
 def _checklist(ctx, p: dict, desc: str, plan: dict, written: dict[str, str], items: dict[int, str],
                cap: int, log_path: Path | None = None) -> dict[int, tuple[str, str]]:
-    """{item number: ("DONE" | "MISSING" | "NOT SAID", note)} for the numbered changes, from the files as they are."""
-    files = "\n\n".join(f"--- {path} ---\n{body[:cap]}" + ("\n(... cut here)" if len(body) > cap else "")
-                        for path, body in written.items() if not path.lower().endswith(".md"))
-    msgs = [{"role": "system", "content": SYSTEM},
-            {"role": "user", "content": f"The project: {redact(p['request'])}\n\nIts files now:\n\n{files}"},
-            {"role": "user", "content":
-             "These changes were asked for:\n\n" + redact("\n".join(items.values())) +
-             "\n\nCheck the files above, not the request: for each numbered change, reply with one line, "
-             "exactly \"N: DONE\" or \"N: MISSING - the file and what's missing\". Only DONE when the code "
-             "above really does it. No other text."}]
-    # room for models that think first (Nov 14, task 38: 1,500 left no ticks for 8 items, so all 8 read as
-    # missing); one more ask when none can be read
-    reply = ctx.chat(msgs, 4000)
-    got = {int(m.group(1)): (m.group(2).upper(), m.group(3).strip()[:200]) for m in _TICK.finditer(_unbold(reply))}
-    if not got:
-        log.info("checklist: no ticks in the reply (%d characters); asking again", len(reply))
-        more = ctx.chat(msgs + [{"role": "assistant", "content": reply},
-                                {"role": "user", "content": "I couldn't read that. Reply with only one line per "
-                                 "number, like \"1: DONE\" or \"2: MISSING - file: what's missing\"."}],
-                        8000 if not reply.strip() else 4000)   # an empty reply: it thought too long (task 42)
-        got = {int(m.group(1)): (m.group(2).upper(), m.group(3).strip()[:200]) for m in _TICK.finditer(_unbold(more))}
-        reply += "\n\n--- asked again ---\n\n" + more
+    """{item number: ("DONE" | "MISSING" | "NOT SAID", note)} for the numbered changes, from the files as they are.
+    Cite it or it's missing (Nov 16): each item and each of its lettered checks is its own line, and a DONE must
+    quote the line that does it; the quote is looked for in the files (quote_shown), and a DONE whose quote isn't
+    there counts as MISSING. An item is DONE only when it and all its checks are. A big checklist is asked one
+    item at a time, naming that item's files and the test files, so the step's shrink keeps them whole (task 56:
+    the test file was never named, so the checker saw only its outline and ticked checks that weren't written)."""
+    code = [r for r in written if not r.lower().endswith(".md")]
+    files = "\n\n".join(f"--- {path} ---\n{written[path][:cap]}" + ("\n(... cut here)" if len(written[path]) > cap
+                                                                    else "") for path in code)
+    tests = [r for r in code if _is_test(r)]
+    subs = {n: sub_points(t) for n, t in items.items()}
+
+    def ask(part: dict[int, str]) -> tuple[dict[str, tuple[str, str, str, str]], str]:
+        lines = []
+        for n in part:
+            lines.append(f"{n}: DONE - file: `the exact line from that file that does it`   (or {n}: MISSING - "
+                         "the file and what's missing)")
+            lines += [f"{n}{k}: DONE - test file: `the exact line, inside a test_ function, that checks ({k})`"
+                      for k in subs[n]]
+        read = sorted({r for n in part for r in _names(part[n], [{"path": x} for x in code], stems=True)}
+                      | (set(tests) if any(subs[n] for n in part) else set()))
+        msgs = [{"role": "system", "content": SYSTEM},
+                {"role": "user", "content": f"The project: {redact(p['request'])}\n\nIts files now:\n\n{files}"},
+                {"role": "user", "content":
+                 "These changes were asked for:\n\n" + redact("\n\n".join(part.values())) +
+                 "\n\nCheck the files above, not the request" + (f" (read {', '.join(read)} in full)" if read else "")
+                 + ". Reply with one line for each of these, and no other text:\n" + "\n".join(lines) +
+                 "\n\nA DONE must quote one exact line copied from the file, in backticks; the quote is looked up "
+                 "in the file, and a DONE whose quote isn't there counts as missing. A lettered check is DONE only "
+                 "when a test really checks it. If you can't quote it, it's MISSING."}]
+        # room for models that think first (Nov 14, task 38: 1,500 left no ticks for 8 items, so all 8 read as
+        # missing); one more ask when none can be read
+        reply = ctx.chat(msgs, 4000)
+        got = _parse_proofs(reply)
+        if not got:
+            log.info("checklist: no ticks in the reply (%d characters); asking again", len(reply))
+            more = ctx.chat(msgs + [{"role": "assistant", "content": reply},
+                                    {"role": "user", "content": "I couldn't read that. Reply with only the lines "
+                                     "asked for, like \"1: DONE - a.py: `the line`\" or \"2: MISSING - file: what's "
+                                     "missing\"."}],
+                            8000 if not reply.strip() else 4000)   # an empty reply: it thought too long (task 42)
+            got = _parse_proofs(more)
+            reply += "\n\n--- asked again ---\n\n" + more
+        return got, reply
+
+    whole = [{"role": "user", "content": files + "\n".join(items.values())}]
+    parts = ([{n: t} for n, t in items.items()] if len(items) > 1 and worker_cloud.prompt_tokens(whole)
+             > _SPLIT_CHECKLIST else [items])
+    got, replies = {}, []
+    for part in parts:
+        g, r = ask(part)
+        got.update({k: v for k, v in g.items() if k.rstrip("abcdefghijklmnopqrstuvwxyz").isdigit()
+                    and int(k.rstrip("abcdefghijklmnopqrstuvwxyz")) in part})
+        replies.append(r)
+
+    def proof(key: str, test: bool) -> tuple[str, str]:
+        """("DONE", "") when said and shown; ("MISSING", why) else; ("NOT SAID", "") when not answered."""
+        if key not in got:
+            return "NOT SAID", ""
+        state, where, quote, note = got[key]
+        if state != "DONE":
+            return "MISSING", note
+        if not quote:
+            return "MISSING", "said done, but quoted no line"
+        if quote_shown(written, where, quote, test):
+            return "DONE", ""
+        return "MISSING", (f"said done, but its quote isn't in {where or 'the files'}"
+                           + (" inside a test" if test else "") + f": `{quote[:80]}`")
+
+    out, shown = {}, []
+    for n in items:
+        state, note = proof(str(n), False)
+        if state == "NOT SAID" and not any(f"{n}{k}" in got for k in subs[n]):
+            out[n] = ("NOT SAID", "")
+            continue
+        why = [note] if state != "DONE" and note else ["the change itself: not answered"] if state == "NOT SAID" \
+            else []
+        lacking = []
+        for k, text in subs[n].items():
+            s, w = proof(f"{n}{k}", True)
+            if s != "DONE":
+                lacking.append(f"({k}) {text[:90]}" + (f" [{w}]" if w else ""))
+        if lacking:
+            where = f" in {', '.join(tests)}" if tests else ""
+            why.append(f"{len(lacking)} of {len(subs[n])} checks not shown in a test{where}: " + "; ".join(lacking))
+        out[n] = ("DONE", "") if state == "DONE" and not lacking else ("MISSING", "; ".join(why)[:900])
+        shown.append(f"{n}: {out[n][0]}" + (f" - {out[n][1]}" if out[n][1] else ""))
     if log_path is not None:                            # kept for review: what the checklist said, each round
         with open(log_path, "a", encoding="utf-8") as fh:
-            fh.write(f"=== checklist ({len(got)} of {len(items)} read) ===\n{reply}\n\n")
-    return {n: got.get(n, ("NOT SAID", "")) for n in items}
+            fh.write(f"=== checklist ({len(got)} lines read, {len(parts)} ask{'s' if len(parts) != 1 else ''}) "
+                     "===\n" + "\n\n--- next item ---\n\n".join(replies)
+                     + "\n\n--- after looking up the quotes ---\n" + "\n".join(shown) + "\n\n")
+    return out
 
 
-def _unbold(text: str) -> str:
-    """'**1:** DONE', '| 1 | DONE |', '- 1 — DONE' -> '1: DONE' (models format a checklist their own way)."""
-    text = re.sub(r"[*`]+|(?<!\w)_+|_+(?!\w)", "", text or "")       # keeps academy_fit.py's underscore
-    return re.sub(r"(?m)^[ \t|>\-]*(\d{1,2})[ \t]*(?:[|:.)\-–—]+[ \t]*)+(DONE|MISSING)\b[ \t|]*",
-                  r"\1: \2 ", text)
 
 
 def _no_change_no_done(ticks: dict[int, tuple[str, str]], written: dict[str, str], path: Path | None,
@@ -1366,6 +1509,13 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
         files_of = {n: sorted(_names(t, [{"path": r} for r in written if not r.lower().endswith(".md")], stems=True))
                     for n, t in items.items()}
         ticks = _no_change_no_done(ticks, written, found_path, files_of)
+        problems, checked = all_problems()
+        return ticks, problems, checked
+
+    def all_problems() -> tuple[list[str], list[str]]:
+        """Every check that needs no model: the build check, then the JSON fields and calls the change asks for.
+        The fix rounds use this too (Nov 16, task 56: they re-ran only build_problems, so the two missing record()
+        calls were never sent to a file and 3 rounds passed with no fix asked for)."""
         problems, checked = build_problems(folder, code, stdlib_only)
         # the JSON fields a change asks for, checked on every entry (task 56: the glossary had no ids for hours
         # while models said it did)
@@ -1394,7 +1544,7 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
             checked.append("calls the change asks for checked ("
                            + ", ".join(f"{f}: {', '.join(n + '()' for n in sorted(c))}" for f, c in calls.items())
                            + ")")
-        return ticks, problems, checked
+        return problems, checked
 
     same = {f["path"] for f in (plan or {}).get("files", []) if f.get("change") == "same"}
 
@@ -1457,15 +1607,21 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
                     steps.info("No fix went in this round, so the last check stands.")
                     break
             if problems:
-                problems, checked = build_problems(folder, code, stdlib_only)   # again: the edits may have changed them
+                problems, checked = all_problems()   # again: the edits may have changed them
                 for rel in code:
                     mine = [x for x in problems if x.startswith(rel + " ")]
                     if mine:
-                        fix(rel, "Fix only these build errors (Windows' own C# compiler / PowerShell parser / the "
-                                 "Python import check); every other line stays exactly as it is. If a class is "
+                        # the change's own words for this file, so "never calls record()" says what record() is
+                        # and when it's called (Nov 16, task 56)
+                        asked = [items[n] for n in items
+                                 if _names(items[n], [{"path": rel}], stems=True)] if use_list else []
+                        fix(rel, "Fix only these problems the checks found (the build check, and the fields and "
+                                 "calls the change asks for); every other line stays exactly as it is. If a class is "
                                  "defined twice across files, keep one. Fix the code itself: never by deleting or "
                                  "commenting out the import, call or test that found the problem (task 49 commented "
-                                 "out an import of a missing function):\n- " + "\n- ".join(mine[:30]))
+                                 "out an import of a missing function):\n- " + "\n- ".join(mine[:30])
+                            + ("\n\nWhat the change asks for, where it names this file:\n\n" + "\n\n".join(asked[:3])
+                               if asked else ""), must=True)
             old_ticks = ticks
             ticks, problems, checked = check()
             # a check that gave no answer for an item keeps the round before's answer, said as such
@@ -1478,7 +1634,7 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
         stopped = str(e)
         log.warning("build %d: checks stopped early: %s", job_id, stopped)
         steps.info("The checks stopped early: %s.", stopped)
-        problems, checked = build_problems(folder, code, stdlib_only)    # no model needed for these
+        problems, checked = all_problems()    # no model needed for these
         # the last check's answers stand (a fix may have been tried since, unchecked); none yet: not checked
         ticks = {n: (s, note + " (a fix was tried, not checked again)" if s == "MISSING" else note)
                  for n, (s, note) in ticks.items()} if ticks else {n: ("NOT SAID", "") for n in items} if use_list else {}
@@ -1509,7 +1665,7 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
                 if all((folder / r).exists() and (folder / r).read_bytes() == b for r, b in before.items()):
                     steps.info("No fix changed a file, so the last test run stands (not run again).")
                     break                    # task 55: a 10-minute Sandbox run again on the same files
-                problems, checked = build_problems(folder, code, stdlib_only)
+                problems, checked = all_problems()
                 if problems:
                     break
         except (BudgetOut, TooLongForLocal) as e:
