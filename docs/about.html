@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>About this guide</title>
+<meta name="description" content="How this guide was checked, licences and credits.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="layout">
+<nav class="site" aria-label="Guide">
+  <div class="brand">Othos</div><div class="sub">The user guide</div>
+  <ol>
+    <li><a href="index.html">Start here</a></li>
+    <li><a href="install.html">Install</a></li>
+    <li><a href="first-call.html">Your first call</a></li>
+    <li><a href="make-it-yours.html">Make it yours</a></li>
+    <li><a href="everyday.html">Everyday use</a></li>
+    <li><a href="smithy.html">The Smithy</a></li>
+    <li><a href="privacy.html">Privacy</a></li>
+    <li><a href="advanced.html">Advanced</a></li>
+    <li><a href="troubleshooting.html">Fixing problems</a></li>
+    <li><a href="words.html">Words explained</a></li>
+    <li><a href="about.html" aria-current="page">About this guide</a></li>
+  </ol>
+</nav>
+<main>
+<h1>About this guide</h1>
+<p class="lead">How far to trust it, and where Othos comes from.</p>
+
+<h2>How this guide was checked</h2>
+<p>Every page was written for someone who has never used Othos or a voice assistant before. The facts come from the project's own files. Here is what that means in practice:</p>
+<ul>
+  <li><strong>Checked against the setup and checker scripts:</strong> the steps and questions setup asks, the four models it downloads, the three settings files it makes, the <code>STOP:</code> messages, the lines <code>doctor.ps1</code> prints, and that <code>start-othos.bat</code> starts Othos. Setup was also tried on a clean Windows test machine with nothing installed, where it stopped at "Python 3.12 not found" as described.</li>
+  <li><strong>Taken from the project README and not re-tested for this guide:</strong> the voice commands, news and weather sources, The Smithy's task types, the privacy table, the hardware advice and the offline speech steps. If a command does not work the way a page says, please report it.</li>
+  <li><strong>Known to be untested:</strong> fully offline speech has only been checked to start up, never used in a real call.</li>
+</ul>
+<p>Figures such as download sizes and speeds are approximate and can change.</p>
+
+<h2>Updates</h2>
+<p>Othos is updated from time to time, and this guide is updated with it. The project's README lists what changed in each version.</p>
+
+<h2>Licences</h2>
+<ul>
+  <li><strong>Othos</strong> (the agent and the top-level files) is under the <strong>GNU AGPL v3.0 or later</strong>. See <code>LICENSE</code> in the Othos folder. Private use on your own computer is fine. If you share Othos or run it as a service for other people, you must offer the source under the same terms.</li>
+  <li><strong>The call page</strong> started as LiveKit's Agent Starter for React, under the MIT License, and includes the circuit-board picture, which is under the AGPL v3.0 or later. The call page as a whole is therefore under the AGPL.</li>
+</ul>
+
+<h2>Credits</h2>
+<ul>
+  <li>The circuit-board picture is by Jared Rhodenizer, from <a href="https://github.com/jaredrhod/ai-visualizer">ai-visualizer</a> (AGPL-3.0-or-later).</li>
+  <li>The call page is based on LiveKit's <a href="https://github.com/livekit-examples/agent-starter-react">Agent Starter for React</a> (MIT).</li>
+  <li>Built with <a href="https://github.com/livekit/agents">LiveKit Agents</a>, <a href="https://ollama.com">Ollama</a>, <a href="https://deepgram.com">Deepgram</a>, <a href="https://rime.ai">Rime</a>, <a href="https://tavily.com">Tavily</a>, <a href="https://github.com/speaches-ai/speaches">Speaches</a> and <a href="https://github.com/remsky/Kokoro-FastAPI">Kokoro-FastAPI</a>.</li>
+</ul>
+
+<div class="pager"><a href="words.html">← Words explained</a><a href="index.html">Back to the start →</a></div>
+</main>
+</div>
+</body>
+</html>

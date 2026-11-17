@@ -170,6 +170,9 @@ if ($Mode -eq "offline") {
 } else {
     Warn "Mixed mode needs DEEPGRAM_API_KEY and RIME_API_KEY in .env (README says where to get them)."
 }
+# ---- 6b. Google (optional): the same question as the installer's page, asked only in a console, never twice
+$gq = Join-Path $A "google-question.ps1"
+if (Test-Path $gq) { & $gq }
 # ---- 7. this PC's specs: the Othos window asks on its first start ("May I check your current
 # system specs...?") and shows the advice in its own window; "Check my PC..." does it any time
 $specsPy = Join-Path $A "system_specs.py"

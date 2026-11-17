@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Everyday use</title>
+<meta name="description" content="What to say to Othos: notes, news, weather, the camera and more.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="layout">
+<nav class="site" aria-label="Guide">
+  <div class="brand">Othos</div><div class="sub">The user guide</div>
+  <ol>
+    <li><a href="index.html">Start here</a></li>
+    <li><a href="install.html">Install</a></li>
+    <li><a href="first-call.html">Your first call</a></li>
+    <li><a href="make-it-yours.html">Make it yours</a></li>
+    <li><a href="everyday.html" aria-current="page">Everyday use</a></li>
+    <li><a href="smithy.html">The Smithy</a></li>
+    <li><a href="privacy.html">Privacy</a></li>
+    <li><a href="advanced.html">Advanced</a></li>
+    <li><a href="troubleshooting.html">Fixing problems</a></li>
+    <li><a href="words.html">Words explained</a></li>
+    <li><a href="about.html">About this guide</a></li>
+  </ol>
+</nav>
+<main>
+<h1>Everyday use</h1>
+<p class="lead">You just talk. There is nothing to memorise: say what you want in your own words. These examples show what works.</p>
+
+<h2>Talking and ending</h2>
+<div class="table-wrap"><table>
+  <tr><th>You say</th><th>What happens</th></tr>
+  <tr><td>"Othos, end the call" / "hang up"</td><td>Othos says goodbye and ends the call.</td></tr>
+  <tr><td>"Switch to code chat"</td><td>Opens the typed code chat after Othos finishes speaking.</td></tr>
+</table></div>
+
+<h2>Notes</h2>
+<div class="table-wrap"><table>
+  <tr><th>You say</th><th>What happens</th></tr>
+  <tr><td>"Remember that my sister's birthday is June 3rd."</td><td>Saves a note on your computer (in <code>agent\brain\</code>).</td></tr>
+  <tr><td>"What did I tell you about my sister?"</td><td>Searches your notes.</td></tr>
+</table></div>
+
+<h2>News and weather</h2>
+<div class="table-wrap"><table>
+  <tr><th>You say</th><th>What happens</th></tr>
+  <tr><td>"What's the news?" / "keep going" / "tell me more about the second one" / "where's that from?"</td><td>A news round-up, more headlines, follow-ups and sources.</td></tr>
+  <tr><td>"Any breaking news?" / "summarize the news"</td><td>The last few hours, or a spoken summary.</td></tr>
+  <tr><td>"What's the local news?" / "state news"</td><td>Your own feeds from <code>personal.json</code>.</td></tr>
+  <tr><td>"PC hardware news" / "tech news" / "design news"</td><td>Free news feeds.</td></tr>
+  <tr><td>"What are people reading?" / "bestsellers"</td><td>New York Times lists (needs a free New York Times key in <code>.env</code>).</td></tr>
+  <tr><td>"What's the weather like?" / "will it rain tomorrow?"</td><td>Weather for your town.</td></tr>
+  <tr><td>"Search the web for ..."</td><td>Searches the web with Tavily directly.</td></tr>
+  <tr><td>"What's Apple's stock price?"</td><td>A quoted price with its source and time.</td></tr>
+</table></div>
+<p>News and weather use free sources first. Some extras (The Guardian, the New York Times, YouTube, Ravelry, Twitch) need a free key from that service, which you paste into <code>agent\.env</code>. They are all optional. See <a href="advanced.html">Advanced</a>.</p>
+
+<h2>The camera</h2>
+<div class="table-wrap"><table>
+  <tr><th>You say</th><th>What happens</th></tr>
+  <tr><td>"Take a look" / "what am I holding?" / "read this label"</td><td>Takes <strong>one</strong> picture with your webcam and describes it on your PC. It never streams video, and only looks when you ask.</td></tr>
+</table></div>
+
+<h2>Keeping out of a game's way</h2>
+<div class="table-wrap"><table>
+  <tr><th>You say</th><th>What happens</th></tr>
+  <tr><td>"Gaming mode on" / "gaming mode off" / "is gaming mode on?"</td><td>Moves Othos out of the way when a game needs your PC's power.</td></tr>
+</table></div>
+
+<h2>Asking The Smithy for code</h2>
+<p>See <a href="smithy.html">The Smithy</a> for these: "Ask the Smithy to review ...", "What's the Smithy working on?", "Keep Smithy task 3".</p>
+
+<h2>Recording a how-to</h2>
+<p>Othos can record what you do, step by step, so you have a written guide afterwards.</p>
+<div class="table-wrap"><table>
+  <tr><th>You say</th><th>What happens</th></tr>
+  <tr><td>"Othos, start a how-to: setting up OBS"</td><td>Othos says "Recording", then stays quiet. Each thing you say becomes a step, with a picture of the window in front.</td></tr>
+  <tr><td>"Scratch that" / "note: use the second port"</td><td>Removes the last step / adds a tip to it.</td></tr>
+  <tr><td>"Take a picture" (or "snap") / "no picture"</td><td>Another picture for the last step / removes its pictures.</td></tr>
+  <tr><td>"Pause the how-to" / "resume the how-to" / "how many steps?"</td><td>While recording.</td></tr>
+  <tr><td>"Finish the how-to"</td><td>Saves it in <code>agent\drafts\howto\</code>.</td></tr>
+</table></div>
+<p>Pictures are taken only while you are recording, and only of the window in front, never your whole screen. Chat apps, password managers and sign-in screens are skipped. They stay on your PC.</p>
+
+<div class="pager"><a href="make-it-yours.html">← Make it yours</a><a href="smithy.html">Next: The Smithy →</a></div>
+</main>
+</div>
+</body>
+</html>

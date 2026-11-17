@@ -2,6 +2,9 @@
 
 *Othos Project V1*
 
+**Full guide:** a step-by-step beginner's guide is in [docs/index.html](docs/index.html). Download
+Othos, then open that file in your browser (it works offline, no internet needed).
+
 Othos is a voice companion that runs on your own Windows PC. You talk to it in a
 browser call page, and it answers out loud. The thinking happens on your computer,
 using local models through [Ollama](https://ollama.com). It can:

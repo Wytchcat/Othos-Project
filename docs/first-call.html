@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Your first call</title>
+<meta name="description" content="Start Othos, say hello and end the call.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="layout">
+<nav class="site" aria-label="Guide">
+  <div class="brand">Othos</div><div class="sub">The user guide</div>
+  <ol>
+    <li><a href="index.html">Start here</a></li>
+    <li><a href="install.html">Install</a></li>
+    <li><a href="first-call.html" aria-current="page">Your first call</a></li>
+    <li><a href="make-it-yours.html">Make it yours</a></li>
+    <li><a href="everyday.html">Everyday use</a></li>
+    <li><a href="smithy.html">The Smithy</a></li>
+    <li><a href="privacy.html">Privacy</a></li>
+    <li><a href="advanced.html">Advanced</a></li>
+    <li><a href="troubleshooting.html">Fixing problems</a></li>
+    <li><a href="words.html">Words explained</a></li>
+    <li><a href="about.html">About this guide</a></li>
+  </ol>
+</nav>
+<main>
+<h1>Your first call</h1>
+<p class="lead">A "call" is just a conversation with Othos. You start it on a web page that runs on your own PC.</p>
+
+<h2>Start a call</h2>
+<ol class="steps">
+  <li><strong>Start Othos.</strong> Double-click <code>start-othos.bat</code> in the Othos folder, or click the Othos shortcut if you built the taskbar app. Give it a few seconds: it starts several small programs in the background.</li>
+  <li><strong>The call page opens</strong> in your web browser at <code>http://127.0.0.1:3000</code>. If it does not open by itself, type that address into your browser yourself.</li>
+  <li><strong>Press Start call.</strong> Your browser may ask permission to use your microphone. Choose <em>Allow</em>, or Othos cannot hear you.</li>
+  <li><strong>Say hello.</strong> Othos greets you out loud. Talk the way you would to a person. When you stop, it answers.</li>
+</ol>
+<div class="note"><p><strong>Nothing happens, or Othos does not answer?</strong> It may still be loading. Wait a few seconds and press <strong>Start call</strong> again. If it still does not work, see <a href="troubleshooting.html">Fixing problems</a>.</p></div>
+
+<h2>Things to try</h2>
+<ul>
+  <li>"What's the weather like?" (needs your town in <a href="make-it-yours.html">your settings</a>)</li>
+  <li>"Remember that my sister's birthday is June 3rd." Then later: "What did I tell you about my sister?"</li>
+  <li>"What's the news?" Then: "Keep going."</li>
+</ul>
+<p>More ideas are on <a href="everyday.html">Everyday use</a>.</p>
+
+<h2>End the call</h2>
+<p>Say <strong>"Othos, end the call"</strong> or <strong>"hang up"</strong>. Othos says goodbye and ends the call.</p>
+
+<h2>Stop Othos</h2>
+<p>When you are finished, stop the background programs so they stop using your PC:</p>
+<ul>
+  <li>If you use the taskbar app: close the Othos window.</li>
+  <li>If you started it with <code>start-othos.bat</code>: run <code>agent\stop-othos.bat</code>.</li>
+</ul>
+
+<details>
+<summary>Advanced: what is running while Othos is on</summary>
+<p>Starting Othos starts four small servers, all listening only on your own PC (<code>127.0.0.1</code>), so other devices on your network cannot reach them:</p>
+<ul>
+  <li>the LiveKit call server on port 7880,</li>
+  <li>the voice agent on port 8081,</li>
+  <li>the call page on port 3000,</li>
+  <li>Ollama on port 11434.</li>
+</ul>
+<p>The agent's log is <code>agent\logs\agent.log</code>. Logs can include what you said, so keep them private.</p>
+</details>
+
+<div class="pager"><a href="install.html">← Install</a><a href="make-it-yours.html">Next: Make it yours →</a></div>
+</main>
+</div>
+</body>
+</html>

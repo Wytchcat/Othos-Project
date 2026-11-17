@@ -1045,7 +1045,14 @@ class Chain:
     def _try_links(self, messages, threads, max_tokens, should_stop):
         """The step's answer from the first provider with free tokens, or None when all are out."""
         size = prompt_tokens(messages)
-        for name, spoken, backend, m in self.links:
+        # a key passed over for its twin gets the step back if the twin fails, before any other provider (Nov 17,
+        # task 58: Cerebras's 2nd key sent an empty reply, the step went on past the 1st key, which had room 18 s
+        # later, and down to this PC's 3B model)
+        order, passed, given_back = list(self.links), {}, set()
+        i = 0
+        while i < len(order):
+            name, spoken, backend, m = order[i]
+            i += 1
             if _out_until(name) > time.time():
                 continue
             if _too_small(m):                          # this step asked for strong models only
@@ -1062,7 +1069,7 @@ class Chain:
                 steps.info("%s takes about %s tokens a minute, and this step is about %s; trying the next provider.",
                            spoken, f"{tpm:,}", f"{size:,}")
                 continue
-            if room > 0:
+            if room > 0 and name not in given_back:
                 # the same provider's other key, later in the order, with room sooner: that one takes this step
                 # instead of waiting here (Nov 16, the user: "Go for 1"; task 57 waited about 60 s on almost every
                 # step for Cerebras's minute while the second key, the same model, sat free)
@@ -1073,6 +1080,7 @@ class Chain:
                 if twin is not None:
                     log.info("switching: %s's minute is full for %.0f s more; its other key, %s, has room sooner",
                              spoken, room, twin[1])
+                    passed[twin[0]] = order[i - 1]
                     continue
             if room > float(self.cc.get("pace_max_wait", 90)):
                 log.info("switching: %s's minute is full for %.0f s more; this step goes to the next", spoken, room)
@@ -1136,6 +1144,11 @@ class Chain:
                     log.warning("switching: %s can't take this step (%s); trying the next", spoken, str(e)[:160])
                     steps.info("%s can't take this step; trying the next provider.", spoken)
                     break
+            if name in passed:                         # it failed: the key passed over for it is next
+                back = passed.pop(name)
+                given_back.add(back[0])
+                order.insert(i, back)
+                log.info("switching: %s didn't answer; back to %s, passed over for it", spoken, back[1])
         return None
 
     def _local(self, why, messages, threads, max_tokens, should_stop) -> str:

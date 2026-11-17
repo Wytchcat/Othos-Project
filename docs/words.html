@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Words explained</title>
+<meta name="description" content="Plain-language meanings for the technical words used with Othos.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="layout">
+<nav class="site" aria-label="Guide">
+  <div class="brand">Othos</div><div class="sub">The user guide</div>
+  <ol>
+    <li><a href="index.html">Start here</a></li>
+    <li><a href="install.html">Install</a></li>
+    <li><a href="first-call.html">Your first call</a></li>
+    <li><a href="make-it-yours.html">Make it yours</a></li>
+    <li><a href="everyday.html">Everyday use</a></li>
+    <li><a href="smithy.html">The Smithy</a></li>
+    <li><a href="privacy.html">Privacy</a></li>
+    <li><a href="advanced.html">Advanced</a></li>
+    <li><a href="troubleshooting.html">Fixing problems</a></li>
+    <li><a href="words.html" aria-current="page">Words explained</a></li>
+    <li><a href="about.html">About this guide</a></li>
+  </ol>
+</nav>
+<main>
+<h1>Words explained</h1>
+<p class="lead">Short, plain meanings for the words you will meet. You do not need to memorise any of this.</p>
+
+<div class="table-wrap"><table>
+  <tr><th>Word</th><th>What it means</th></tr>
+  <tr><td>AI model (or just "model")</td><td>A program that has learned to understand and write language (or look at pictures). Othos uses several small ones, each for one job: talking, searching your notes, looking through the camera, writing code. They are big files stored on your PC.</td></tr>
+  <tr><td>Local</td><td>Happens on your own computer. Nothing is sent over the internet.</td></tr>
+  <tr><td>Cloud</td><td>Happens on someone else's computer over the internet. In the usual Othos setup, only speech (hearing you and speaking back) uses the cloud.</td></tr>
+  <tr><td>Ollama</td><td>A free program that downloads AI models and runs them on your PC. Othos asks Ollama to do its thinking.</td></tr>
+  <tr><td>Key (API key)</td><td>A long code that works like a password for an online service. You get one by signing up on the service's website. Keep keys private.</td></tr>
+  <tr><td>Deepgram</td><td>An online service that turns your voice into text ("speech-to-text"). Used in the usual setup.</td></tr>
+  <tr><td>Rime</td><td>An online service that gives Othos its speaking voice ("text-to-speech"). Used in the usual setup.</td></tr>
+  <tr><td>Mixed mode</td><td>The usual setup: speech goes through Deepgram and Rime, everything else stays on your PC.</td></tr>
+  <tr><td>Fully offline mode</td><td>Speech runs on your PC too. Needs a graphics card and extra programs. See <a href="advanced.html">Advanced</a>.</td></tr>
+  <tr><td>The call page</td><td>The web page you talk to Othos on. It runs on your own PC at <code>http://127.0.0.1:3000</code>, and no one else can open it.</td></tr>
+  <tr><td>127.0.0.1</td><td>An address that always means "this computer". Othos uses it so its pieces talk to each other without leaving your PC.</td></tr>
+  <tr><td>Python, Node.js</td><td>Programming tools that Othos is built on. You install them once and never use them directly.</td></tr>
+  <tr><td>PowerShell</td><td>A Windows window where you type instructions. You only need it for setup and for checking things.</td></tr>
+  <tr><td>Folder / path</td><td>A "path" is the address of a file, such as <code>agent\.env</code> meaning the file <code>.env</code> inside the folder <code>agent</code>.</td></tr>
+  <tr><td>The Smithy</td><td>A background helper that writes and reviews code for you. It only makes drafts for you to read. See <a href="smithy.html">The Smithy</a>.</td></tr>
+  <tr><td>Draft</td><td>A file Othos or The Smithy made for you to read. Nothing in a draft is used, run or sent until you decide to.</td></tr>
+  <tr><td>Task</td><td>One job given to The Smithy, such as "review this file".</td></tr>
+  <tr><td>Provider</td><td>An online company that runs a bigger AI model for The Smithy. All are off until you turn one on. See <a href="smithy.html">The Smithy</a>.</td></tr>
+  <tr><td>Tavily</td><td>An online search service Othos uses last, when the free sources do not have an answer.</td></tr>
+  <tr><td>Webcam look</td><td>Othos takes one picture and describes it on your PC, only when you ask. It never streams video.</td></tr>
+  <tr><td>Gaming mode</td><td>A setting that moves Othos out of the way when a game needs your PC's power.</td></tr>
+  <tr><td>Port</td><td>A numbered "door" on your PC that a program listens on. If two programs want the same door, one cannot start. See <a href="troubleshooting.html">Fixing problems</a>.</td></tr>
+  <tr><td>Log</td><td>A text file where a program writes down what it did, handy when something goes wrong. Logs can contain what you said, so do not share them.</td></tr>
+</table></div>
+
+<div class="pager"><a href="troubleshooting.html">← Fixing problems</a><a href="about.html">Next: About this guide →</a></div>
+</main>
+</div>
+</body>
+</html>

@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Smithy</title>
+<meta name="description" content="The Smithy is Othos's background coding helper. It drafts code for you to read and never runs or applies anything.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="layout">
+<nav class="site" aria-label="Guide">
+  <div class="brand">Othos</div><div class="sub">The user guide</div>
+  <ol>
+    <li><a href="index.html">Start here</a></li>
+    <li><a href="install.html">Install</a></li>
+    <li><a href="first-call.html">Your first call</a></li>
+    <li><a href="make-it-yours.html">Make it yours</a></li>
+    <li><a href="everyday.html">Everyday use</a></li>
+    <li><a href="smithy.html" aria-current="page">The Smithy</a></li>
+    <li><a href="privacy.html">Privacy</a></li>
+    <li><a href="advanced.html">Advanced</a></li>
+    <li><a href="troubleshooting.html">Fixing problems</a></li>
+    <li><a href="words.html">Words explained</a></li>
+    <li><a href="about.html">About this guide</a></li>
+  </ol>
+</nav>
+<main>
+<h1>The Smithy</h1>
+<p class="lead">The Smithy is a helper that writes and reviews computer code in the background, while you do other things. You do not need to know how to code to try it, but it is most useful if you do.</p>
+
+<div class="note"><p><strong>The safety rule:</strong> everything The Smithy makes is a <em>draft</em>, a file for you to read. It never applies a change, runs a program, sends anything or installs anything. You look at the result and copy what you want yourself.</p></div>
+
+<h2>Set it up (once)</h2>
+<ol class="steps">
+  <li>Finish <a href="install.html">Install</a> first. The Smithy uses the same Python environment, and Ollama must be installed.</li>
+  <li>Build its app. In PowerShell, in the Othos folder:
+<pre><code>powershell -ExecutionPolicy Bypass -File agent\build-smithy.ps1</code></pre>
+    This adds <strong>The Smithy</strong> to your Desktop and Start menu. (Setup does not do this for you.)</li>
+  <li>Open <strong>The Smithy</strong> from the shortcut. Opening it starts the helper; closing it stops it.</li>
+  <li>Click <strong>Get models...</strong> and fetch the default coding model (<code>qwen2.5-coder:3b</code>) if setup did not already download it. Ollama must be running.</li>
+</ol>
+
+<h2>Ask it for something</h2>
+<p>With Othos running, say:</p>
+<ul>
+  <li>"Ask the Smithy to review gaming dot py."</li>
+  <li>"Ask the Smithy to write a script that renames my photos by date."</li>
+  <li>"Ask the Smithy to build a small to-do web app."</li>
+</ul>
+<p>The result waits in <code>agent\drafts\smithy\</code>. Othos tells you when one is ready ("Smithy task 3 is ready").</p>
+<div class="table-wrap"><table>
+  <tr><th>You say</th><th>What happens</th></tr>
+  <tr><td>"What's the Smithy working on?"</td><td>Tells you the progress.</td></tr>
+  <tr><td>"Read me Smithy task 3" / "show me Smithy task 3"</td><td>Reads the result aloud, or opens it.</td></tr>
+  <tr><td>"Keep Smithy task 3" / "discard Smithy task 3"</td><td>Marks the result. Othos asks you to say yes or no first.</td></tr>
+  <tr><td>"Read me the Smithy log" / "show me the Smithy log"</td><td>The work log.</td></tr>
+</table></div>
+
+<h2>What it can do</h2>
+<ul>
+  <li><strong>Review:</strong> read a code file and list bugs and risks.</li>
+  <li><strong>Fix:</strong> draft a fix as a "diff" (a list of changes). It is never applied.</li>
+  <li><strong>Script:</strong> write a script. It is saved, never run.</li>
+  <li><strong>Joomla:</strong> draft Joomla website template changes.</li>
+  <li><strong>Build:</strong> make a small project from scratch, in its own folder under <code>agent\drafts\smithy\</code>.</li>
+  <li><strong>Follow-up:</strong> ask a question about an earlier result, or ask for a new version of a build.</li>
+</ul>
+<p>While it works, <strong>Progress</strong> (a small window beside the work log) shows each step as it happens.</p>
+
+<h2>What it is allowed to read</h2>
+<p>It reads files only from the folders you list as <code>code_folders</code> in <code>agent\smithy.json</code>. Private files (<code>.env</code>, keys, your notes) are always blocked, and anything that looks like a key is removed before text reaches a model. This is enforced by the program's code, not by asking the model nicely.</p>
+
+<h2>How it runs on your PC</h2>
+<ul>
+  <li>It uses your computer's main processor (CPU) only and its own small model, so it is slow but does not need a graphics card.</li>
+  <li>It pauses while a processor-heavy game is running.</li>
+  <li>A typed <strong>code chat</strong> is also at <code>http://127.0.0.1:3000/code</code> (or the <code>&lt;/&gt;</code> button during a call). <strong>Save code to drafts</strong> writes new files into <code>agent\drafts\</code> and changes nothing else.</li>
+</ul>
+
+<details>
+<summary>Advanced: using bigger models from online providers</summary>
+<p>A <strong>provider</strong> is an online company that runs a larger AI model. In The Smithy's window, <strong>Providers...</strong> lets you add a provider's key (stored encrypted for your Windows account, outside the Othos folder) and turn the provider on.</p>
+<ul>
+  <li><strong>Nothing leaves your PC until you turn a provider on.</strong> All are off by default.</li>
+  <li>What is sent is that task's request, after the same filter that removes personal details.</li>
+  <li>Providers whose free plans may train on what you send are refused unless you allow them.</li>
+  <li>There are daily token and spending limits. LM Studio running on your own computer works the same way and sends nothing out.</li>
+  <li>With more than one provider on, The Smithy can switch to the next when one runs out of free use, and falls back to your own PC last.</li>
+</ul>
+<p>Full details, including the command line and settings, are in <code>agent\SMITHY.md</code>.</p>
+</details>
+
+<div class="pager"><a href="everyday.html">← Everyday use</a><a href="privacy.html">Next: Privacy →</a></div>
+</main>
+</div>
+</body>
+</html>

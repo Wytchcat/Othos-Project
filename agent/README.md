@@ -17,6 +17,7 @@ mixed and offline modes, the voice commands, privacy, hardware and troubleshooti
 | `library.py` | the local reference library: pages kept in `library\` (never committed) and searched without the internet; shared by Othos and its workers; your own .txt, .md and .pdf files can be added |
 | `library_window.py` | the Add documents window (open with `library-add.ps1`): put PDFs, .txt and .md files into the library from this computer, or from your own AWS S3 bucket with a read-only key (the window shows how to make one) |
 | `docs\othos-project.html` | the project guide: open it in a browser (local copy, not in the public copy) |
+| `google_tools.py`, `google_window.py` | Google: the Connect Google window (open with `google-connect.ps1`) and, once connected, your calendar by voice (read-only for now: "What's on my calendar tomorrow?", "Am I free Thursday afternoon?"). Needs your own Google Cloud project's Desktop client in `.env` |
 | `suggested-sources.json` | free web APIs for gardening, books, recipes and movies/TV that you can add yourself (suggestions only; read their terms first) |
 | `personal.py` | reads `personal.json` (your name, town, local feeds); `personal.example.json` shows the fields |
 | `gaming.py`, `gaming.json` | gaming mode |

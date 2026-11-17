@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fixing problems</title>
+<meta name="description" content="What to try when Othos does not start, does not answer or is slow.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="layout">
+<nav class="site" aria-label="Guide">
+  <div class="brand">Othos</div><div class="sub">The user guide</div>
+  <ol>
+    <li><a href="index.html">Start here</a></li>
+    <li><a href="install.html">Install</a></li>
+    <li><a href="first-call.html">Your first call</a></li>
+    <li><a href="make-it-yours.html">Make it yours</a></li>
+    <li><a href="everyday.html">Everyday use</a></li>
+    <li><a href="smithy.html">The Smithy</a></li>
+    <li><a href="privacy.html">Privacy</a></li>
+    <li><a href="advanced.html">Advanced</a></li>
+    <li><a href="troubleshooting.html" aria-current="page">Fixing problems</a></li>
+    <li><a href="words.html">Words explained</a></li>
+    <li><a href="about.html">About this guide</a></li>
+  </ol>
+</nav>
+<main>
+<h1>Fixing problems</h1>
+<p class="lead">Start with the first item. It finds most problems.</p>
+
+<h2>First: run the checker</h2>
+<p>Open PowerShell in the Othos folder (open the folder in File Explorer, click the address bar, type <code>powershell</code>, press Enter) and run:</p>
+<pre><code>powershell -ExecutionPolicy Bypass -File doctor.ps1</code></pre>
+<p>Lines starting <code>FIX</code> tell you what is missing or wrong: a key, a model, a program, a busy "port", or an address written as <code>localhost</code> instead of <code>127.0.0.1</code>. Fix those, then run it again until it says <strong>All good.</strong> It only looks; it changes nothing.</p>
+
+<h2>Common problems</h2>
+<h3>Othos did not join the call, or never answers</h3>
+<ul>
+  <li><strong>Give it a few seconds,</strong> then press <strong>Start call</strong> again. It may still be loading.</li>
+  <li><strong>Is Ollama running?</strong> Othos needs it for thinking.</li>
+  <li>The address <code>LIVEKIT_URL</code> must be the same in <code>agent\.env</code> and the call page's <code>.env.local</code>.</li>
+  <li>If it says an older copy is still running (port 8081 busy), run <code>agent\stop-othos.bat</code>, then start again.</li>
+  <li>Look at the last lines of <code>agent\logs\agent.log</code> for a clue. It is private: do not post it.</li>
+</ul>
+<h3>The page will not open</h3>
+<p>Type <code>http://127.0.0.1:3000</code> yourself. Always use <code>127.0.0.1</code>, not <code>localhost</code>: on some Windows setups <code>localhost</code> goes to the wrong kind of address and nothing answers. Every address in your settings should use <code>127.0.0.1</code>.</p>
+<h3>"Python 3.12 not found", or a wrong Python</h3>
+<p>The agent needs Python <strong>3.12.x</strong>. Newer versions do not work. Install 3.12 (and tick <em>py launcher</em>). If <code>doctor.ps1</code> still complains, delete the <code>agent\.venv</code> folder and run setup again.</p>
+<h3>A port is busy</h3>
+<p>A "port" is a numbered door a program listens on. Othos uses 7880 (call server), 8081 (agent), 3000 (call page) and 11434 (Ollama); offline speech also uses 8000 and 8880. If another program, or an old copy of Othos, holds one, close it or run <code>agent\stop-othos.bat</code>.</p>
+<h3>Replies are slow</h3>
+<ul>
+  <li>Close other heavy programs.</li>
+  <li>Use a smaller conversation model (<code>OLLAMA_MODEL</code> in <code>agent\.env</code>).</li>
+  <li>Turn off the moving circuit-board picture by opening <code>http://127.0.0.1:3000/?board=off</code>.</li>
+  <li>Expect a few seconds before the first word on a PC without a graphics card. That is normal.</li>
+</ul>
+<h3>Setup stopped with STOP:</h3>
+<p>Read the line: it names what is missing. Install it, close and reopen PowerShell, and run setup again. See <a href="install.html">Install</a>.</p>
+<h3>Strange "401" or LiveKit Cloud messages in the log</h3>
+<p>Harmless. Some plug-ins try an online service Othos does not use; it uses its own local server.</p>
+
+<div class="pager"><a href="advanced.html">← Advanced</a><a href="words.html">Next: Words explained →</a></div>
+</main>
+</div>
+</body>
+</html>

@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Make it yours</title>
+<meta name="description" content="Tell Othos your name and town, and give your assistant its own name, logo and colour.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="layout">
+<nav class="site" aria-label="Guide">
+  <div class="brand">Othos</div><div class="sub">The user guide</div>
+  <ol>
+    <li><a href="index.html">Start here</a></li>
+    <li><a href="install.html">Install</a></li>
+    <li><a href="first-call.html">Your first call</a></li>
+    <li><a href="make-it-yours.html" aria-current="page">Make it yours</a></li>
+    <li><a href="everyday.html">Everyday use</a></li>
+    <li><a href="smithy.html">The Smithy</a></li>
+    <li><a href="privacy.html">Privacy</a></li>
+    <li><a href="advanced.html">Advanced</a></li>
+    <li><a href="troubleshooting.html">Fixing problems</a></li>
+    <li><a href="words.html">Words explained</a></li>
+    <li><a href="about.html">About this guide</a></li>
+  </ol>
+</nav>
+<main>
+<h1>Make it yours</h1>
+<p class="lead">Othos works out of the box. Everything on this page is optional: it just makes Othos feel like yours.</p>
+
+<div class="note"><p>All these settings live in the <code>agent</code> folder, in files that stay on your computer. Edit them with Notepad. <strong>After saving a change, close and reopen Othos.</strong> (For the call page, refreshing the web page is enough.)</p></div>
+
+<h2>Your name and town: personal.json</h2>
+<p>Open <code>agent\personal.json</code>. Every field starts empty (<code>""</code>), which simply means that feature is off. Type your answer between the quote marks. Keep the quote marks and commas as they are.</p>
+<div class="table-wrap"><table>
+  <tr><th>Field</th><th>What it does</th><th>Example</th></tr>
+  <tr><td><code>name</code></td><td>What Othos calls you (in greetings, goodbyes and urgent moments).</td><td><code>"Alex"</code></td></tr>
+  <tr><td><code>weather_location</code></td><td>Your town, for the weather and "where do I live?".</td><td><code>"Anytown, State, US"</code></td></tr>
+  <tr><td><code>weather_latlon</code></td><td>Your town's map point, used for US National Weather Service forecasts. Only this is sent to the weather service, not your name.</td><td><code>"40.7128,-74.0060"</code></td></tr>
+  <tr><td><code>contact_url</code></td><td>Your website or contact page. Wikipedia refuses programs that do not give one, so Wikipedia answers stay off until you set it.</td><td><code>"https://example.com"</code></td></tr>
+  <tr><td><code>pronunciations</code></td><td>How Othos's voice should say local place names it gets wrong.</td><td><code>{"Anytown": "Any-town"}</code></td></tr>
+</table></div>
+<p>The file also has fields for local and state news feeds, extra names the microphone keeps mishearing (<code>keyterms</code>), and the weekly model check. The bottom of the file has an <code>_example</code> section showing a filled-in file for a made-up person. It is never used.</p>
+<p>Weather comes from the US National Weather Service. Outside the US, Othos falls back to a web search for your town's weather.</p>
+
+<h2>A few lines about you: profile.md</h2>
+<p><code>agent\profile.md</code> is a plain text file where you write a few lines about yourself and how you like Othos to behave. For example:</p>
+<pre><code>Keep answers to one or two sentences unless asked for more.
+I'm vegetarian.
+I live with two cats.</code></pre>
+<p>Othos reads it at the start of each call. Othos never writes to it; only you do.</p>
+
+<h2>Give your assistant its own name, logo and colour</h2>
+<p>Your assistant does not have to be called Othos. Setup asks what to call it, or you can change it later in the <code>assistant</code> section of <code>personal.json</code>:</p>
+<pre><code>"assistant": {"name": "Jarvis", "heard_as": ["Jervis"], "logo": "my-logo.png", "color": "#9d7bff"}</code></pre>
+<div class="table-wrap"><table>
+  <tr><th>Field</th><th>What it does</th></tr>
+  <tr><td><code>name</code></td><td>What the assistant calls itself, and the name you say to it ("Jarvis, end the call"). Empty means Othos.</td></tr>
+  <tr><td><code>heard_as</code></td><td>Words the microphone writes down instead of the name, so they count as the name too. Look in a call's transcript to find them.</td></tr>
+  <tr><td><code>logo</code></td><td>A picture file: a full path, or a file name inside the <code>agent</code> folder. PNG, SVG, JPG, WebP and ICO work on the call page. For the taskbar and shortcut icon, use an <code>.ico</code> file and run <code>agent\build-othos-app.ps1</code> again.</td></tr>
+  <tr><td><code>color</code></td><td>An accent colour for the name, such as <code>"#9d7bff"</code>. Empty means the usual colours.</td></tr>
+</table></div>
+<p>The circuit-board picture on the call page stays the same; only the name on it changes.</p>
+
+<details>
+<summary>Advanced: more personal.json fields</summary>
+<ul>
+  <li><code>home_location</code>: where you live, if different from the weather town.</li>
+  <li><code>local_news.feeds</code> and <code>state_news.feeds</code>: RSS feeds (a site's list of new articles) used for "local news" and "state news". Each has a <code>site</code>, a spoken <code>name</code>, a <code>url</code> and an optional <code>skip_urls</code> pattern. Trigger words (<code>trigger_words</code>) say which spoken words mean local or state news.</li>
+  <li><code>keyterms</code>: names the microphone keeps getting wrong.</li>
+  <li><code>model_check</code>: <code>"ask"</code> (a Yes/No once a week, the default), <code>"auto"</code> or <code>"off"</code>. See <a href="advanced.html">Advanced</a>.</li>
+</ul>
+</details>
+
+<div class="pager"><a href="first-call.html">← Your first call</a><a href="everyday.html">Next: Everyday use →</a></div>
+</main>
+</div>
+</body>
+</html>

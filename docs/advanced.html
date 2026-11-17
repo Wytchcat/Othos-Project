@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Advanced</title>
+<meta name="description" content="Settings, offline speech, the setup window, model checks, hardware and sharing a PC.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="layout">
+<nav class="site" aria-label="Guide">
+  <div class="brand">Othos</div><div class="sub">The user guide</div>
+  <ol>
+    <li><a href="index.html">Start here</a></li>
+    <li><a href="install.html">Install</a></li>
+    <li><a href="first-call.html">Your first call</a></li>
+    <li><a href="make-it-yours.html">Make it yours</a></li>
+    <li><a href="everyday.html">Everyday use</a></li>
+    <li><a href="smithy.html">The Smithy</a></li>
+    <li><a href="privacy.html">Privacy</a></li>
+    <li><a href="advanced.html" aria-current="page">Advanced</a></li>
+    <li><a href="troubleshooting.html">Fixing problems</a></li>
+    <li><a href="words.html">Words explained</a></li>
+    <li><a href="about.html">About this guide</a></li>
+  </ol>
+</nav>
+<main>
+<h1>Advanced</h1>
+<p class="lead">Everything here is optional. You can use Othos for a long time without opening this page. Each part says what it is for.</p>
+
+<h2>The settings file: agent\.env</h2>
+<p>Setup makes <code>agent\.env</code> from <code>.env.example</code>. It stays on your computer. Anything not marked "needed" can stay empty.</p>
+<div class="table-wrap"><table>
+  <tr><th>Setting</th><th>What it is</th><th>Needed?</th></tr>
+  <tr><td><code>OTHOS_SPEECH</code></td><td><code>cloud</code> (mixed) or <code>local</code> (fully offline).</td><td>Yes (setup sets it)</td></tr>
+  <tr><td><code>DEEPGRAM_API_KEY</code></td><td>Turns your voice into text. Sign up at <a href="https://console.deepgram.com/">console.deepgram.com</a>.</td><td>Mixed mode</td></tr>
+  <tr><td><code>DEEPGRAM_MIP_OPT_OUT</code></td><td><code>true</code> asks Deepgram not to use your audio to train its models.</td><td>Keep <code>true</code></td></tr>
+  <tr><td><code>RIME_API_KEY</code></td><td>Othos's speaking voice. Sign up at <a href="https://rime.ai/">rime.ai</a>.</td><td>Mixed mode</td></tr>
+  <tr><td><code>OLLAMA_MODEL</code></td><td>The conversation model (default <code>llama3.2:3b</code>). Download another first with <code>ollama pull</code>.</td><td>Default works</td></tr>
+  <tr><td><code>TAVILY_API_KEY</code></td><td>Web search, used last. <a href="https://app.tavily.com/">app.tavily.com</a> (free credits each month).</td><td>Optional</td></tr>
+  <tr><td><code>GUARDIAN_API_KEY</code>, <code>NYT_API_KEY</code></td><td>News from The Guardian and the New York Times.</td><td>Optional</td></tr>
+  <tr><td><code>RAVELRY_USER</code> / <code>RAVELRY_KEY</code>, <code>YOUTUBE_API_KEY</code>, <code>TWITCH_CLIENT_ID</code> / <code>TWITCH_CLIENT_SECRET</code></td><td>Knitting patterns, tutorial videos, and how busy a game is on Twitch.</td><td>Optional</td></tr>
+  <tr><td><code>LIVEKIT_URL</code>, <code>LIVEKIT_API_KEY</code>, <code>LIVEKIT_API_SECRET</code></td><td>The local call server. Already filled in.</td><td>Leave as is</td></tr>
+</table></div>
+<p>The call page has its own small file, <code>ui\.env.local</code>, which setup makes. It repeats the three LiveKit lines and sets <code>OTHOS_CODE_MODEL</code> (the model for the code chat).</p>
+
+<h2 id="offline">Fully offline speech</h2>
+<p>Instead of Deepgram and Rime, speech can run on your PC. You need a graphics card (about 2 to 3 GB of graphics memory for speech, on top of the conversation model) and two extra programs.</p>
+<ol class="steps">
+  <li>Run <code>setup.ps1 -Mode offline</code>. It sets <code>OTHOS_SPEECH=local</code>.</li>
+  <li>Install and start two speech programs, following their own instructions:
+    <ul>
+      <li><a href="https://github.com/speaches-ai/speaches">Speaches</a> (hearing you) on <code>http://127.0.0.1:8000</code>, with a Whisper model such as <code>Systran/faster-whisper-small.en</code>.</li>
+      <li><a href="https://github.com/remsky/Kokoro-FastAPI">Kokoro-FastAPI</a> (the voice) on <code>http://127.0.0.1:8880</code>.</li>
+    </ul></li>
+  <li>If yours use other addresses, set <code>LOCAL_STT_URL</code>, <code>LOCAL_STT_MODEL</code>, <code>LOCAL_TTS_URL</code> and <code>LOCAL_TTS_VOICE</code> in <code>agent\.env</code>.</li>
+  <li>Start both before Othos. <code>doctor.ps1</code> checks they are listening.</li>
+</ol>
+<div class="warn"><p><strong>Not tested in a real call yet.</strong> Local speech was built on a PC with no graphics card, so it has only been checked to start up. Web search is off in this mode unless you add a Tavily key.</p></div>
+
+<h2 id="installer">The optional setup window</h2>
+<p>The <code>installer</code> folder holds the source for <code>OthosSetup.exe</code>, a window that does what <code>setup.ps1</code> does. You build it once with the C# compiler that comes with Windows, so there is nothing extra to install:</p>
+<pre><code>powershell -ExecutionPolicy Bypass -File installer\build-installer.ps1</code></pre>
+<p>This makes <code>installer\OthosSetup.exe</code>. <strong>Move it into the Othos folder, next to <code>agent</code> and <code>ui</code></strong> (it looks for both), then open it.</p>
+<ul>
+  <li>You can resize the window, and its messages use the same colours as the window.</li>
+  <li>The window itself never uses the internet; the downloads are done by <code>setup.ps1</code>.</li>
+  <li>If a step stops, the message says which step and shows the error line. Install what it names, then press <strong>Try Again</strong>.</li>
+  <li>After a good install it asks one optional question, "Connect your Google account?", with the benefits and risks. <strong>Not now</strong> is the default. It makes no network call and only saves your answer on your PC.</li>
+</ul>
+
+<h2>The weekly model check</h2>
+<p>AI models improve. Once a week the Othos window asks <strong>"Check for updated models?"</strong> (<strong>Yes, check</strong> or <strong>Not now</strong>). <strong>Check models...</strong> runs it any time. You can change how it starts with <code>model_check</code> in <code>personal.json</code>: <code>"ask"</code>, <code>"auto"</code> or <code>"off"</code>.</p>
+<ul>
+  <li><strong>The check itself downloads nothing.</strong> It lists models tested with your version, newer ones in the same families (marked "not tested yet"), and a newer Ollama if there is one.</li>
+  <li>Each model is marked <strong>Fits</strong>, <strong>Tight</strong> or <strong>Won't fit</strong> for your PC's memory and graphics card.</li>
+  <li>To get one, click <strong>Get</strong>. A Yes/No shows the download size and free space first. Nothing downloads until you click <strong>Yes, download</strong>.</li>
+</ul>
+
+<h2>Which models suit your PC?</h2>
+<p>Bigger models give better answers but need more memory and a graphics card. As a rough guide:</p>
+<ul>
+  <li><strong>Any 16 GB PC, no graphics card:</strong> the small default models, in mixed mode. Replies take a few seconds to start, and writing is slow (an estimated 5 to 9 "tokens", roughly word pieces, per second). This is how Othos was built and tested.</li>
+  <li><strong>A graphics card with 8 GB:</strong> small models run faster, and fully offline speech becomes possible but tight.</li>
+  <li><strong>12 to 16 GB graphics memory:</strong> 8 to 14 billion-parameter models and comfortable offline speech.</li>
+  <li><strong>24 GB and up:</strong> the largest models Othos suggests (about 27 to 32 billion parameters).</li>
+</ul>
+<p>The project README has a full table by graphics card and laptop. These figures are estimates, not promises, and your numbers will differ. On Windows, Ollama uses NVIDIA cards out of the box; AMD support covers only some cards; Intel Arc and Snapdragon graphics are not used by standard Ollama, so models run on the processor. Before you buy anything, check <a href="https://docs.ollama.com/gpu">Ollama's GPU list</a>.</p>
+
+<h2>Two people on one computer</h2>
+<p>If two people use one Windows PC with separate Windows accounts, each account has its own Othos folder, settings, drafts, keys, Ollama and models. But the whole computer shares the local addresses (ports), the processor, memory and graphics card. While one account's Othos is running, the other's either cannot start or ends up using the first account's Ollama.</p>
+<div class="note"><p><strong>Best practice:</strong> close Othos and its helpers, then fully sign out of Windows (Start, your account picture, <strong>Sign out</strong>) before the other person signs in. Do not use <em>Switch user</em>, which leaves the first account's programs running.</p></div>
+
+<h2>Customising</h2>
+<ul>
+  <li><strong>Conversation model:</strong> <code>OLLAMA_MODEL</code> in <code>agent\.env</code>. Download it first, for example <code>ollama pull qwen3:8b</code>.</li>
+  <li><strong>Voice:</strong> <code>RIME_SPEAKER</code> (cloud) or <code>LOCAL_TTS_VOICE</code> (offline). Respellings for words it says wrongly go in <code>agent\pronunciations.json</code>, and place names in <code>personal.json</code>.</li>
+  <li><strong>Gaming mode:</strong> <code>agent\gaming.json</code> lists your games and what each one needs.</li>
+  <li><strong>Packages stay pinned.</strong> After you install or upgrade a Python package yourself, run <code>agent\update-requirements.ps1</code>.</li>
+</ul>
+
+<div class="pager"><a href="privacy.html">← Privacy</a><a href="troubleshooting.html">Next: Fixing problems →</a></div>
+</main>
+</div>
+</body>
+</html>

@@ -45,6 +45,7 @@ import workers_voice  # (its INSTALLED list, for the self-check)
 import selfcheck  # the quiet self-check behind "How are you?"
 import searchctx  # searches keep the topic and the user's town: searchctx.py
 import library  # the user's own saved reference pages: library.py
+import google_tools  # Google Calendar (read-only) once connected: google_tools.py, google-connect.ps1
 import humor  # hints about the jokes ("go easy on the puns"): caught by code, kept in state\humor.json
 import sources  # free sources tried before Tavily: sources.py
 import personal  # the user's name, town, feeds and respellings: personal.json
@@ -1651,6 +1652,8 @@ def _tool_names_for(text: str, has_results: bool) -> set[str]:
     text = sources.join_spelled(_spoken_models(_without_small_talk(text)))  # "my forty sixty TI" is a graphics card
     if not text:
         return set()  # "Hello. What's going on?": just chat, no tools
+    if google_tools.asks_calendar(text) and not _SEARCH_WORDS.search(text):
+        return set()  # "Am I free Thursday?": the calendar, answered by code in llm_node (never a web search)
     if _ASKS_NOTES.search(text):
         return {"save_note", "search_notes"}
     names = set()
@@ -2688,6 +2691,18 @@ class Assistant(Agent):
                     call_id=f"notes_{uuid.uuid4().hex[:12]}",
                 )]),
             )
+            return
+        if (isinstance(last, llm.ChatMessage) and last.role == "user" and google_tools.asks_calendar(self._user_text)
+                and not _SEARCH_WORDS.search(self._user_text)):
+            # "What's on my calendar tomorrow?" / "Am I free Thursday afternoon?": Google Calendar, read-only, worded by code
+            try:
+                reply = await asyncio.wait_for(asyncio.to_thread(google_tools.calendar_answer, self._user_text), timeout=12)
+            except Exception as e:
+                log.info("calendar failed: %s", type(e).__name__)
+                reply = "I couldn't reach your Google calendar just now. Try again in a minute."
+            log.info("calendar answered by code (%d chars)", len(reply))   # never the events themselves
+            self._verbatim = True
+            yield reply
             return
         if (isinstance(last, llm.ChatMessage) and last.role == "user" and not _PLACE_NAMED.search(self._user_text)
                 and not _SEARCH_WORDS.search(self._user_text)

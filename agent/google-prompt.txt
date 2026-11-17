@@ -1,0 +1,17 @@
+Connect your Google account? (optional)
+
+Othos can use your Google Calendar, Sheets, Docs, Gmail and Google Voice voicemails, so you can ask by voice: "What's on my calendar today?", "Any new email?", "Read me the budget sheet".
+
+What you get
+  - Hands-free answers from your own calendar, mail, documents and spreadsheets, read by Othos.
+  - Nothing to retype: Othos reads it for you and says where the answer came from.
+  - You choose which parts to connect. Everything starts read-only.
+
+What to know first (the risks, in plain words)
+  - Your account's permission is broad. Google can't limit "read email" to just some messages, so Othos limits itself in its own code (and skips a never-read list you set). If someone got into this PC, the saved sign-in could read the same things until you cancel it.
+  - Some of what Othos reads goes out when it speaks. With the online voice (Rime), anything Othos says aloud, including email text, is sent to that voice service. Othos asks before reading an email's full text, unless your voice and hearing both run on this computer.
+  - Emails and documents can contain tricks. A message might try to give Othos orders. Othos treats everything it reads as plain text, never as instructions, and can't send, delete or change anything while connected read-only.
+  - Othos never opens links or attachments. It doesn't click, download or open anything inside an email or document. If one has a link or an attachment, Othos only tells you it's there ("this email has a link and one attachment; I haven't opened them") and you decide whether to open it yourself. That closes off the most common way email is used to attack people.
+  - Google shows a warning screen. Because you make your own Google key for this, Google calls the app "unverified". That's expected; you click through it once.
+  - You can undo it any time: press Disconnect in Othos, or remove Othos at myaccount.google.com/permissions. Both stop access at once.
+  - Othos keeps the sign-in on this computer only, locked to your Windows account. Nothing is posted, sent or deleted.

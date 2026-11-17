@@ -34,3 +34,5 @@
 {"id":"repeat-1","say":"What were those names again?","tools":[],"has_results":true,"note":"answer from what was said"}
 {"id":"more-1","say":"Tell me more results","tools":["more_results","web_search"],"has_results":true}
 {"id":"more-2","say":"Give me the next one","tools":["more_results","web_search"],"has_results":true}
+{"id":"cal-1","say":"What's on my calendar tomorrow?","tools":[],"note":"Google Calendar, answered by code"}
+{"id":"cal-2","say":"Am I free Thursday afternoon?","tools":[],"note":"Google Calendar, answered by code"}

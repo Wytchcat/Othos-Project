@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privacy</title>
+<meta name="description" content="What Othos keeps on your PC and what it sends to online services.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="layout">
+<nav class="site" aria-label="Guide">
+  <div class="brand">Othos</div><div class="sub">The user guide</div>
+  <ol>
+    <li><a href="index.html">Start here</a></li>
+    <li><a href="install.html">Install</a></li>
+    <li><a href="first-call.html">Your first call</a></li>
+    <li><a href="make-it-yours.html">Make it yours</a></li>
+    <li><a href="everyday.html">Everyday use</a></li>
+    <li><a href="smithy.html">The Smithy</a></li>
+    <li><a href="privacy.html" aria-current="page">Privacy</a></li>
+    <li><a href="advanced.html">Advanced</a></li>
+    <li><a href="troubleshooting.html">Fixing problems</a></li>
+    <li><a href="words.html">Words explained</a></li>
+    <li><a href="about.html">About this guide</a></li>
+  </ol>
+</nav>
+<main>
+<h1>Privacy</h1>
+<p class="lead">Where your information goes. In short: most things stay on your PC, a few things go to named online services, and Othos never sends, posts or deletes anything for you.</p>
+
+<h2>Stays on your computer</h2>
+<ul>
+  <li>The AI model that does the thinking and talking.</li>
+  <li>Your notes and the search through them.</li>
+  <li>Webcam pictures. They are taken only when you ask, one at a time, and are never streamed.</li>
+  <li>The code chat, and The Smithy (unless you turn on an online provider).</li>
+  <li>Your settings: <code>.env</code>, <code>personal.json</code>, <code>profile.md</code>, and the logs.</li>
+</ul>
+
+<h2>Goes to online services</h2>
+<div class="table-wrap"><table>
+  <tr><th>Service</th><th>What it gets</th><th>When</th></tr>
+  <tr><td>Deepgram</td><td>Your voice during a call.</td><td>The usual (mixed) setup. Not used in fully offline mode.</td></tr>
+  <tr><td>Rime</td><td>Othos's replies, so it can speak them.</td><td>Mixed setup only.</td></tr>
+  <tr><td>Tavily</td><td>Web search questions. Personal questions are never sent to it.</td><td>Last, after the free sources.</td></tr>
+  <tr><td>Free sources (National Weather Service, Wikipedia, feeds, GitHub, Stack Exchange, and with your keys Ravelry, YouTube, Twitch, The Guardian, the New York Times)</td><td>Only search words, a game or channel name, or your town's map point. Wikipedia also sees your <code>contact_url</code>.</td><td>When you ask something they can answer.</td></tr>
+  <tr><td>The weekly model check (ollama.com, Hugging Face, GitHub)</td><td>Only AI model family names, plus your computer's internet address, like any web visit. No account, no cookies.</td><td>Only when you say yes, click <strong>Check models...</strong>, or set it to automatic. Nothing is downloaded unless you click <strong>Get</strong> and say yes.</td></tr>
+  <tr><td>Online AI providers for The Smithy</td><td>That task's request, after personal details are filtered out.</td><td>Only after you turn a provider on. Off by default.</td></tr>
+</table></div>
+
+<h2>What Othos will never do</h2>
+<ul>
+  <li><strong>It never sends, posts or deletes anything for you.</strong> Anything like that needs your yes, checked by the program itself.</li>
+  <li><strong>The Smithy never runs, installs or applies anything.</strong> It only makes drafts.</li>
+  <li>It never writes to your <code>profile.md</code>.</li>
+  <li>Its call page and call server listen on your own PC only (<code>127.0.0.1</code>), so other devices on your network cannot reach them.</li>
+</ul>
+
+<h2>Keeping your keys safe</h2>
+<ul>
+  <li>Keys in <code>.env</code> are like passwords. Do not post them, send them or put them on the internet. Othos's own files for them (<code>.env</code>, <code>personal.json</code>, <code>profile.md</code>) are kept out of Git, the tool developers use to share code.</li>
+  <li>Keys you add in The Smithy's Providers window are encrypted for your Windows account and stored outside the Othos folder, in <code>%LOCALAPPDATA%\Othos\keys.dat</code>.</li>
+  <li>Logs (<code>agent\logs\</code>) can contain what you said. Do not share them without reading them first.</li>
+</ul>
+
+<details>
+<summary>Advanced: how-to screenshots</summary>
+<p>While you are recording a how-to, Othos takes a picture of the window in front: one per step you say, or when you say "take a picture". There is no timer and no background capture. It skips chat apps (Signal, Discord, Telegram, WhatsApp), password managers, Windows sign-in and permission prompts, and any window whose title mentions a password, credentials, signing in or two-factor codes. They are saved in <code>agent\drafts\howto\</code> and go nowhere else.</p>
+</details>
+
+<div class="pager"><a href="smithy.html">← The Smithy</a><a href="advanced.html">Next: Advanced →</a></div>
+</main>
+</div>
+</body>
+</html>

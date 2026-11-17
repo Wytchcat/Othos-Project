@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Install Othos</title>
+<meta name="description" content="Install Othos on Windows, step by step, for complete beginners.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="layout">
+<nav class="site" aria-label="Guide">
+  <div class="brand">Othos</div><div class="sub">The user guide</div>
+  <ol>
+    <li><a href="index.html">Start here</a></li>
+    <li><a href="install.html" aria-current="page">Install</a></li>
+    <li><a href="first-call.html">Your first call</a></li>
+    <li><a href="make-it-yours.html">Make it yours</a></li>
+    <li><a href="everyday.html">Everyday use</a></li>
+    <li><a href="smithy.html">The Smithy</a></li>
+    <li><a href="privacy.html">Privacy</a></li>
+    <li><a href="advanced.html">Advanced</a></li>
+    <li><a href="troubleshooting.html">Fixing problems</a></li>
+    <li><a href="words.html">Words explained</a></li>
+    <li><a href="about.html">About this guide</a></li>
+  </ol>
+</nav>
+<main>
+<h1>Install</h1>
+<p class="lead">Five steps. You do not need to understand them all to follow them. If something goes wrong, nothing is broken: setup can be run again, and it skips what is already done and never overwrites your settings files.</p>
+
+<h2>Step 1: Install three programs</h2>
+<p>Othos is built on three free programs. Install each one the usual way (download, open, click through the installer).</p>
+<div class="table-wrap"><table>
+  <tr><th>Program</th><th>What it is</th><th>Get it</th></tr>
+  <tr><td>Python <strong>3.12</strong></td><td>The language Othos's voice agent is written in. It must be version <strong>3.12.x</strong>. Newer versions (3.13 and later) do not work yet, even if they are the one on the download button.</td><td><a href="https://www.python.org/downloads/">python.org/downloads</a>. In the installer, tick <em>py launcher</em>.</td></tr>
+  <tr><td>Node.js (LTS)</td><td>Runs the web page you talk to Othos on. Pick the one marked <em>LTS</em>.</td><td><a href="https://nodejs.org/">nodejs.org</a></td></tr>
+  <tr><td>Ollama</td><td>The program that runs AI models on your PC.</td><td><a href="https://ollama.com/download">ollama.com/download</a></td></tr>
+</table></div>
+<p>Optional: <a href="https://git-scm.com/download/win">Git</a>, only if you want to get updates the developer's way. You can skip it.</p>
+
+<h2>Step 2: Run setup</h2>
+<p><strong>Easiest: use the setup window.</strong> If your Othos folder contains <code>OthosSetup.exe</code>, double-click it and follow the buttons. It checks that the three programs above are installed (listing any that are missing, with a link each), then does the same work as the command below and shows each step. If your folder has only an <code>installer</code> folder with source files, see <a href="advanced.html#installer">Advanced</a>, or use the command below instead.</p>
+<p><strong>Or: type one command.</strong></p>
+<ol class="steps">
+  <li>Open the Othos folder in File Explorer (the one containing <code>setup.ps1</code>).</li>
+  <li>Click the long address bar at the top of the window, type <code>powershell</code>, and press Enter. A blue or black window opens. This is <strong>PowerShell</strong>, a place where you type instructions to the computer.</li>
+  <li>Type (or paste) this and press Enter:
+<pre><code>powershell -ExecutionPolicy Bypass -File setup.ps1</code></pre>
+    <span class="dim">(The <code>-ExecutionPolicy Bypass</code> part just lets this one script run. It changes no Windows settings.)</span></li>
+</ol>
+<p>Setup asks <em>Which setup?</em> Type <code>1</code> (mixed, the usual one) or just press Enter. Then it works through these steps and prints a line starting with <code>==</code> for each:</p>
+<ul>
+  <li><strong>Checking tools:</strong> looks for Python 3.12, Node, Ollama, and installs a small helper called pnpm if it is missing.</li>
+  <li><strong>LiveKit server:</strong> downloads the small program that carries your voice between the web page and Othos. It comes from LiveKit's official download page.</li>
+  <li><strong>Python environment:</strong> installs the packages Othos needs, into a folder of its own that does not touch the rest of your PC.</li>
+  <li><strong>Call page:</strong> installs the web page you will talk on.</li>
+  <li><strong>Models:</strong> downloads four small AI models through Ollama, about 6 GB in total. This is the longest step and can take a while on a slow connection.</li>
+  <li><strong>Your settings:</strong> makes three files for you to fill in (next step). It also asks what you would like to call your assistant. Press Enter to keep the name <em>Othos</em>.</li>
+</ul>
+<div class="warn"><p><strong>If setup stops</strong>, the last line starts with <code>STOP:</code> and says what is missing, for example <em>Python 3.12 not found</em>. Install what it names, close and reopen PowerShell, and run the same command again. It carries on where it left off.</p></div>
+
+<h2>Step 3: Fill in your settings files</h2>
+<p>When setup finishes, three files open in Notepad++ (if you have it) or Notepad. They live in the <code>agent</code> folder and stay on your computer.</p>
+<ul>
+  <li><code>.env</code>: your keys. For the usual setup you need two: <code>DEEPGRAM_API_KEY</code> (turns your voice into text) and <code>RIME_API_KEY</code> (Othos's speaking voice). Sign up on each service's website, copy the key, and paste it after the <code>=</code> sign. <strong>Treat keys like passwords:</strong> never post them or send them to anyone. Leave every other line as it is.</li>
+  <li><code>personal.json</code>: your name and town, so Othos can greet you and give local weather. Everything starts empty, which just switches that feature off. See <a href="make-it-yours.html">Make it yours</a>.</li>
+  <li><code>profile.md</code>: a few plain sentences about you and how you like Othos to behave, such as "Keep answers short." Only you edit this file.</li>
+</ul>
+<p>Save each file (Ctrl+S) and close it.</p>
+
+<h2>Step 4: Check that everything is ready</h2>
+<p>In the same PowerShell window, run:</p>
+<pre><code>powershell -ExecutionPolicy Bypass -File doctor.ps1</code></pre>
+<p>It prints a line for each thing it checked. Lines starting <code>ok</code> are fine. Lines starting <code>FIX</code> say what is missing or wrong. At the end you see <strong>All good.</strong> or the number of things to fix. It only looks; it never changes anything.</p>
+
+<h2>Step 5: Start Othos</h2>
+<p>Double-click <code>start-othos.bat</code> in the Othos folder. Your web browser opens the call page at <code>http://127.0.0.1:3000</code> (that address means "this computer"). Now go to <a href="first-call.html">Your first call</a>.</p>
+
+<h2>Optional: a taskbar app</h2>
+<p>If you would rather click an icon than a <code>.bat</code> file, build the Othos app once. In PowerShell, in the Othos folder:</p>
+<pre><code>powershell -ExecutionPolicy Bypass -File agent\build-othos-app.ps1</code></pre>
+<p>This adds an Othos shortcut. Click it to start Othos; close its window to stop Othos. The first time it opens, it asks whether it may check your PC's specs. If you say yes, it shows which AI models and settings fit your PC. Nothing leaves your computer.</p>
+<p>To stop Othos without the app, run <code>agent\stop-othos.bat</code>.</p>
+
+<details>
+<summary>Advanced: setup options and what it downloads</summary>
+<ul>
+  <li><code>setup.ps1 -Mode offline</code> picks the offline setup without asking.</li>
+  <li>The four models are <code>llama3.2:3b</code> (conversation), <code>nomic-embed-text</code> (searching your notes), <code>moondream:1.8b</code> (the camera) and <code>qwen2.5-coder:3b</code> (The Smithy and the code chat).</li>
+  <li>If you use Git, setup also turns on a pre-commit check that keeps <code>requirements.txt</code> an exact list of package versions.</li>
+  <li>If Microsoft Defender is running, setup scans the LiveKit download before using it.</li>
+</ul>
+</details>
+
+<div class="pager"><a href="index.html">← Start here</a><a href="first-call.html">Next: Your first call →</a></div>
+</main>
+</div>
+</body>
+</html>

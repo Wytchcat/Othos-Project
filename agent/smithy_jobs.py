@@ -1087,7 +1087,10 @@ def build_problems(folder: Path, rels: list[str], stdlib_only: bool = False) -> 
                                 "is in the program: add it to the files this script compiles")
         for n in script["missing"]:
             problems.append(f"{script['script']} line 1: it compiles {n}, which isn't in the build")
-        cs = script["files"]
+        # the files it leaves out are compiled with it all the same, so their own errors are named in their own
+        # file and fixed there (Nov 17, task 59: GooglePrompt.cs's error showed only once the script compiled it,
+        # was blamed on the script's edit, refused, and never sent to GooglePrompt.cs)
+        cs = list(script["files"]) + [r for r in cs if r not in script["files"]]
     if cs:
         errs = _cs_errors(folder, cs, script["target"] if script else "library", script["refs"] if script else ())
         if errs is None:
@@ -1174,6 +1177,61 @@ def test_main_problems(rel: str, text: str) -> list[str]:
     if len(calls) > 1 and not out:
         out.append(f"{rel} line {calls[1].lineno}: unittest.main() is called {len(calls)} times; keep exactly one")
     return out
+
+
+_RUNS_ANYWAY = re.compile(r"^\S.* line \d+: F811 ")      # redefined: Python runs it, the later one wins
+
+
+def blocks_tests(problems: list[str]) -> list[str]:
+    """The problems that keep the Sandbox tests from running: all but the ones Python runs with all the same."""
+    return [x for x in problems if not _RUNS_ANYWAY.match(x)]
+
+
+def drop_repeated_imports(text: str) -> tuple[str, int]:
+    """An import inside a function that repeats one at the top of the file (the same module, the same names) is
+    taken out, with no model: ruff calls it F811 and it blocked the tests (Nov 17, task 58: three fix rounds failed
+    to remove `from academy_readme import ...` repeated inside a test). Returns (text, how many were taken out)."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return text, 0
+    top: set[tuple] = set()
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom):
+            top |= {("from", node.module, node.level, a.name, a.asname) for a in node.names}
+        elif isinstance(node, ast.Import):
+            top |= {("import", a.name, a.asname) for a in node.names}
+
+    def key(node: ast.AST) -> set[tuple] | None:
+        if isinstance(node, ast.ImportFrom):
+            return {("from", node.module, node.level, a.name, a.asname) for a in node.names}
+        if isinstance(node, ast.Import):
+            return {("import", a.name, a.asname) for a in node.names}
+        return None
+
+    lines = text.splitlines(keepends=True)
+    cut: list[tuple[int, int]] = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        mine = []
+        for st in fn.body:
+            k = key(st)
+            if not k or not k <= top:
+                continue
+            first, last = st.lineno - 1, (st.end_lineno or st.lineno) - 1
+            before = lines[first][:st.col_offset].strip()
+            after = lines[last][st.end_col_offset or 0:].strip()
+            if before or (after and not after.startswith("#")):   # only a statement on lines of its own
+                continue
+            mine.append((first, last))
+        if len(mine) < len(fn.body):                 # never leaves a function with no body
+            cut += mine
+    if not cut:
+        return text, 0
+    for first, last in sorted(cut, reverse=True):
+        del lines[first:last + 1]
+    return "".join(lines), len(cut)
 
 
 def _py_module(rel: str) -> str:
@@ -1872,6 +1930,14 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
         """Every check that needs no model: the build check, then the JSON fields and calls the change asks for.
         The fix rounds use this too (Nov 16, task 56: they re-ran only build_problems, so the two missing record()
         calls were never sent to a file and 3 rounds passed with no fix asked for)."""
+        for rel in code:                       # a repeated import inside a function: taken out, no model needed
+            if rel.lower().endswith(".py") and rel in written:
+                new, n = drop_repeated_imports(written[rel])
+                if n:
+                    inside(folder, rel).write_text(new, encoding="utf-8")
+                    written[rel] = new
+                    steps.info("%s: %d import%s inside a function repeated the file's own imports; taken out.",
+                               rel, n, "" if n == 1 else "s")
         problems, checked = build_problems(folder, code, stdlib_only)
         # the JSON fields a change asks for, checked on every entry (task 56: the glossary had no ids for hours
         # while models said it did)
@@ -2007,7 +2073,9 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
     # the tests, in a throwaway Windows Sandbox (smithy_sandbox; off unless sandbox_tests is on). Only for the
     # whole build, once it builds clean; a failure gets one fix round (sandbox_fix_rounds) and runs again.
     sandbox = {"status": "off", "tests": {}, "output": {}, "why": ""}
-    if only is None and not stopped and not problems and any(smithy_sandbox.is_test(r) for r in code):
+    # a problem the code runs with all the same (a name defined twice) doesn't keep the tests from running; it
+    # still leaves the build NOT COMPLETE (Nov 17, task 58: one repeated import meant its tests never ran)
+    if only is None and not stopped and not blocks_tests(problems) and any(smithy_sandbox.is_test(r) for r in code):
         stop = getattr(ctx, "_should_stop", None)
         try:
             for rnd in range(int(ctx.cfg.get("sandbox_fix_rounds", 1)) + 1):
@@ -2109,7 +2177,7 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
                     steps.info("No fix changed a file, so the last test run stands (not run again).")
                     break                    # task 55: a 10-minute Sandbox run again on the same files
                 problems, checked = all_problems()
-                if problems:
+                if blocks_tests(problems):
                     break
         except (BudgetOut, TooLongForLocal) as e:
             stopped = str(e)
