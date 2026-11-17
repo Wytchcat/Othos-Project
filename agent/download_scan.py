@@ -173,6 +173,10 @@ def _run(cmd: list[str]) -> tuple[int, str]:
         return -1, str(e)
 
 
+_DEFENDER_THREAT = re.compile(r"found\s+[1-9]\d*\s+threats?\b", re.I)
+_DEFENDER_FAILED = re.compile(r"failed with hr\s*=", re.I)
+
+
 def scan(path, kind: str = "data") -> dict:
     """Scan one file with the chosen product. kind: "data" (a model) or "program" (exe, zip, installer)."""
     path = Path(path)
@@ -191,11 +195,15 @@ def scan(path, kind: str = "data") -> dict:
         if not exe or not defender_ready():
             return {"status": "unchecked", "engine": pick, "detail": "Microsoft Defender isn't running, so nothing scanned this file."}
         code, text = _run([str(exe), "-Scan", "-ScanType", "3", "-File", str(path), "-DisableRemediation"])
-        if code == 0:
-            return {"status": "clean", "engine": pick, "detail": "Microsoft Defender found no threats."}
-        if code == 2:
+        # MpCmdRun exits 2 both for "threat found" and for scan errors (e.g. "Failed with hr = 0x80508023" for a file
+        # Defender can't see), so a threat is only reported when its output says so
+        if _DEFENDER_THREAT.search(text):
             return {"status": "found", "engine": pick, "detail": "Microsoft Defender reported a threat."}
-        return {"status": "unchecked", "engine": pick, "detail": f"Microsoft Defender couldn't finish the scan ({text.strip()[-120:] or code})."}
+        if code == 0 and not _DEFENDER_FAILED.search(text):
+            return {"status": "clean", "engine": pick, "detail": "Microsoft Defender found no threats."}
+        why = (_DEFENDER_FAILED.search(text) and text[text.lower().find("failed with"):][:60].strip()) or text.strip()[-120:] or f"exit code {code}"
+        return {"status": "unchecked", "engine": pick,
+                "detail": f"Microsoft Defender couldn't finish the scan ({why}). The file was not treated as a threat."}
     if pick == "ClamAV":
         exe = clam_exe()
         if not exe:

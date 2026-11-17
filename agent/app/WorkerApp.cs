@@ -2373,6 +2373,13 @@ class SiteBuildForm : Form
     readonly Dictionary<string, List<Label>> fitLabels = new Dictionary<string, List<Label>>();
     Dictionary<string, object> info;
     TextBox name, about, pages, look, notes;
+    // Joomla only: the admin account. The password is typed here, sent once to the build on its STDIN, then cleared;
+    // it's never saved, logged or put on a command line.
+    readonly Panel joomlaPanel = new Panel();
+    TextBox adminUser, adminEmail, pass1, pass2;
+    readonly Button sitesButton = new Button(), openButton = new Button();
+    string builtUrl = "";
+    bool building;
 
     public SiteBuildForm()
     {
@@ -2388,6 +2395,11 @@ class SiteBuildForm : Form
         Btn(planButton, "Show the plan…", 22, 596, 170, true); planButton.Enabled = false;
         planButton.Click += (s, e) => ShowPlan();
         Btn(close, "Close", 522, 596, 100, false); close.Click += (s, e) => Close();
+        // the Joomla sites made on this PC: start, stop, open (joomla_stack.py)
+        Btn(sitesButton, "Your Joomla sites…", 202, 596, 170, false);
+        sitesButton.Click += (s, e) => { using (var d = new JoomlaSitesForm()) d.ShowDialog(this); };
+        Btn(openButton, "Open the site", 382, 596, 130, true); openButton.Visible = false;
+        openButton.Click += (s, e) => { if (builtUrl.StartsWith("http://127.0.0.1:")) try { Process.Start(builtUrl); } catch { } };
         CancelButton = close;                                    // Escape closes; nothing is made
         AutoAnchor.Fit(this, true);
         Label(body, "Loading…", 16, 16, 580, Dim);
@@ -2497,8 +2509,60 @@ class SiteBuildForm : Form
         look = Field("The look (optional)", "Colours and feel, e.g. warm and calm, dark green and cream.", ref y, false);
         notes = Field("Anything else (optional)", "Opening hours, what to say on Contact, and so on. [CHECK] notes mark anything missing.", ref y, true);
         foreach (var t in new[] { name, about, pages }) t.TextChanged += (s, e) => Ready();
-        var pad = new Label(); pad.SetBounds(16, y, 10, 8); body.Controls.Add(pad);
+
+        // Joomla's own questions, shown only when Joomla is picked
+        joomlaPanel.SetBounds(0, y, 610, 10); joomlaPanel.BackColor = Bg; joomlaPanel.Visible = false;
+        body.Controls.Add(joomlaPanel);
+        int jy = 0;
+        jy = Label(joomlaPanel, "4. Your Joomla admin account", 16, jy, 580, Ink, true).Bottom + 2;
+        jy = Label(joomlaPanel, "Kept only in your Joomla site on this PC. Firestarter never logs in to it.", 16, jy, 580, Dim).Bottom + 6;
+        adminUser = JField("Admin username", ref jy, false);
+        adminEmail = JField("Admin email (Joomla asks for one)", ref jy, false);
+        pass1 = JField("Admin password (12 characters or more)", ref jy, true);
+        pass2 = JField("The same password again", ref jy, true);
+        foreach (var t in new[] { adminUser, adminEmail, pass1, pass2 }) t.TextChanged += (s, e) => Ready();
+        jy = Label(joomlaPanel, "Starting extensions (from their makers; you download and install the ones you want):",
+                   16, jy + 4, 580, Ink, true).Bottom + 4;
+        foreach (var o in (System.Collections.ArrayList)d["types"])
+        {
+            var t = (Dictionary<string, object>)o;
+            if (S(t, "key") != "joomla" || !t.ContainsKey("extensions")) continue;
+            foreach (var eo in (System.Collections.ArrayList)t["extensions"])
+            {
+                var x = (Dictionary<string, object>)eo;
+                jy = Label(joomlaPanel, S(x, "name") + ": " + S(x, "what") + ". " + S(x, "price") + ".", 16, jy, 580, Dim).Bottom;
+                foreach (var key in new[] { "page", "page2" })
+                {
+                    string url = S(x, key);
+                    if (!url.StartsWith("https://")) continue;
+                    var link = new LinkLabel(); link.Text = "Its page: " + new Uri(url).Host; link.AutoSize = true;
+                    link.LinkColor = Dim; link.ActiveLinkColor = Ember; link.Location = new Point(36, jy);
+                    link.LinkClicked += (s, e) => { try { Process.Start(url); } catch { } };   // her browser
+                    joomlaPanel.Controls.Add(link); jy = link.Bottom;
+                }
+                jy += 6;
+            }
+        }
+        joomlaPanel.Height = jy + 10;
+        foreach (var r in typeButtons) r.CheckedChanged += (s, e) => { joomlaPanel.Visible = IsJoomla(); Ready(); };
+        var pad = new Label(); pad.SetBounds(16, joomlaPanel.Bottom, 10, 8); body.Controls.Add(pad);
         status.Text = "Pick what the site is for and a kind of site, then answer the questions.";
+    }
+
+    TextBox JField(string ask, ref int y, bool secret)
+    {
+        y = Label(joomlaPanel, ask, 16, y, 580, Ink).Bottom + 2;
+        var t = new TextBox(); t.BackColor = PurpleFill; t.ForeColor = Ink; t.BorderStyle = BorderStyle.FixedSingle;
+        t.SetBounds(16, y, 360, 26); t.UseSystemPasswordChar = secret; t.MaxLength = secret ? 128 : 100;
+        joomlaPanel.Controls.Add(t); y = t.Bottom + 8; return t;
+    }
+
+    bool IsJoomla() { return S(Chosen(typeButtons), "key") == "joomla"; }
+
+    bool JoomlaReady()
+    {
+        return adminUser != null && System.Text.RegularExpressions.Regex.IsMatch(adminUser.Text.Trim(), "^[A-Za-z0-9._-]{2,30}$") &&
+               adminEmail.Text.Contains("@") && pass1.Text.Length >= 12 && pass1.Text == pass2.Text;
     }
 
     void UseChosen()
@@ -2522,8 +2586,9 @@ class SiteBuildForm : Form
 
     void Ready()
     {
-        planButton.Enabled = Chosen(useButtons) != null && Chosen(typeButtons) != null && name != null &&
-                             name.Text.Trim().Length >= 2 && about.Text.Trim().Split(' ').Length >= 3 && pages.Text.Trim() != "";
+        planButton.Enabled = !building && Chosen(useButtons) != null && Chosen(typeButtons) != null && name != null &&
+                             name.Text.Trim().Length >= 2 && about.Text.Trim().Split(' ').Length >= 3 && pages.Text.Trim() != "" &&
+                             (!IsJoomla() || JoomlaReady());
     }
 
     string Answers()
@@ -2534,6 +2599,7 @@ class SiteBuildForm : Form
             { "type", S(Chosen(typeButtons), "key") }, { "use", S(Chosen(useButtons), "key") },
             { "name", name.Text.Trim() }, { "about", about.Text.Trim() }, { "pages", list },
             { "look", look.Text.Trim() }, { "notes", notes.Text.Trim() } };
+        if (IsJoomla()) { a["admin_user"] = adminUser.Text.Trim(); a["admin_email"] = adminEmail.Text.Trim(); }   // never the password
         string file = Path.Combine(Path.GetTempPath(), "firestarter-site-build.json");
         File.WriteAllText(file, Json.Serialize(a), new System.Text.UTF8Encoding(false));
         return file;
@@ -2563,6 +2629,7 @@ class SiteBuildForm : Form
         var a = ThemedBox.Show(this, S(r, "plan") + "\n\nBuild it?", FirestarterApp.Name + ": the plan",
                                MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
         if (a != DialogResult.Yes) { try { File.Delete(file); } catch { } status.ForeColor = Dim; status.Text = "Not built. Change anything and show the plan again."; return; }
+        if (IsJoomla()) { BuildJoomla(file); return; }
         status.Text = "Starting…";
         ThreadPool.QueueUserWorkItem(_ =>
         {
@@ -2573,6 +2640,171 @@ class SiteBuildForm : Form
                 if (s2 != null && S(s2, "task") != "")
                 { status.ForeColor = Ember; status.Text = "Queued as Firestarter task " + S(s2, "task") + ". It writes the pages' words, then makes the site in drafts\\sites."; }
                 else { status.ForeColor = Gold; status.Text = "Not started: " + (s2 == null ? "try  worker.py build-start  in PowerShell" : S(s2, "error")); }
+            })); } catch { }
+        });
+    }
+
+    // The Joomla build: downloads (checked), PHP and MariaDB, Joomla's installer, her password on STDIN, the site
+    // started on 127.0.0.1; one JSON line per step (worker.py joomla-build).
+    void BuildJoomla(string file)
+    {
+        building = true; Ready(); status.ForeColor = Dim; status.Text = "Starting the Joomla build…";
+        string password = pass1.Text;
+        pass1.Text = ""; pass2.Text = "";                     // not kept in the window
+        var psi = new ProcessStartInfo(FirestarterApp.Py, "-u worker.py joomla-build \"" + file + "\" --approved");
+        psi.WorkingDirectory = FirestarterApp.AgentDir; psi.UseShellExecute = false; psi.CreateNoWindow = true;
+        psi.RedirectStandardInput = true; psi.RedirectStandardOutput = true;
+        psi.StandardOutputEncoding = System.Text.Encoding.UTF8;
+        psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8";
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            string final = null, url = ""; bool ok = false;
+            try
+            {
+                using (var p = Process.Start(psi))
+                {
+                    p.StandardInput.WriteLine(password); p.StandardInput.Close();
+                    password = null;
+                    string line;
+                    while ((line = p.StandardOutput.ReadLine()) != null)
+                    {
+                        Dictionary<string, object> ev = null;
+                        try { ev = Json.Deserialize<Dictionary<string, object>>(line); } catch { }
+                        if (ev == null) continue;
+                        string kind = S(ev, "event");
+                        if (kind == "progress")
+                        {
+                            string st = S(ev, "status"), done = S(ev, "done"), total = S(ev, "total");
+                            if (done != "" && total != "" && total != "0")
+                                st += string.Format("  {0:0} of {1:0} MB", double.Parse(done) / 1e6, double.Parse(total) / 1e6);
+                            try { BeginInvoke((Action)(() => { status.ForeColor = Dim; status.Text = st; })); } catch { }
+                        }
+                        else if (kind == "done")
+                        {
+                            ok = true; url = S(ev, "url");
+                            final = "Built and running at " + url + "  (admin: " + S(ev, "admin") + "). Firestarter task " +
+                                    S(ev, "task") + " writes the articles and steps.html in its folder.";
+                        }
+                        else if (kind == "error") final = "Not built: " + S(ev, "error");
+                    }
+                    p.WaitForExit();
+                }
+            }
+            catch (Exception ex) { final = "Not built: " + ex.Message; }
+            finally { try { File.Delete(file); } catch { } }
+            try { BeginInvoke((Action)(() => {
+                building = false; Ready();
+                status.ForeColor = ok ? Ember : Gold; status.Text = final ?? "Stopped.";
+                if (ok) { builtUrl = url; openButton.Visible = true; }
+            })); } catch { }
+        });
+    }
+}
+
+// "Your Joomla sites": the Joomla sites made on this PC (joomla_stack.py). Start runs one on 127.0.0.1, Stop stops
+// it, Open opens it in her browser, Steps opens its steps.html. "Stop all" also stops the database. Only processes
+// Firestarter started are ever stopped.
+class JoomlaSitesForm : Form
+{
+    static readonly Color Bg = Color.FromArgb(2, 7, 5), Ink = Color.FromArgb(200, 230, 210),
+        Dim = Color.FromArgb(120, 140, 130), Ember = FirestarterApp.Accent, Gold = Color.FromArgb(231, 195, 104),
+        PurpleFill = Color.FromArgb(14, 16, 25), PurpleLine = Color.FromArgb(64, 53, 105), PurpleHover = Color.FromArgb(25, 24, 43);
+    static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
+    readonly Panel list = new Panel();
+    readonly Label status = new Label();
+
+    public JoomlaSitesForm()
+    {
+        Text = FirestarterApp.Name + ": your Joomla sites";
+        FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false;
+        StartPosition = FormStartPosition.CenterParent; ShowInTaskbar = false;
+        try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
+        BackColor = Bg; ForeColor = Ink; Font = new Font("Segoe UI", 10f);
+        ClientSize = new Size(560, 420);
+        var stripe = new Panel(); stripe.BackColor = Ember; stripe.SetBounds(0, 0, 6, 420); Controls.Add(stripe);
+        var head = new Label(); head.Text = "Your Joomla sites on this PC"; head.ForeColor = Ember;
+        head.Font = new Font("Segoe UI Semibold", 12f); head.SetBounds(22, 12, 520, 26); Controls.Add(head);
+        var why = new Label(); why.ForeColor = Dim; why.SetBounds(22, 40, 520, 40);
+        why.Text = "Each runs only on this PC (127.0.0.1) while it's started. Stopping one doesn't delete anything.";
+        Controls.Add(why);
+        list.SetBounds(22, 84, 520, 260); list.AutoScroll = true; list.BackColor = Bg; Controls.Add(list);
+        status.SetBounds(22, 348, 520, 22); status.ForeColor = Dim; Controls.Add(status);
+        var stopAll = Btn("Stop all", 22, 376, 120, false);
+        stopAll.Click += (s, e) => Do("joomla-stop", "Stopped every site and the database.");
+        var close = Btn("Close", 442, 376, 100, false); close.Click += (s, e) => Close();
+        CancelButton = close;
+        AutoAnchor.Fit(this, true);
+        LoadList();
+    }
+
+    Button Btn(string text, int x, int y, int w, bool main)
+    {
+        var b = new Button(); b.Text = text; b.SetBounds(x, y, w, 30); b.FlatStyle = FlatStyle.Flat;
+        b.FlatAppearance.BorderColor = main ? Ember : PurpleLine; b.FlatAppearance.MouseOverBackColor = PurpleHover;
+        b.BackColor = PurpleFill; b.ForeColor = Ink; Controls.Add(b); return b;
+    }
+
+    static string S(Dictionary<string, object> d, string k)
+    { return d != null && d.ContainsKey(k) && d[k] != null ? Convert.ToString(d[k]) : ""; }
+
+    void LoadList()
+    {
+        status.ForeColor = Dim; status.Text = "Reading the list…";
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            Dictionary<string, object> d = null;
+            try { d = Json.Deserialize<Dictionary<string, object>>(FirestarterApp.Run("joomla-sites")); } catch { }
+            try { BeginInvoke((Action)(() => Fill(d))); } catch { }
+        });
+    }
+
+    void Fill(Dictionary<string, object> d)
+    {
+        list.Controls.Clear();
+        if (d == null || !d.ContainsKey("sites")) { status.ForeColor = Gold; status.Text = "Couldn't read the list (try  worker.py joomla-sites)."; return; }
+        var sites = (System.Collections.ArrayList)d["sites"];
+        if (sites.Count == 0) { status.Text = "No Joomla sites yet: make one with New site build."; return; }
+        int y = 0;
+        foreach (var o in sites)
+        {
+            var s = (Dictionary<string, object>)o;
+            string slug = S(s, "slug"), url = S(s, "url"), folder = S(s, "folder");
+            bool on = S(s, "running") == "True";
+            var l = new Label(); l.AutoSize = true; l.ForeColor = on ? Ember : Ink; l.Location = new Point(0, y);
+            l.Text = S(s, "name") + "  (Joomla " + S(s, "joomla") + ")  " + (on ? "running at " + url : "stopped");
+            list.Controls.Add(l); y = l.Bottom + 4;
+            int x = 0;
+            foreach (var label in on ? new[] { "Open", "Admin", "Stop", "Steps" } : new[] { "Start", "Steps" })
+            {
+                var b = new Button(); b.Text = label; b.SetBounds(x, y, 80, 28); b.FlatStyle = FlatStyle.Flat;
+                b.FlatAppearance.BorderColor = PurpleLine; b.BackColor = PurpleFill; b.ForeColor = Ink;
+                string act = label;
+                b.Click += (s2, e2) =>
+                {
+                    if (act == "Open" && url.StartsWith("http://127.0.0.1:")) try { Process.Start(url); } catch { }
+                    if (act == "Admin" && url.StartsWith("http://127.0.0.1:")) try { Process.Start(url + "administrator/"); } catch { }
+                    if (act == "Steps") { string f = Path.Combine(folder, "steps.html"); if (File.Exists(f)) try { Process.Start(f); } catch { } else status.Text = "Its steps aren't written yet (the articles task is still running)."; }
+                    if (act == "Start") Do("joomla-start \"" + slug + "\"", "Started.");
+                    if (act == "Stop") Do("joomla-stop \"" + slug + "\"", "Stopped.");
+                };
+                list.Controls.Add(b); x += 88;
+            }
+            y += 40;
+        }
+        status.Text = "";
+    }
+
+    void Do(string args, string said)
+    {
+        status.ForeColor = Dim; status.Text = "Working…";
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            string o = "";
+            try { o = FirestarterApp.Run(args); } catch (Exception ex) { o = ex.Message; }
+            try { BeginInvoke((Action)(() => {
+                status.ForeColor = o.Contains("\"error\"") ? Gold : Ember;
+                status.Text = o.Contains("\"error\"") ? "Didn't work: " + o : said;
+                LoadList();
             })); } catch { }
         });
     }
