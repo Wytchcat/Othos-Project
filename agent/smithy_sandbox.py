@@ -3,10 +3,11 @@
 The Smithy never runs anything on this PC. With `sandbox_tests: true` in smithy.json (off by default), a
 build's test files may run inside Windows Sandbox:
 - networking OFF, no clipboard, printer, microphone or camera; the Sandbox is thrown away afterwards
-- only three folders are mapped: the build's files (read-only), the Python installer (read-only, copied from
-  Downloads only after its signature checks as the Python Software Foundation's) and one output folder
-- Python 3.12.10 is installed inside, the build is copied to C:\\Work there, each test runs with a time limit,
-  and only its output and exit code come back
+- only three folders are mapped: the build's files (read-only), Python (read-only, copied from Downloads only
+  after it checks: the installer signed by the Python Software Foundation, the embeddable zip by its pinned
+  SHA-256) and one output folder
+- Python 3.12.10 is unzipped inside (or installed, when the zip isn't there or doesn't work), the build is copied
+  to C:\\Work there, each test runs with a time limit, and only its output and exit code come back
 - one Sandbox at a time: if one is already running (an installer test), the tests aren't run, and it says so
 - the Sandbox opens a window while it runs (Windows needs a signed-in session to run anything in it)
 
@@ -121,14 +122,46 @@ def _config(kit: Path) -> str:
             + mapped(kit / "out", r"C:\Kit\out", False) + "</MappedFolders></Configuration>")
 
 
-def _script(installer: str, tests: list[str], per_test_seconds: int) -> str:
-    lines = ["@echo off",
-             f"start /wait C:\\Kit\\setup\\{installer} /quiet InstallAllUsers=0 PrependPath=0 Include_test=0 "
-             "Include_launcher=0 Include_doc=0 Include_tcltk=0 TargetDir=C:\\Py",
-             "if not exist C:\\Py\\python.exe (echo Python didn't install> C:\\Kit\\out\\setup.txt& echo done> "
-             "C:\\Kit\\out\\done.txt& exit /b 1)",
-             "xcopy C:\\Kit\\in C:\\Work\\ /e /i /q /y >nul",
-             "cd /d C:\\Work"]
+# Python's own "embeddable" zip (Nov 16, the user: "Yes, go ahead and download"): unzipped in the Sandbox in seconds,
+# where the installer took most of each ~11-minute run. The zip itself isn't signed, so only this exact file is used:
+# its SHA-256, taken from python.org's file on Nov 16 after all 31 programs in it checked as signed (29 by the Python
+# Software Foundation, 2 by Microsoft). Any other copy: the installer, as before.
+EMBED_SHA256 = {"python-3.12.10-embed-amd64.zip": "4acbed6dd1c744b0376e3b1cf57ce906f9dc9e95e68824584c8099a63025a3c3"}
+
+
+def _sha256(path: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _embed_ok(path: Path) -> bool:
+    try:
+        return path.is_file() and EMBED_SHA256.get(path.name) == _sha256(path)
+    except OSError:
+        return False
+
+
+def _script(installer: str, tests: list[str], per_test_seconds: int, embed: str = "") -> str:
+    install = (f"start /wait C:\\Kit\\setup\\{installer} /quiet InstallAllUsers=0 PrependPath=0 Include_test=0 "
+               "Include_launcher=0 Include_doc=0 Include_tcltk=0 TargetDir=C:\\Py") if installer else ""
+    lines = ["@echo off"]
+    if embed:
+        # unzipped; its ._pth file decides where Python looks for modules, so C:\Work (the build) is added to it
+        lines += [f"powershell -NoProfile -Command \"Expand-Archive -LiteralPath 'C:\\Kit\\setup\\{embed}' "
+                  "-DestinationPath 'C:\\Py' -Force; Get-ChildItem 'C:\\Py\\python*._pth' | "
+                  "ForEach-Object { Add-Content -LiteralPath $_.FullName ([Environment]::NewLine + 'C:\\Work') }\""]
+        if install:                                    # the installer only if the zip didn't give a python.exe
+            lines += [f"if not exist C:\\Py\\python.exe ({install})"]
+    elif install:
+        lines += [install]
+    lines += ["if not exist C:\\Py\\python.exe (echo Python didn't install> C:\\Kit\\out\\setup.txt& echo done> "
+              "C:\\Kit\\out\\done.txt& exit /b 1)",
+              "xcopy C:\\Kit\\in C:\\Work\\ /e /i /q /y >nul",
+              "cd /d C:\\Work"]
     for t in tests:
         name = Path(t).stem
         run = f"C:\\Py\\python.exe {t}"
@@ -157,7 +190,10 @@ def run_tests(job_id: int, folder: Path, rels: list[str], cfg: dict, results_dir
         return {"status": "busy", "tests": {t: "not run" for t in tests}, "output": {},
                 "why": "another Windows Sandbox is running (only one at a time)"}
     installer = Path(cfg.get("sandbox_python") or Path.home() / "Downloads" / "python-3.12.10-amd64.exe")
-    if not installer.is_file() or not _signed_by_python(installer):
+    embed = Path(cfg.get("sandbox_python_zip") or Path.home() / "Downloads" / "python-3.12.10-embed-amd64.zip")
+    embed_ok = _embed_ok(embed)
+    installer_ok = installer.is_file() and _signed_by_python(installer)
+    if not embed_ok and not installer_ok:
         return {"status": "unavailable", "tests": {t: "not run" for t in tests}, "output": {},
                 "why": f"the Python installer ({installer.name}) isn't there or isn't signed by the {PYTHON_SIGNER}"}
     kit = results_dir / "sandbox-runs" / f"{job_id:05d}-{round_no}"
@@ -169,9 +205,13 @@ def run_tests(job_id: int, folder: Path, rels: list[str], cfg: dict, results_dir
         target = kit / "in" / r
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(folder / r, target)
-    shutil.copyfile(installer, kit / "setup" / installer.name)
+    if embed_ok:
+        shutil.copyfile(embed, kit / "setup" / embed.name)
+    if installer_ok:                                       # also the fallback when the zip is used
+        shutil.copyfile(installer, kit / "setup" / installer.name)
     per_test = int(cfg.get("sandbox_test_seconds", 120))
-    (kit / "setup" / "run.cmd").write_text(_script(installer.name, tests, per_test), encoding="ascii")
+    (kit / "setup" / "run.cmd").write_text(_script(installer.name if installer_ok else "", tests, per_test,
+                                                   embed.name if embed_ok else ""), encoding="ascii")
     limit = time.monotonic() + 60 * float(cfg.get("sandbox_minutes", 15))
     sid, viewer = "", None
     try:

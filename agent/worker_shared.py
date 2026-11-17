@@ -39,6 +39,22 @@ def answer_shape(schema: dict | None):
         ANSWER_SCHEMA.reset(token)
 
 
+# The smallest model (billions of parameters, from its name: "gpt-oss-120b" = 120) that may take the calls made
+# inside `with strong_models(70):`. Switching skips smaller cloud models and this PC's model for them, and says so
+# (worker_cloud.NoStrongModel) instead of falling to one; a model whose name gives no size counts as strong
+# (Nov 16, task 56: a whole-file rewrite fell to NVIDIA's gpt-oss-20b, which kept the wrong test). 0 = any.
+MIN_MODEL_B: ContextVar = ContextVar("min_model_b", default=0)
+
+
+@contextmanager
+def strong_models(min_b: float):
+    token = MIN_MODEL_B.set(float(min_b or 0))
+    try:
+        yield
+    finally:
+        MIN_MODEL_B.reset(token)
+
+
 HERE = Path(__file__).parent
 STATE_DIR = HERE / "state"
 USER = personal.name() or "the user"  # personal.json's name, for the prompts

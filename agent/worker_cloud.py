@@ -396,13 +396,13 @@ KEY_PAGES = {
 # ---------------------------------------------------------------- the Providers window's commands
 def command(argv: list[str], config_path: Path) -> bool:
     """`providers`, `provider-set NAME [on|off] [model=M] [accept=yes|no] [order=N]`, `set-key NAME` (key on
-    stdin), `del-key NAME`, `test-provider NAME`, `set-limits TOKENS_PER_DAY USD_PER_DAY`.
+    stdin), `del-key NAME`, `test-provider NAME`, `set-limits TOKENS_PER_DAY USD_PER_DAY`, `reset-today NAME`.
     Shared by both workers (worker_engine.main). True if it was one of these."""
     import sys
     import worker_keys
     cmd = argv[1] if len(argv) > 1 else ""
     if cmd not in ("providers", "provider-set", "set-key", "del-key", "test-provider", "set-limits", "free-limits",
-                   "switch-sort", "add-second"):
+                   "switch-sort", "add-second", "reset-today"):
         return False
     cfg = worker_shared.load_json(config_path)
     cc = cfg.setdefault("cloud", {"enabled": [], "default": "", "models": {}, "accept_data_use": [],
@@ -515,6 +515,10 @@ def command(argv: list[str], config_path: Path) -> bool:
             if cc.get("default") == p.name:
                 cc["default"] = ""
             save()
+    elif cmd == "reset-today":                        # this provider's count for today back to 0
+        p = named()
+        print(f"{p.spoken}: today's count cleared" if reset_today(p.name)
+              else f"{p.spoken}: nothing counted today")
     elif cmd == "set-limits":
         try:
             cc["max_tokens_per_day"] = max(0, int(float(argv[2])))
@@ -676,6 +680,20 @@ def reset_task_tokens(key: str) -> None:
     u = _today(_usage())
     if (u.get("tasks") or {}).pop(key, None) is not None:
         USAGE_PATH.write_text(json.dumps(u, indent=2), encoding="utf-8")
+
+
+def reset_today(name: str) -> bool:
+    """One provider's count for today, and its "out until" mark, cleared (Nov 16, the user: "Can we reset The
+    Smithy's count?"; the user's own command, `reset-today NAME`). Its daily cap then counts from 0 again; if the
+    provider itself still says the day is used, it answers 429 and rests as it says. Other providers and the tasks'
+    totals are left as they are. True when there was something to clear."""
+    u = _today(_usage())
+    had = (u.get("providers") or {}).pop(name, None) is not None
+    had = (u.get("out") or {}).pop(name, None) is not None or had
+    if had:
+        USAGE_PATH.parent.mkdir(exist_ok=True)
+        USAGE_PATH.write_text(json.dumps(u, indent=2), encoding="utf-8")
+    return had
 
 
 def task_tokens(key: str | None = None) -> int:
@@ -887,6 +905,29 @@ class TooLongForLocal(ValueError):
     the same again)."""
 
 
+class NoStrongModel(RuntimeError):
+    """A step asked for strong models only (worker_shared.strong_models) and none in the switch order can take it
+    now; it isn't sent to a smaller one."""
+
+
+def model_size(model: str) -> float:
+    """Billions of parameters from a model's name ("gpt-oss-120b" -> 120, "qwen3-30b-a3b" -> 30); 0 = not said."""
+    m = re.search(r"(?<![a-z0-9.])(\d+(?:\.\d+)?)b(?![a-z])", str(model or "").lower())
+    return float(m.group(1)) if m else 0.0
+
+
+def _family(name: str) -> str:
+    """A provider and its second key share a family: "cerebras-2" -> "cerebras"."""
+    p = PROVIDERS.get(name)
+    return (p.base or p.name) if p else name
+
+
+def _too_small(model: str) -> bool:
+    least = float(worker_shared.MIN_MODEL_B.get() or 0)
+    size = model_size(model)
+    return bool(least and size and size < least)
+
+
 def prompt_tokens(messages: list[dict]) -> int:
     """About how many tokens the messages are (3.5 characters a token, as elsewhere here)."""
     return int(sum(len(str(m.get("content", ""))) for m in messages) / 3.5)
@@ -978,6 +1019,11 @@ class Chain:
             out = self._try_links(messages, threads, max_tokens, should_stop)
             if out is not None:
                 return out
+            if worker_shared.MIN_MODEL_B.get():         # strong models only: never this PC's or a smaller one
+                strong = [l[1] for l in self.links if not _too_small(l[3])]
+                raise NoStrongModel("no strong model is free for this step right now ("
+                                    + (", ".join(strong) + " can't take it" if strong else
+                                       "none in the switch order is big enough") + ")")
             too_long = self._too_long_here(messages) if self.local else ""
             if self.ask is None:
                 return self._local(None, messages, threads, max_tokens, should_stop)
@@ -1002,6 +1048,9 @@ class Chain:
         for name, spoken, backend, m in self.links:
             if _out_until(name) > time.time():
                 continue
+            if _too_small(m):                          # this step asked for strong models only
+                log.info("switching: %s (%s) is smaller than this step asks for; skipped", spoken, m)
+                continue
             if name in self.too_big and size >= self.too_big[name]:
                 continue                               # it said a step this big is too large
             room = pace_wait(self.cc, name, size)
@@ -1013,6 +1062,18 @@ class Chain:
                 steps.info("%s takes about %s tokens a minute, and this step is about %s; trying the next provider.",
                            spoken, f"{tpm:,}", f"{size:,}")
                 continue
+            if room > 0:
+                # the same provider's other key, later in the order, with room sooner: that one takes this step
+                # instead of waiting here (Nov 16, the user: "Go for 1"; task 57 waited about 60 s on almost every
+                # step for Cerebras's minute while the second key, the same model, sat free)
+                later = self.links[[l[0] for l in self.links].index(name) + 1:]
+                twin = next((l for l in later if _family(l[0]) == _family(name) and _out_until(l[0]) <= time.time()
+                             and not (l[0] in self.too_big and size >= self.too_big[l[0]]) and not _too_small(l[3])
+                             and 0 <= pace_wait(self.cc, l[0], size) < room), None)
+                if twin is not None:
+                    log.info("switching: %s's minute is full for %.0f s more; its other key, %s, has room sooner",
+                             spoken, room, twin[1])
+                    continue
             if room > float(self.cc.get("pace_max_wait", 90)):
                 log.info("switching: %s's minute is full for %.0f s more; this step goes to the next", spoken, room)
                 continue                               # too long to wait for this step; not marked out
@@ -1035,6 +1096,11 @@ class Chain:
                     self._did(f"{spoken} ({m})")
                     return out
                 except BudgetOut as e:                 # the user's own limit (dollars, one task): no provider can help
+                    if worker_shared.MIN_MODEL_B.get():
+                        # a strong-only step never goes to this PC's model (Nov 16, task 57: a whole-file rewrite
+                        # of the test file went to the 3B model when the task's limit ran out, and ran 80 minutes)
+                        log.warning("switching: %s; a strong-only step isn't sent to this PC's model", e)
+                        raise NoStrongModel(f"{e}, and this step needs a strong model") from None
                     log.warning("switching: %s; going to this PC's model", e)
                     steps.info("%s. Going to this PC's model.", str(e)[:1].upper() + str(e)[1:])
                     return self._local(e, messages, threads, max_tokens, should_stop)

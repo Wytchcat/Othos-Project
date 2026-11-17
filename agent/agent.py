@@ -45,6 +45,7 @@ import workers_voice  # (its INSTALLED list, for the self-check)
 import selfcheck  # the quiet self-check behind "How are you?"
 import searchctx  # searches keep the topic and the user's town: searchctx.py
 import library  # the user's own saved reference pages: library.py
+import humor  # hints about the jokes ("go easy on the puns"): caught by code, kept in state\humor.json
 import sources  # free sources tried before Tavily: sources.py
 import personal  # the user's name, town, feeds and respellings: personal.json
 
@@ -456,6 +457,17 @@ def _greeting_for(hour: int) -> str:
     if 17 <= hour < 22:
         return "Good evening"
     return "Hello"  # late at night
+
+
+_OPENING_ASKS = ("How's it going?", "How's your day going so far?", "What's new?", "How are things?")
+
+
+def _opening_line(hour: int, name: str | None, pick: int | None = None) -> str:
+    """The call's first words, by code: 'Good afternoon, the user. How's it going?'"""
+    import random
+    asks = _OPENING_ASKS if 5 <= hour < 22 else ("How's it going?", "What's new?", "How are things?")   # no "so far" late at night
+    ask = asks[pick % len(asks)] if pick is not None else random.choice(asks)
+    return f"{_greeting_for(hour)}{', ' + name if name else ''}. {ask}"
 
 
 def _fix_greeting(text: str, hour: int | None = None) -> str:
@@ -2339,11 +2351,16 @@ class Assistant(Agent):
             instructions += f"\n- Address the user as {personal.name()}."
         if HOME_LOCATION:  # from .env; stays on the laptop
             instructions += f"\nThe user lives in {_home_spoken()}."
+        # what the user said about the jokes (humor.py) is read at the start of every call
+        self._instr_base = instructions
+        self._humor = humor.load()
+        instructions += humor.prompt_line(self._humor)
         # The time goes last: it changes every minute, and anything after it can't
         # reuse Ollama's cache from the previous call. Without the time it greeted
         # with "Good morning" just after midnight.
         instructions += f"\n\nIt is {datetime.now():%A, %B %d, %Y, %I:%M %p}."
         super().__init__(instructions=instructions)
+        self._humor_seen: set[str] = set()   # user messages whose hints were already applied
         self._handoff = None  # the "open code chat" task (kept so it isn't garbage-collected)
         self._gaming: gaming.GamingMonitor | None = None  # set in entrypoint
         self._workers = WorkersVoice()  # session set in entrypoint
@@ -2442,6 +2459,28 @@ class Assistant(Agent):
                                   conn_options=self.session.conn_options.llm_conn_options, **kwargs) as stream:
             async for chunk in stream:
                 yield chunk
+
+    async def _humor_hints(self, msg_id: str, user_text: str, prev_assistant: str) -> str:
+        """Apply what the user said about the humor (once per message). Returns the short line to say back
+        when the whole turn was the hint, else ''. The setting changes either way."""
+        if msg_id in self._humor_seen:
+            return ""
+        self._humor_seen.add(msg_id)
+        kinds = humor.catch(user_text, prev_assistant)
+        if not kinds:
+            return ""
+        new, line = humor.apply(self._humor, kinds)
+        if new != self._humor:
+            self._humor = new
+            humor.save(new)
+            try:
+                await self.update_instructions(self._instr_base + humor.prompt_line(new)
+                                               + f"\n\nIt is {datetime.now():%A, %B %d, %Y, %I:%M %p}.")
+            except Exception as e:
+                log.info("humor: instructions not updated mid-call: %s", e)
+        humor.log_event(kinds, self._humor)
+        log.info("humor hint %s -> level %d, puns %s, keep %s", kinds, self._humor["level"], self._humor["puns"], self._humor["keep"])
+        return line if line and humor.whole_hint(user_text, kinds) else ""
 
     async def _self_check_reply(self, user_text: str) -> str:
         """The quiet self-check behind "How are you?": looks at this PC and the call, nothing spoken
@@ -2679,6 +2718,14 @@ class Assistant(Agent):
             # "Also," on its own: the user is still talking; say nothing and wait for the rest
             log.info("filler-only turn %r: no reply", self._user_text)
             return
+        if isinstance(last, llm.ChatMessage) and last.role == "user":
+            # "Go easy on the puns", "I like the humor, keep it": caught by code, kept for next time (humor.py)
+            prev = next((i.text_content or "" for i in reversed(chat_ctx.items[:-1])
+                         if isinstance(i, llm.ChatMessage) and i.role == "assistant"), "")
+            hint_reply = await self._humor_hints(last.id, self._user_text, prev)
+            if hint_reply and not self._allowed:
+                yield hint_reply
+                return
         if (isinstance(last, llm.ChatMessage) and last.role == "user" and not self._allowed
                 and selfcheck.asks_back(self._user_text)):
             # "I'm fine, how are you?": a quiet self-check, answered by code (no model)
@@ -3998,8 +4045,15 @@ async def entrypoint(ctx: JobContext):
 
     if os.getenv("GREET_ON_START", "true").lower() == "true":
         # not interruptible: the call is just starting, and echo protection only
-        # covers the first 3 s, so the greeting's own echo used to pause it
-        await session.generate_reply(instructions="Greet the user briefly.", allow_interruptions=False)
+        # covers the first 3 s, so the greeting's own echo used to pause it.
+        # Said by code (no model): the model took 10-15 s to write two short sentences.
+        # OTHOS_GREETING=model brings back the model-written greeting.
+        if os.getenv("OTHOS_GREETING", "").lower() == "model":
+            await session.generate_reply(instructions="Greet the user briefly.", allow_interruptions=False)
+        else:
+            line = _opening_line(datetime.now().hour, _user_name())
+            log.info("greeting by code: %r", line)
+            await session.say(line, allow_interruptions=False)
 
     # Firestarter and the Smithy: "Smithy task 3 is ready" between turns; results finished while the user was away
     assistant._workers.session = session

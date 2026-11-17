@@ -26,3 +26,7 @@ Check the code guards: `.venv/Scripts/python.exe training/score.py`
 
 ## Never train on these
 - **Stack Overflow / Stack Exchange dumps.** Their download terms allow Stack Overflow to deny access if the data is used to train an LLM. Othos searches them (retrieval) and cites them; it never uses them as training data.
+
+## Humor hints (Nov 16)
+- `hint_set.jsonl`: what a person says about the jokes, and the hint kinds humor.py must catch (or must not). tests/test_humor.py runs it.
+- With `OTHOS_HUMOR_LOG=1`, each caught hint is written to `state\humor-events.jsonl` as labels only (time, hint kinds, level, puns setting). Those labels, plus the hint set, are the start of preference examples for the voice model: a reply followed by "go easy on the puns" is a rejected example, the dry line without the pun the preferred one. Writing the reply text into examples would need its own opt-in.

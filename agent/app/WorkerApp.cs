@@ -952,7 +952,7 @@ class FirestarterForm : Form
 #if SMITHY
         ClientSize = new Size(420, 176 + 36 * FirestarterApp.Tiers.Length + 128 + 62 + 38 + 38 + 38);
 #else
-        ClientSize = new Size(420, 176 + 36 * FirestarterApp.Tiers.Length + 116 + 166 + 76);
+        ClientSize = new Size(420, 176 + 36 * FirestarterApp.Tiers.Length + 116 + 166 + 114);
 #endif
         BackColor = Bg; ForeColor = Ink;
         Font = new Font("Segoe UI", 10f);
@@ -1041,6 +1041,9 @@ class FirestarterForm : Form
         // No restart needed: the worker reads its settings and keys again at each task.
         var provButton = MakeButton("Providers…", 150, y2 + 196, 250);
         provButton.Click += (s, e) => { using (var d = new ProvidersForm()) d.ShowDialog(this); };
+        // a new site, built on this PC after a plan and a yes (site_builds.py; the user, Nov 16)
+        var buildButton = MakeButton("New site build…", 150, y2 + 234, 250);
+        buildButton.Click += (s, e) => { using (var d = new SiteBuildForm()) d.ShowDialog(this); };
 #endif
 
         timer.Interval = 2000;
@@ -2351,6 +2354,230 @@ class DocsForm : Form
 #endif
 
 #if !SMITHY
+// "New site build" window (the user, Nov 16): what the site is for (informational, blog, eCommerce), the kinds of site
+// with an explanation and a comparison for each use (site_builds.json, each outside claim with its source and date),
+// a few questions, then the plan for a yes. Only after Yes is anything queued (worker.py build-start --approved).
+// Kinds not built yet are shown, greyed, with the reason.
+class SiteBuildForm : Form
+{
+    static readonly Color Bg = Color.FromArgb(2, 7, 5), Ink = Color.FromArgb(200, 230, 210),
+        Dim = Color.FromArgb(120, 140, 130), Ember = FirestarterApp.Accent, Gold = Color.FromArgb(231, 195, 104),
+        Good = Color.FromArgb(120, 200, 140), PurpleFill = Color.FromArgb(14, 16, 25),
+        PurpleLine = Color.FromArgb(64, 53, 105), PurpleHover = Color.FromArgb(25, 24, 43);
+    static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
+
+    readonly Panel body = new Panel();
+    readonly Label status = new Label();
+    readonly Button planButton = new Button(), close = new Button();
+    readonly List<RadioButton> useButtons = new List<RadioButton>(), typeButtons = new List<RadioButton>();
+    readonly Dictionary<string, List<Label>> fitLabels = new Dictionary<string, List<Label>>();
+    Dictionary<string, object> info;
+    TextBox name, about, pages, look, notes;
+
+    public SiteBuildForm()
+    {
+        Text = FirestarterApp.Name + ": new site build";
+        FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false;
+        StartPosition = FormStartPosition.CenterParent; ShowInTaskbar = false;
+        try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
+        BackColor = Bg; ForeColor = Ink; Font = new Font("Segoe UI", 10f);
+        ClientSize = new Size(640, 640);
+        var stripe = new Panel(); stripe.BackColor = Ember; stripe.SetBounds(0, 0, 6, 640); Controls.Add(stripe);
+        body.SetBounds(6, 0, 634, 560); body.AutoScroll = true; body.BackColor = Bg; Controls.Add(body);
+        status.SetBounds(22, 562, 600, 30); status.ForeColor = Dim; Controls.Add(status);
+        Btn(planButton, "Show the plan…", 22, 596, 170, true); planButton.Enabled = false;
+        planButton.Click += (s, e) => ShowPlan();
+        Btn(close, "Close", 522, 596, 100, false); close.Click += (s, e) => Close();
+        CancelButton = close;                                    // Escape closes; nothing is made
+        AutoAnchor.Fit(this, true);
+        Label(body, "Loading…", 16, 16, 580, Dim);
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            Dictionary<string, object> d = null;
+            try { d = Json.Deserialize<Dictionary<string, object>>(FirestarterApp.Run("build-info")); } catch { }
+            try { BeginInvoke((Action)(() => Fill(d))); } catch { }
+        });
+    }
+
+    void Btn(Button b, string text, int x, int y, int w, bool main)
+    {
+        b.Text = text; b.SetBounds(x, y, w, 32); b.FlatStyle = FlatStyle.Flat;
+        b.FlatAppearance.BorderColor = main ? Ember : PurpleLine; b.FlatAppearance.MouseOverBackColor = PurpleHover;
+        b.BackColor = PurpleFill; b.ForeColor = Ink; Controls.Add(b);
+    }
+
+    static Label Label(Control parent, string text, int x, int y, int w, Color c, bool bold = false, float size = 10f)
+    {
+        var l = new Label(); l.Text = text; l.ForeColor = c; l.AutoSize = true; l.MaximumSize = new Size(w, 0);
+        l.Font = new Font("Segoe UI", size, bold ? FontStyle.Bold : FontStyle.Regular);
+        l.Location = new Point(x, y); parent.Controls.Add(l); return l;
+    }
+
+    static string S(Dictionary<string, object> d, string k)
+    { return d != null && d.ContainsKey(k) && d[k] != null ? Convert.ToString(d[k]) : ""; }
+
+    TextBox Field(string ask, string hint, ref int y, bool multi)
+    {
+        y = Label(body, ask, 16, y, 580, Ink, true).Bottom + 2;
+        if (hint != "") y = Label(body, hint, 16, y, 580, Dim).Bottom + 2;
+        var t = new TextBox(); t.Multiline = multi; t.BackColor = PurpleFill; t.ForeColor = Ink;
+        t.BorderStyle = BorderStyle.FixedSingle; t.SetBounds(16, y, 580, multi ? 54 : 26);
+        if (multi) t.ScrollBars = ScrollBars.Vertical;
+        body.Controls.Add(t); y = t.Bottom + 12; return t;
+    }
+
+    void Fill(Dictionary<string, object> d)
+    {
+        body.Controls.Clear();
+        info = d;
+        if (d == null) { Label(body, "Couldn't read the list (try  worker.py build-info  in PowerShell).", 16, 16, 580, Gold); return; }
+        int y = 14;
+        y = Label(body, "New site build", 16, y, 580, Ember, true, 13f).Bottom + 4;
+        y = Label(body, "Firestarter builds a site on this PC from your answers. You see the plan first, and nothing " +
+                        "is made before your yes. Nothing goes online.", 16, y, 580, Dim).Bottom + 12;
+
+        y = Label(body, "1. What is the site for?", 16, y, 580, Ink, true).Bottom + 4;
+        var uses = (System.Collections.ArrayList)d["uses"];
+        foreach (var o in uses)
+        {
+            var u = (Dictionary<string, object>)o;
+            var r = new RadioButton(); r.Text = S(u, "name"); r.Tag = u; r.ForeColor = Ink; r.AutoSize = true;
+            r.Location = new Point(16, y); r.CheckedChanged += (s, e) => { if (((RadioButton)s).Checked) UseChosen(); };
+            body.Controls.Add(r); useButtons.Add(r);
+            y = Label(body, S(u, "about"), 36, r.Bottom, 560, Dim).Bottom + 6;
+        }
+
+        y = Label(body, "2. Which kind of site?", 16, y + 8, 580, Ink, true).Bottom + 2;
+        y = Label(body, "How each kind fits each use. Lines about other makers name their page, checked " + S(d, "checked") + ".",
+                  16, y, 580, Dim).Bottom + 6;
+        foreach (var o in (System.Collections.ArrayList)d["types"])
+        {
+            var t = (Dictionary<string, object>)o;
+            bool can = S(t, "can") == "True";
+            if (can)
+            {
+                var r = new RadioButton(); r.Text = S(t, "name"); r.Tag = t; r.AutoSize = true; r.ForeColor = Ink;
+                r.Font = new Font("Segoe UI", 10f, FontStyle.Bold);
+                r.Location = new Point(16, y); r.CheckedChanged += (s, e) => Ready();
+                body.Controls.Add(r); typeButtons.Add(r);
+                y = r.Bottom;
+            }
+            else   // not pickable yet: plain dim text (a disabled radio button draws its text etched and hard to read)
+                y = Label(body, S(t, "name"), 34, y + 2, 560, Dim, true).Bottom;
+            if (!can) y = Label(body, S(t, "why"), 36, y, 560, Gold).Bottom;
+            y = Label(body, S(t, "about"), 36, y, 560, Dim).Bottom;
+            y = Label(body, "Needs: " + S(t, "needs"), 36, y, 560, Dim).Bottom + 2;
+            var fits = (Dictionary<string, object>)t["uses"];
+            var mine = new List<Label>();
+            foreach (var uo in uses)
+            {
+                var u = (Dictionary<string, object>)uo; var c = (Dictionary<string, object>)fits[S(u, "key")];
+                string fit = S(c, "fit");
+                string word = fit == "good" ? "✔ Good" : fit == "some" ? "◐ Partly" : "✖ No";
+                var l = Label(body, word + "  for " + S(u, "name") + ": " + S(c, "line"), 36, y, 560,
+                              fit == "good" ? Good : fit == "some" ? Ink : Gold);
+                l.Tag = S(u, "key"); mine.Add(l); y = l.Bottom;
+                string src = S(c, "source");
+                if (src.StartsWith("https://"))
+                {
+                    var link = new LinkLabel(); link.Text = "Source: " + new Uri(src).Host; link.AutoSize = true;
+                    link.LinkColor = Dim; link.ActiveLinkColor = Ember; link.Location = new Point(56, y);
+                    link.LinkClicked += (s, e) => { try { Process.Start(src); } catch { } };   // opens in her browser
+                    body.Controls.Add(link); y = link.Bottom;
+                }
+            }
+            fitLabels[S(t, "key")] = mine;
+            y += 10;
+        }
+
+        y = Label(body, "3. About the site", 16, y + 4, 580, Ink, true).Bottom + 6;
+        name = Field("Its name", "", ref y, false);
+        about = Field("What it's for", "A few words: what you do, who it's for. Only what you write here is used for facts.", ref y, true);
+        pages = Field("Pages", "Separated by commas. Suggested for the use you picked; change as you like (up to 8).", ref y, false);
+        look = Field("The look (optional)", "Colours and feel, e.g. warm and calm, dark green and cream.", ref y, false);
+        notes = Field("Anything else (optional)", "Opening hours, what to say on Contact, and so on. [CHECK] notes mark anything missing.", ref y, true);
+        foreach (var t in new[] { name, about, pages }) t.TextChanged += (s, e) => Ready();
+        var pad = new Label(); pad.SetBounds(16, y, 10, 8); body.Controls.Add(pad);
+        status.Text = "Pick what the site is for and a kind of site, then answer the questions.";
+    }
+
+    void UseChosen()
+    {
+        var u = Chosen(useButtons);
+        if (u == null) return;
+        string key = S(u, "key");
+        foreach (var kv in fitLabels)
+            foreach (var l in kv.Value) l.Font = new Font("Segoe UI", 10f, (string)l.Tag == key ? FontStyle.Bold : FontStyle.Regular);
+        var list = new List<string>();
+        foreach (var p in (System.Collections.ArrayList)u["pages"]) list.Add(Convert.ToString(p));
+        pages.Text = string.Join(", ", list.ToArray());
+        Ready();
+    }
+
+    static Dictionary<string, object> Chosen(List<RadioButton> group)
+    {
+        foreach (var r in group) if (r.Checked) return (Dictionary<string, object>)r.Tag;
+        return null;
+    }
+
+    void Ready()
+    {
+        planButton.Enabled = Chosen(useButtons) != null && Chosen(typeButtons) != null && name != null &&
+                             name.Text.Trim().Length >= 2 && about.Text.Trim().Split(' ').Length >= 3 && pages.Text.Trim() != "";
+    }
+
+    string Answers()
+    {
+        var list = new List<string>();
+        foreach (var p in pages.Text.Split(',')) if (p.Trim() != "") list.Add(p.Trim());
+        var a = new Dictionary<string, object> {
+            { "type", S(Chosen(typeButtons), "key") }, { "use", S(Chosen(useButtons), "key") },
+            { "name", name.Text.Trim() }, { "about", about.Text.Trim() }, { "pages", list },
+            { "look", look.Text.Trim() }, { "notes", notes.Text.Trim() } };
+        string file = Path.Combine(Path.GetTempPath(), "firestarter-site-build.json");
+        File.WriteAllText(file, Json.Serialize(a), new System.Text.UTF8Encoding(false));
+        return file;
+    }
+
+    void ShowPlan()
+    {
+        planButton.Enabled = false; status.ForeColor = Dim; status.Text = "Making the plan…";
+        string file = Answers();
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            Dictionary<string, object> r = null;
+            try { r = Json.Deserialize<Dictionary<string, object>>(FirestarterApp.Run("build-plan \"" + file + "\"")); } catch { }
+            try { BeginInvoke((Action)(() => Decide(r, file))); } catch { }
+        });
+    }
+
+    void Decide(Dictionary<string, object> r, string file)
+    {
+        Ready();
+        if (r == null || S(r, "error") != "")
+        {
+            try { File.Delete(file); } catch { }
+            status.ForeColor = Gold; status.Text = "No plan: " + (r == null ? "try  worker.py build-plan  in PowerShell" : S(r, "error"));
+            return;
+        }
+        var a = ThemedBox.Show(this, S(r, "plan") + "\n\nBuild it?", FirestarterApp.Name + ": the plan",
+                               MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
+        if (a != DialogResult.Yes) { try { File.Delete(file); } catch { } status.ForeColor = Dim; status.Text = "Not built. Change anything and show the plan again."; return; }
+        status.Text = "Starting…";
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            Dictionary<string, object> s2 = null;
+            try { s2 = Json.Deserialize<Dictionary<string, object>>(FirestarterApp.Run("build-start \"" + file + "\" --approved")); } catch { }
+            finally { try { File.Delete(file); } catch { } }
+            try { BeginInvoke((Action)(() => {
+                if (s2 != null && S(s2, "task") != "")
+                { status.ForeColor = Ember; status.Text = "Queued as Firestarter task " + S(s2, "task") + ". It writes the pages' words, then makes the site in drafts\\sites."; }
+                else { status.ForeColor = Gold; status.Text = "Not started: " + (s2 == null ? "try  worker.py build-start  in PowerShell" : S(s2, "error")); }
+            })); } catch { }
+        });
+    }
+}
+
 // "Check my PC" window: reads this PC's specs (Othos's system_specs.py, locally; nothing leaves
 // the PC), shows Firestarter's advice for worker.json (worker_specs.py: local CPU models only,
 // each with whether it fits), then asks "Apply these settings?". Apply backs up worker.json in

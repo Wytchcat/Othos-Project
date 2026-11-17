@@ -1,0 +1,24 @@
+{"say":"No. I like the humor. Please keep it.","prev":"I'll try to keep the humor to myself then.","hints":["keep"]}
+{"say":"Maybe go easy on the puns.","hints":["puns_fewer"]}
+{"say":"It's okay.","hints":["reassure"]}
+{"say":"That's what you're supposed to do.","hints":["reassure"]}
+{"say":"Please keep it.","prev":"I'll try to keep the jokes to myself then.","hints":["keep"]}
+{"say":"Please keep it.","prev":"Here is the file you asked for.","hints":[]}
+{"say":"Keep it short.","prev":"Here is a long answer about the weather.","hints":[]}
+{"say":"Too many puns, honestly.","hints":["puns_fewer"]}
+{"say":"No more puns.","hints":["puns_none"]}
+{"say":"Tone it down a bit.","hints":["less"]}
+{"say":"Please be more serious.","hints":["less"]}
+{"say":"You're too sarcastic today.","hints":["less"]}
+{"say":"I don't like the sarcasm.","hints":["less"]}
+{"say":"More jokes please.","hints":["more"]}
+{"say":"Be funnier.","hints":["more"]}
+{"say":"Keep the humor to yourself.","hints":[]}
+{"say":"I like the humor but go easy on the puns.","hints":["puns_fewer","keep"]}
+{"say":"Back to normal with the jokes.","hints":["reset"]}
+{"say":"That's not funny.","hints":["soft_less"]}
+{"say":"Ha, good one.","hints":["soft_more"]}
+{"say":"What's the weather like?","hints":[]}
+{"say":"How tall is Mount Everest?","hints":[]}
+{"say":"Teeth, you don't have.","hints":[]}
+{"say":"Tell me a joke.","hints":[]}
