@@ -298,6 +298,246 @@ DialogResult dr = f.ShowDialog(owner);
     }
 
     // ------------------------------------------------------------------------
+    // "Connect your Google account? (optional)" – one question after a good install.
+    // Text only: no network call, no browser, no sign-in. Records only
+    // {"answer", "dont_ask_again", "asked_on"} to agent\state\google-prompt.json.
+    // ------------------------------------------------------------------------
+    internal static class GooglePrompt
+    {
+        public const string Title = "Connect your Google account? (optional)";
+
+        public const string Intro =
+            "Othos can use your Google Calendar, Sheets, Docs, Gmail and Google Voice voicemails, so you can ask by voice: " +
+            "\"What's on my calendar today?\", \"Any new email?\", \"Read me the budget sheet\".";
+
+        public const string Summary =
+            "What to know first: your permission is broad, spoken text may go to the online voice, emails can contain " +
+            "tricks, Othos never opens links or attachments. Show me how for the full text.";
+
+        public static string FullText()
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.Append(Intro).Append("\n\n");
+            sb.Append("What you get\n");
+            sb.Append("- Hands-free answers from your own calendar, mail, documents and spreadsheets, read by Othos.\n");
+            sb.Append("- Nothing to retype: Othos reads it for you and says where the answer came from.\n");
+            sb.Append("- You choose which parts to connect. Everything starts read-only.\n\n");
+            sb.Append("What to know first (the risks, in plain words)\n");
+            sb.Append("- Your account's permission is broad. Google can't limit \"read email\" to just some messages, so Othos " +
+                      "limits itself in its own code (and skips a never-read list you set). If someone got into this PC, the " +
+                      "saved sign-in could read the same things until you cancel it.\n");
+            sb.Append("- Some of what Othos reads goes out when it speaks. With the online voice (Rime), anything Othos says " +
+                      "aloud, including email text, is sent to that voice service. Othos asks before reading an email's full " +
+                      "text, unless your voice and hearing both run on this computer.\n");
+            sb.Append("- Emails and documents can contain tricks. A message might try to give Othos orders. Othos treats " +
+                      "everything it reads as plain text, never as instructions, and can't send, delete or change anything " +
+                      "while connected read-only.\n");
+            sb.Append("- Othos never opens links or attachments. It doesn't click, download or open anything inside an email " +
+                      "or document. If one has a link or an attachment, Othos only tells you it's there (\"this email has a " +
+                      "link and one attachment; I haven't opened them\") and you decide whether to open it yourself. That " +
+                      "closes off the most common way email is used to attack people.\n");
+            sb.Append("- Google shows a warning screen. Because you make your own Google key for this, Google calls the app " +
+                      "\"unverified\". That's expected; you click through it once.\n");
+            sb.Append("- You can undo it any time: press Disconnect in Othos, or remove Othos at " +
+                      "myaccount.google.com/permissions. Both stop access at once.\n");
+            sb.Append("- Othos keeps the sign-in on this computer only, locked to your Windows account. Nothing is posted, " +
+                      "sent or deleted.");
+            return sb.ToString();
+        }
+
+        public static string RecordPath(string othosFolder)
+        {
+            return Path.Combine(Path.Combine(Path.Combine(othosFolder, "agent"), "state"), "google-prompt.json");
+        }
+
+        // Ask unless an earlier answer says not to: the page shows again only when
+        // dont_ask_again is false and the answer is not "connect".
+        public static bool ShouldAsk(string path)
+        {
+            try
+            {
+                if (!File.Exists(path)) return true;
+                string json = File.ReadAllText(path, Encoding.UTF8);
+                if (Regex.IsMatch(json, "\"dont_ask_again\"\\s*:\\s*true")) return false;
+                if (Regex.IsMatch(json, "\"answer\"\\s*:\\s*\"connect\"")) return false;
+                return true;
+            }
+            catch { return true; }
+        }
+
+        public static string RecordJson(string answer, bool dontAskAgain, DateTime when)
+        {
+            return "{\"answer\": \"" + answer + "\", \"dont_ask_again\": " + (dontAskAgain ? "true" : "false") +
+                   ", \"asked_on\": \"" + when.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture) + "\"}\n";
+        }
+
+        // Shows the page if it should, and records the answer. Never throws: a failure
+        // here never blocks finishing the installer.
+        public static void AskAndRecord(IWin32Window owner, string othosFolder)
+        {
+            try
+            {
+                string path = RecordPath(othosFolder);
+                if (!ShouldAsk(path)) return;
+                string answer;
+                bool dontAsk;
+                using (GooglePromptForm f = new GooglePromptForm())
+                {
+                    f.ShowDialog(owner);
+                    answer = f.Answer;
+                    dontAsk = f.DontAskAgain;
+                }
+                Directory.CreateDirectory(Path.GetDirectoryName(path));
+                File.WriteAllText(path, RecordJson(answer, dontAsk, DateTime.Now), new UTF8Encoding(false));
+            }
+            catch { }
+        }
+
+        internal static Button MakeButton(string text)
+        {
+            Button b = new Button();
+            b.Text = text;
+            b.BackColor = OthosColors.ButtonBack;
+            b.ForeColor = OthosColors.Text;
+            b.FlatStyle = FlatStyle.Flat;
+            b.FlatAppearance.BorderColor = OthosColors.ButtonBorder;
+            b.FlatAppearance.MouseOverBackColor = OthosColors.ButtonHover;
+            b.AutoSize = true;
+            b.MinimumSize = new Size(100, 30);
+            return b;
+        }
+
+        internal static RichTextBox MakeText(string text)
+        {
+            RichTextBox r = new RichTextBox();
+            r.ReadOnly = true;
+            r.Text = text;
+            r.BackColor = OthosColors.Panel;
+            r.ForeColor = OthosColors.Text;
+            r.BorderStyle = BorderStyle.None;
+            r.ScrollBars = RichTextBoxScrollBars.Vertical;
+            r.TabStop = false;
+            r.HandleCreated += delegate(object s, EventArgs ev) { try { OthosSetup.SetWindowTheme(r.Handle, "DarkMode_Explorer", null); } catch { } };
+            return r;
+        }
+
+        internal static void Theme(Form f, string title, Size size, Size min)
+        {
+            f.HandleCreated += delegate(object s, EventArgs ev) { try { int use = 1; OthosSetup.DwmSetWindowAttribute(f.Handle, 20, ref use, 4); } catch { } };
+            f.Text = title;
+            f.FormBorderStyle = FormBorderStyle.Sizable;
+            f.MinimumSize = min;
+            f.ClientSize = size;
+            f.StartPosition = FormStartPosition.CenterParent;
+            f.BackColor = OthosColors.Background;
+            f.ForeColor = OthosColors.Text;
+            f.Font = new Font("Segoe UI", 10, FontStyle.Regular);
+            f.MaximizeBox = true;
+            f.MinimizeBox = false;
+            f.ShowInTaskbar = false;
+        }
+    }
+
+    // The question itself. Not now is the default (Enter); Escape, X and Alt+F4 mean Not now.
+    internal class GooglePromptForm : Form
+    {
+        private CheckBox chkDontAsk;
+        private bool sawFullText = false;
+
+        public GooglePromptForm()
+        {
+            GooglePrompt.Theme(this, "Othos Setup", new Size(620, 400), new Size(460, 340));
+
+            Label head = new Label();
+            head.Text = GooglePrompt.Title;
+            head.AutoSize = true;
+            head.ForeColor = OthosColors.Heading;
+            head.Font = new Font("Segoe UI Semibold", 14, FontStyle.Regular);
+            head.Location = new Point(20, 16);
+            this.Controls.Add(head);
+
+            RichTextBox body = GooglePrompt.MakeText(GooglePrompt.Intro + "\n\n" + GooglePrompt.Summary);
+            body.Location = new Point(20, 60);
+            body.Size = new Size(this.ClientSize.Width - 40, this.ClientSize.Height - 60 - 130);
+            body.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+            this.Controls.Add(body);
+
+            Label hint = new Label();
+            hint.Text = "Coming soon: Othos's Connect Google window isn't built yet";
+            hint.AutoSize = true;
+            hint.ForeColor = OthosColors.Warning;
+            hint.Location = new Point(20, this.ClientSize.Height - 120);
+            hint.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
+            this.Controls.Add(hint);
+
+            chkDontAsk = new CheckBox();
+            chkDontAsk.Text = "Don't ask me again";
+            chkDontAsk.AutoSize = true;
+            chkDontAsk.ForeColor = OthosColors.Text;
+            chkDontAsk.BackColor = OthosColors.Background;
+            chkDontAsk.Location = new Point(20, this.ClientSize.Height - 90);
+            chkDontAsk.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
+            this.Controls.Add(chkDontAsk);
+
+            Button btnNotNow = GooglePrompt.MakeButton("Not now");
+            btnNotNow.DialogResult = DialogResult.Cancel;
+            btnNotNow.Location = new Point(20, this.ClientSize.Height - 50);
+            btnNotNow.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
+            this.Controls.Add(btnNotNow);
+
+            Button btnHow = GooglePrompt.MakeButton("Show me how");
+            btnHow.Location = new Point(140, this.ClientSize.Height - 50);
+            btnHow.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
+            btnHow.Click += delegate(object s, EventArgs ev)
+            {
+                sawFullText = true;
+                using (GoogleFullTextForm full = new GoogleFullTextForm()) { full.ShowDialog(this); }
+            };
+            this.Controls.Add(btnHow);
+
+            Button btnConnect = GooglePrompt.MakeButton("Connect");
+            btnConnect.Enabled = false;                 // the Connect Google window isn't built yet
+            btnConnect.Location = new Point(this.ClientSize.Width - 120, this.ClientSize.Height - 50);
+            btnConnect.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
+            this.Controls.Add(btnConnect);
+            new ToolTip().SetToolTip(hint, "Othos main will turn Connect on when that window is ready.");
+
+            this.AcceptButton = btnNotNow;              // Enter presses only the default button
+            this.CancelButton = btnNotNow;              // Escape means Not now
+            this.Shown += delegate(object s, EventArgs ev) { btnNotNow.Focus(); };
+        }
+
+        // Connect is disabled, so every way out (Not now, Escape, X, Alt+F4) is "not now";
+        // after reading the full text it is recorded as "show_how".
+        public string Answer { get { return sawFullText ? "show_how" : "not_now"; } }
+        public bool DontAskAgain { get { return chkDontAsk.Checked; } }
+    }
+
+    // "Show me how": the full text as its own page; Back (Enter, Escape, X) returns to the question.
+    internal class GoogleFullTextForm : Form
+    {
+        public GoogleFullTextForm()
+        {
+            GooglePrompt.Theme(this, GooglePrompt.Title, new Size(700, 560), new Size(460, 340));
+
+            RichTextBox body = GooglePrompt.MakeText(GooglePrompt.FullText());
+            body.Location = new Point(20, 20);
+            body.Size = new Size(this.ClientSize.Width - 40, this.ClientSize.Height - 20 - 70);
+            body.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+            this.Controls.Add(body);
+
+            Button back = GooglePrompt.MakeButton("Back");
+            back.DialogResult = DialogResult.OK;
+            back.Location = new Point(20, this.ClientSize.Height - 50);
+            back.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
+            this.Controls.Add(back);
+            this.AcceptButton = back;
+            this.CancelButton = back;
+            this.Shown += delegate(object s, EventArgs ev) { back.Focus(); };
+        }
+    }
+
+    // ------------------------------------------------------------------------
     // Main installer form (wizard style)
     // ------------------------------------------------------------------------
     public class OthosSetup : Form
@@ -1220,6 +1460,7 @@ private void LvSteps_DrawColumnHeader(object sender, DrawListViewColumnHeaderEve
             {
                 if (assistantName != "Othos") WriteAssistantName();
                 UpdateStepStatus(doneIdx, "OK", true);
+                GooglePrompt.AskAndRecord(this, targetFolder);   // optional; never blocks finishing
         ThemedBox.Show(this, "Setup is done. Fill in these three files in the agent folder: .env (your keys), personal.json (your name and town) and profile.md. They open in your editor if one was found. Then start Othos with start-othos.bat.", "Done", false);
                 return;
             }
