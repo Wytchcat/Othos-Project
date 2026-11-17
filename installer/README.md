@@ -24,7 +24,9 @@ This makes `installer\OthosSetup.exe`. **Move it into the Othos folder, next to 
 - If a step stops, the box says which step and shows the error line. Install what it names,
   then press **Try Again**.
 - After a good install it asks one optional question, "Connect your Google account?", with
-  the benefits and the risks. **Not now** is the default, and Connect is off until Othos's
-  Connect Google window is built. It makes no network call; it only saves your answer in
-  `agent\state\google-prompt.json` (answer, don't-ask-again, date).
+  the benefits and the risks. **Not now** is the default. **Connect** opens Othos's own
+  Connect Google window (`agent\google-connect.ps1`), which explains the rest; it's off, with a
+  "coming soon" note, if that window or the agent's `.venv` isn't there. The page itself makes
+  no network call; it saves your answer in `agent\state\google-prompt.json` (answer,
+  don't-ask-again, date).
 - The source is `OthosSetup.cs` (C# 5, one file).

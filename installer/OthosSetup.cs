@@ -299,7 +299,8 @@ DialogResult dr = f.ShowDialog(owner);
 
     // ------------------------------------------------------------------------
     // "Connect your Google account? (optional)" – one question after a good install.
-    // Text only: no network call, no browser, no sign-in. Records only
+    // The page itself makes no network call and opens no browser; Connect (only when agent\google-connect.ps1
+    // and agent\.venv are there) opens Othos's own Connect Google window, which explains the rest. Records only
     // {"answer", "dont_ask_again", "asked_on"} to agent\state\google-prompt.json.
     // ------------------------------------------------------------------------
     internal static class GooglePrompt
@@ -381,7 +382,8 @@ DialogResult dr = f.ShowDialog(owner);
                 if (!ShouldAsk(path)) return;
                 string answer;
                 bool dontAsk;
-                using (GooglePromptForm f = new GooglePromptForm())
+                string script = ConnectScript(othosFolder);
+                using (GooglePromptForm f = new GooglePromptForm(script))
                 {
                     f.ShowDialog(owner);
                     answer = f.Answer;
@@ -389,6 +391,41 @@ DialogResult dr = f.ShowDialog(owner);
                 }
                 Directory.CreateDirectory(Path.GetDirectoryName(path));
                 File.WriteAllText(path, RecordJson(answer, dontAsk, DateTime.Now), new UTF8Encoding(false));
+                if (answer == "connect" && script != null) StartConnect(script);
+            }
+            catch { }
+        }
+
+        // Othos's Connect Google window (agent\google-connect.ps1), when it and the agent's .venv are both there;
+        // null otherwise, and Connect stays off with the "coming soon" hint.
+        public static string ConnectScript(string othosFolder)
+        {
+            try
+            {
+                string agent = Path.Combine(othosFolder, "agent");
+                string script = Path.Combine(agent, "google-connect.ps1");
+                if (File.Exists(script) && Directory.Exists(Path.Combine(agent, ".venv"))) return script;
+            }
+            catch { }
+            return null;
+        }
+
+        public static string ConnectArguments(string script)
+        {
+            return "-NoProfile -ExecutionPolicy Bypass -File \"" + script + "\"";
+        }
+
+        // Opens the Connect Google window and doesn't wait for it: the installer finishes normally.
+        public static void StartConnect(string script)
+        {
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo("powershell.exe", ConnectArguments(script));
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                psi.WindowStyle = ProcessWindowStyle.Hidden;
+                psi.WorkingDirectory = Path.GetDirectoryName(script);
+                Process.Start(psi);
             }
             catch { }
         }
@@ -443,8 +480,12 @@ DialogResult dr = f.ShowDialog(owner);
     {
         private CheckBox chkDontAsk;
         private bool sawFullText = false;
+        private bool connectPressed = false;
 
-        public GooglePromptForm()
+        public GooglePromptForm() : this(null) { }
+
+        // connectScript: Othos's Connect Google window, or null when it isn't there (Connect stays off)
+        public GooglePromptForm(string connectScript)
         {
             GooglePrompt.Theme(this, "Othos Setup", new Size(620, 400), new Size(460, 340));
 
@@ -496,20 +537,25 @@ DialogResult dr = f.ShowDialog(owner);
             this.Controls.Add(btnHow);
 
             Button btnConnect = GooglePrompt.MakeButton("Connect");
-            btnConnect.Enabled = false;                 // the Connect Google window isn't built yet
+            btnConnect.Enabled = connectScript != null; // off when the Connect Google window isn't there
             btnConnect.Location = new Point(this.ClientSize.Width - 120, this.ClientSize.Height - 50);
             btnConnect.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
+            btnConnect.Click += delegate(object s, EventArgs ev)
+            {
+                connectPressed = true;
+                this.DialogResult = DialogResult.OK;    // closes the page; the window opens after it's recorded
+            };
             this.Controls.Add(btnConnect);
-            new ToolTip().SetToolTip(hint, "Othos main will turn Connect on when that window is ready.");
+            hint.Visible = connectScript == null;
 
             this.AcceptButton = btnNotNow;              // Enter presses only the default button
             this.CancelButton = btnNotNow;              // Escape means Not now
             this.Shown += delegate(object s, EventArgs ev) { btnNotNow.Focus(); };
         }
 
-        // Connect is disabled, so every way out (Not now, Escape, X, Alt+F4) is "not now";
-        // after reading the full text it is recorded as "show_how".
-        public string Answer { get { return sawFullText ? "show_how" : "not_now"; } }
+        // Connect is "connect"; every other way out (Not now, Escape, X, Alt+F4) is "not now",
+        // or "show_how" after reading the full text.
+        public string Answer { get { return connectPressed ? "connect" : sawFullText ? "show_how" : "not_now"; } }
         public bool DontAskAgain { get { return chkDontAsk.Checked; } }
     }
 
