@@ -38,6 +38,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path, PurePosixPath
@@ -66,7 +67,17 @@ SYSTEM = (f"You are the Smithy, a careful coding assistant for Othos on {USERS} 
           # planted the word "[REDACTED]"
           + " Key-like values are hidden from you before you see any text: [REDACTED] stands for a value that "
           "is really there in the file (often a made-up test key). Treat it as that value, not as the word "
-          "[REDACTED], and never report it as a bug.")
+          "[REDACTED], and never report it as a bug."
+          # the user's benchmarks for every line of code (Nov 17): the same ones Claude follows on Othos
+          + "\n\nHow every line of code you write is judged, in this order. 1. Safety first, pass or fail: no keys, "
+          "passwords or personal data in code; no network use unless the request asks for it; never delete or "
+          "write outside the project's own folder or a temporary folder. 2. Quality on the first pass: it does "
+          "exactly what the request says; it handles bad input and missing files without crashing; it fits this "
+          "PC (Windows 11, Windows PowerShell 5.1, C# 5 with .NET Framework 4); it's plain and small; windows and "
+          "pop-ups follow the app's own colours and can be resized. 3. Use what exists: the standard library and "
+          "the project's own code before anything new. 4. Speed never buys errors: no dead code, no unused imports "
+          "or variables, no leftover comments. Say plainly what's done and what isn't, and settle what you can "
+          "yourself instead of asking the person using it.")
 SYSTEM_TWO_PART = SYSTEM + "\n\n" + FORMAT
 
 JOOMLA = ("This is for a Joomla 5 site using the YOOtheme Pro template (and ZOO). Never change Joomla core "
@@ -403,8 +414,10 @@ def _failing_files(out: str, test: str, code: list[str], same: set[str]) -> list
     then the ones whose name matches a failing test (FAIL: test_complex_confusion_detected ... TestConfusion ->
     academy_confusion.py), the test file last if it's named. Files the plan keeps the same are left out (task 55:
     the fixes went to academy_glossary.py and academy_sources.py, the most imported, while the errors were in
-    academy_readme.py, academy_query.py and academy_confusion.py)."""
-    pick = [r for r in code if r not in same]
+    academy_readme.py, academy_query.py and academy_confusion.py). Never another test file: a test's failure is in
+    the code it tests or in itself (Nov 17, task 58: "FAIL: ... TestAcademyFeatures" named test_academy.py, so the
+    code fixes for test_request.py were sent there and all 6 refused)."""
+    pick = [r for r in code if r not in same and (r == test or not _is_test(r))]
     found: list[str] = []
     for m in re.finditer(r'File "([^"]+)"', out):
         name = re.split(r"[\\/]", m.group(1))[-1].lower()
@@ -931,17 +944,43 @@ def _edit_messages(p: dict, desc: str, plan: dict, rel: str, written: dict[str, 
     return msgs
 
 
+def _sort_out_elsewhere(edits: list[tuple[str, str]], old: str, others: dict[str, str], movable: set[str],
+                        elsewhere: dict[str, list[tuple[str, str]]]) -> list[tuple[str, str]]:
+    """The edits for this file; each one whose FIND isn't in it but is in exactly one other file the build may
+    change goes to `elsewhere[that file]` instead of being thrown away (Nov 17, task 58: 6 good code edits were
+    sent for test_academy.py and all refused)."""
+    mine = []
+    body = old.replace("\r\n", "\n")
+    for find, repl in edits:
+        here = _find_once(body, find) if find.strip() else ""
+        if isinstance(here, str) and here.endswith("isn't in the file"):
+            homes = [r for r in sorted(movable) if r in others
+                     and not isinstance(_find_once(others[r].replace("\r\n", "\n"), find), str)]
+            if len(homes) == 1:
+                elsewhere.setdefault(homes[0], []).append((find, repl))
+                continue
+        mine.append((find, repl))
+    return mine
+
+
 def _edit_file(ctx, job_id: int, msgs: list[dict], rel: str, old: str,
-               none_ok: bool = True, others: dict[str, str] | None = None) -> tuple[str, str]:
+               none_ok: bool = True, others: dict[str, str] | None = None,
+               movable: set[str] | None = None,
+               elsewhere: dict[str, list[tuple[str, str]]] | None = None) -> tuple[str, str]:
     """A long file changed by find/replace pairs. Returns (new body, a note for the result).
     No edits at all: the file is kept as it was (the plan can call a file "changed" that the change
     doesn't touch; Nov 13, task 18 failed on that), or with none_ok=False, ValueError.
-    `others`: the build's other files, so an edit whose FIND is from one of them is named as such."""
+    `others`: the build's other files, so an edit whose FIND is from one of them is named as such.
+    `movable` + `elsewhere`: an edit clearly for one of the `movable` files is put in `elsewhere` for the caller."""
     others = {k: v for k, v in (others or {}).items() if k != rel}
     steps.info("Editing %s: asking for the changes as edits.", rel)
     with worker_shared.answer_shape(EDITS_SCHEMA):
         reply = ctx.chat(msgs, 6000)
     edits = parse_edits(reply)
+    if edits and movable and elsewhere is not None:
+        edits = _sort_out_elsewhere(edits, old, others, movable - {rel}, elsewhere)
+        if not edits:
+            return old, f"`{rel}`: its edits were all for other files, so they went there"
     if not edits:
         if none_ok:
             log.info("build %d: %s, no edits sent; kept as it was", job_id, rel)
@@ -965,6 +1004,8 @@ def _edit_file(ctx, job_id: int, msgs: list[dict], rel: str, old: str,
                                       + f"Send only the missed edits for {rel} again, with the FIND lines copied "
                                       "exactly from it. " + EDIT_FORMAT}], 6000)
         more = parse_edits(again)
+        if more and movable and elsewhere is not None:
+            more = _sort_out_elsewhere(more, body, others, movable - {rel}, elsewhere)
         if more:                                       # no edits in the reply: the missed ones stay missed
             body, done2, problems = apply_edits(body, more, brace, others)
             done += done2
@@ -1074,7 +1115,8 @@ def _ps_errors(folder: Path, rels: list[str]) -> list[str] | None:
     return errors
 
 
-def build_problems(folder: Path, rels: list[str], stdlib_only: bool = False) -> tuple[list[str], list[str]]:
+def build_problems(folder: Path, rels: list[str], stdlib_only: bool = False,
+                   net_ok: bool = True) -> tuple[list[str], list[str]]:
     """(problems, what was checked). C# compiled together, PowerShell / Python / JSON parsed, Python
     imports between the files checked. Nothing runs."""
     problems, checked = [], []
@@ -1136,6 +1178,12 @@ def build_problems(folder: Path, rels: list[str], stdlib_only: bool = False) -> 
             problems += test_main_problems(r, (folder / r).read_text(encoding="utf-8-sig", errors="replace"))
         if tests:
             checked.append("unittest.main() placed so the tests run")
+        for r in py:
+            text = (folder / r).read_text(encoding="utf-8-sig", errors="replace")
+            problems += stdlib_patch_problems(r, text) + delete_problems(r, text) \
+                + ([] if net_ok else network_problems(r, text))
+        checked.append("no change to Python's own modules, no deleting outside the build"
+                       + ("" if net_ok else ", no network use (the request doesn't ask for it)"))
     more, said = smithy_checkers.check_all(folder, rels)      # ruff, pyright, PSScriptAnalyzer, tsc, javac
     return problems + more, checked + said
 
@@ -1179,7 +1227,128 @@ def test_main_problems(rel: str, text: str) -> list[str]:
     return out
 
 
-_RUNS_ANYWAY = re.compile(r"^\S.* line \d+: F811 ")      # redefined: Python runs it, the later one wins
+# what a program may set on Python's own modules: where its output goes, its arguments, its import path
+_STDLIB_SETTABLE = {("sys", "stdout"), ("sys", "stderr"), ("sys", "stdin"), ("sys", "argv"), ("sys", "path")}
+
+
+def stdlib_patch_problems(rel: str, text: str) -> list[str]:
+    """An assignment to an attribute of something from Python's standard library (`Path.__str__ = ...`,
+    `os.sep = ...`, `setattr(Path, ...)`) changes it for the whole program (Nov 17, task 58: to fit a test,
+    `Path.__str__` was rewired to call itself, and 26 tests crashed). Only where output goes, the arguments and the
+    import path may be set (sys.stdout, sys.stderr, sys.stdin, sys.argv, sys.path)."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
+    std = set(getattr(sys, "stdlib_module_names", ()))
+    names: dict[str, str] = {}                         # local name -> the standard-library module it came from
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                top = a.name.split(".")[0]
+                if top in std:
+                    names[a.asname or top] = top
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            top = node.module.split(".")[0]
+            if top in std:
+                for a in node.names:
+                    names[a.asname or a.name] = top
+
+    def base(n: ast.AST) -> str | None:
+        while isinstance(n, ast.Attribute):
+            n = n.value
+        return n.id if isinstance(n, ast.Name) else None
+
+    out = []
+    for node in ast.walk(tree):
+        targets: list[ast.AST] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+            targets = [node.target]
+        elif isinstance(node, ast.Delete):
+            targets = list(node.targets)
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ("setattr", "delattr") \
+                and node.args:
+            targets = [ast.Attribute(value=node.args[0], attr="?", lineno=node.lineno)]
+        for tg in targets:
+            if not isinstance(tg, ast.Attribute):
+                continue
+            b = base(tg)
+            if b is None or b not in names:
+                continue
+            if isinstance(tg.value, ast.Name) and (names[b], tg.attr) in _STDLIB_SETTABLE:
+                continue
+            what = ast.unparse(tg) if tg.attr != "?" else f"{b} (setattr)"
+            out.append(f"{rel} line {node.lineno}: it changes {what}, part of Python's own {names[b]}, for the whole "
+                       "program. Never change Python's own modules or classes; write the code that needs a "
+                       "different result so it makes that result itself (for a path with / in it: p.as_posix())")
+    return out
+
+
+# redefined (the later one wins), an unused import or variable: Python runs it all the same
+_RUNS_ANYWAY = re.compile(r"^\S.* line \d+: F(811|401|841) ")
+_DEAD_CODE = re.compile(r"^\S.* line \d+: F(401|841) ")       # unused import or variable
+
+# -- the safety gate (the user's benchmarks, Nov 17): no network unless asked, no deleting outside the build
+_NET_MODULES = {"urllib", "http", "socket", "requests", "httpx", "aiohttp", "ftplib", "smtplib", "poplib", "imaplib",
+                "telnetlib", "xmlrpc", "websocket", "websockets", "ssl"}
+_NET_ASKED = re.compile(r"(?i)\b(internet|online|download|upload|http|https|url|web\s?site|website|web page|api|"
+                        r"server|network|fetch|e-?mail|smtp|socket)\b")
+
+
+def net_ok_for(request: str) -> bool:
+    """The request asks for network use (a download, a website, an API, email...)."""
+    return bool(_NET_ASKED.search(request or ""))
+
+
+def network_problems(rel: str, text: str) -> list[str]:
+    """An import of a network module when the request never asks for network use."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
+    out = []
+    for node in ast.walk(tree):
+        mods = [a.name for a in node.names] if isinstance(node, ast.Import) else \
+            [node.module] if isinstance(node, ast.ImportFrom) and node.module and not node.level else []
+        for mod in mods:
+            if mod.split(".")[0] in _NET_MODULES:
+                out.append(f"{rel} line {node.lineno}: it imports {mod}, for network use, which the request never "
+                           "asks for. Take it out: the program works on this PC without the network")
+    return out
+
+
+_DELETERS = {("shutil", "rmtree"), ("os", "remove"), ("os", "unlink"), ("os", "rmdir"), ("os", "removedirs")}
+_OUTSIDE = re.compile(r"(?i)^([a-z]:[\\/]|[\\/]|~)")
+
+
+def delete_problems(rel: str, text: str) -> list[str]:
+    """A delete aimed outside the build: a fixed absolute path, the home folder, or a path from the environment.
+    Deleting inside a temporary folder or the build's own folder (relative paths) is fine."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        f = node.func
+        is_del = (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and (f.value.id, f.attr) in _DELETERS) \
+            or (isinstance(f, ast.Attribute) and f.attr in ("unlink", "rmdir", "rmtree"))
+        if not is_del:
+            continue
+        target = node.args[0] if node.args else f.value if isinstance(f, ast.Attribute) else None
+        if target is None:
+            continue
+        seen = ast.unparse(target)
+        lits = [n.value for n in ast.walk(target) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+        if any(_OUTSIDE.match(s) for s in lits) or re.search(r"\b(home|expanduser|environ|getenv|USERPROFILE|"
+                                                               r"APPDATA|LOCALAPPDATA)\b", seen):
+            out.append(f"{rel} line {node.lineno}: it deletes {seen[:80]}, outside the build's own folder. Only "
+                       "delete inside the build's folder or a temporary folder")
+    return out
 
 
 def blocks_tests(problems: list[str]) -> list[str]:
@@ -1291,6 +1460,75 @@ def _imported_by(folder: Path, test: str, rels: list[str]) -> list[str]:
                 if (n == mod or n.endswith("." + mod) or mod.endswith("." + n)) and rel not in found:
                     found.append(rel)
     return sorted(found, key=lambda r: -src.count(PurePosixPath(r.replace("\\", "/")).stem))
+
+
+def _called_files(folder: Path, test: str, failing: list[str], rels: list[str]) -> list[str]:
+    """The build's own files whose functions the failing tests call, in the order they're first called (read with
+    ast; nothing is run). `from academy_mine import clear` + `clear(p)` in a failing test -> academy_mine.py.
+    Nov 17, task 58: the traceback named only test_request.py, the fix went to the first 4 files it imports, and
+    academy_mine.py (5th), where both bugs were, was never sent a fix in 10 runs."""
+    try:
+        tree = ast.parse((folder / test).read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError, ValueError):
+        return []
+    mods = {PurePosixPath(r.replace("\\", "/")).with_suffix("").as_posix().replace("/", "."): r
+            for r in rels if r.lower().endswith(".py") and r != test and not _is_test(r)}
+
+    def rel_of(module: str) -> str:
+        return next((r for m, r in mods.items() if module == m or module.endswith("." + m)), "")
+
+    names: dict[str, str] = {}                     # a name in the test -> the build file it comes from
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module and rel_of(node.module):
+            for a in node.names:
+                names[a.asname or a.name] = rel_of(node.module)
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                if rel_of(a.name):
+                    names[a.asname or a.name.split(".")[0]] = rel_of(a.name)
+    found: list[str] = []
+    for fn in [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+               and n.name in failing]:
+        calls = sorted((c for c in ast.walk(fn) if isinstance(c, ast.Call)), key=lambda c: (c.lineno, c.col_offset))
+        for c in calls:
+            f = c.func
+            base = f.id if isinstance(f, ast.Name) else \
+                f.value.id if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) else ""
+            rel = names.get(base, "")
+            if rel and rel not in found:
+                found.append(rel)
+    return found
+
+
+def _none_ran(out: str) -> bool:
+    return bool(re.search(r"\bRan 0 tests?\b|NO TESTS RAN", out))
+
+
+def fix_files(folder: Path, test: str, out: str, code: list[str], same: set[str]) -> list[str]:
+    """The files a failed test run's fix goes to, the test file first if it's one of them: the files the traceback
+    names, then the ones whose functions the failing tests call, else the files the test imports. No test ran at
+    all: the test file only (Nov 16, task 57: unittest.main() inside the test class; the fix went to
+    academy_confusion.py and began rewriting it whole). `smithy.py replay` uses this too."""
+    if _none_ran(out):
+        return [test]
+    traced = _failing_files(out, test, code, same)
+    called = [r for r in _called_files(folder, test, re.findall(r"(?m)^(?:FAIL|ERROR): (\w+)", out), code)
+              if r not in same and r not in traced]
+    named = ([r for r in traced if r != test] + called + [r for r in traced if r == test]) or \
+        [r for r in _imported_by(folder, test, code) if r not in same] or [test]
+    return ([test] if test in named else []) + [r for r in named if r != test]
+
+
+def fix_files_judged(folder: Path, test: str, named: list[str], code: list[str], same: set[str],
+                     wrong_here: bool) -> list[str]:
+    """`fix_files` after the judging: a test judged wrong puts the test file first; the tests written from the
+    request otherwise send the fix to code files only (never a test file)."""
+    if wrong_here:
+        return [test] + [r for r in named if r != test]
+    if test == REQUEST_TESTS:
+        return [r for r in named if not _is_test(r)] or \
+            [r for r in _imported_by(folder, test, code) if r not in same and not _is_test(r)][:4]
+    return named
 
 
 def py_import_problems(folder: Path, rels: list[str], stdlib_only: bool = False) -> list[str] | None:
@@ -1704,6 +1942,179 @@ def _no_change_no_done(ticks: dict[int, tuple[str, str]], written: dict[str, str
     return ticks
 
 
+# -- a person's word on a locked test (Nov 17, the user: "Yes, build both"): `smithy.py decide ID TEST test|code`
+def decided_path(job_id: int) -> Path:
+    return SMITHY.results_dir / f"{job_id:05d}-decided.json"
+
+
+def decisions(job_id: int) -> dict[str, dict]:
+    """{test name: {"side": "test"|"code", "by": "smithy"|"person", "why": ..., "times": n, "at": history index}}.
+    An older file's plain "test"/"code" values read as a person's word."""
+    try:
+        got = json.loads(decided_path(job_id).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    out = {}
+    for k, v in (got.items() if isinstance(got, dict) else []):
+        d = {"side": v, "by": "person"} if isinstance(v, str) else v if isinstance(v, dict) else {}
+        if d.get("side") in ("test", "code"):
+            out[str(k)] = d
+    return out
+
+
+def decided(job_id: int) -> dict[str, str]:
+    """{test name: "test" (the test is wrong: correct it) | "code" (the test is right: fix the code)}."""
+    return {k: d["side"] for k, d in decisions(job_id).items()}
+
+
+def record_decision(job_id: int, test: str, side: str, by: str, why: str = "", at: int = 0,
+                    before: dict | None = None) -> dict:
+    """Kept in results\\NNNNN-decided.json (not written for job 0, a test run); returns the new entry."""
+    now = decisions(job_id) if job_id else {}
+    prev = (before or {}).get(test) or now.get(test, {})
+    entry = {"side": side, "by": by, "why": why[:400], "times": int(prev.get("times", 0)) + 1 if by == "smithy" else 0,
+             "at": at}
+    if job_id:
+        now[test] = entry
+        decided_path(job_id).write_text(json.dumps(now, indent=1), encoding="utf-8")
+    return entry
+
+
+def decide(job_id: int, test: str, side: str) -> str:
+    """An override, never asked of anyone: The Smithy judges a locked test itself (Nov 17, the user: "it's always
+    going to be the smithy's problem to solve, not the user's")."""
+    if side not in ("test", "code"):
+        raise ValueError('say "test" (the test is wrong) or "code" (the code is wrong)')
+    if not re.fullmatch(r"test\w*", test or ""):
+        raise ValueError(f"{test!r} isn't a test name (they start with test)")
+    if SMITHY.get(job_id) is None:
+        raise ValueError(f"there's no Smithy task {job_id}")
+    record_decision(job_id, test, side, "person")
+    return (f"Task {job_id}: {test} is wrong, so the next run corrects the test to match the request (the code isn't "
+            "changed to fit it)." if side == "test" else
+            f"Task {job_id}: {test} is right, so the next run fixes the code for it (the test stays as it is).") \
+        + f" Carry on with: smithy.py continue {job_id}"
+
+
+_VERDICT = re.compile(r"(?im)^\W*(TEST|CODE)\b[^\n]*(?:\n+[*_ ]*because[*_ ]*:?[*_ ]*\s*(.+))?")
+
+
+def _judge_messages(request: str, test: str, test_src: str, failure: str, code: dict[str, str]) -> list[dict]:
+    shown = "\n\n".join(f"--- {r} ---\n{t[:6000]}" for r, t in code.items())
+    return [{"role": "system", "content": SYSTEM},
+            {"role": "user", "content":
+             "The request (it decides who's right):\n\n" + redact(request) + "\n\nThis test has failed in several "
+             f"test runs in a row:\n```python\n{test_src}\n```\n\nHow it fails (on Windows 11):\n```\n{failure[-2500:]}"
+             f"\n```\n\nThe code it tests:\n\n{shown}"},
+            {"role": "user", "content":
+             "Which one is wrong, judged only against the request's own words? Answer TEST when the test expects "
+             "something the request doesn't ask for, or can't be true here (for example a path written with / where "
+             "Windows gives \\, a value the request never names, a setup that doesn't match the request's example). "
+             "Answer CODE when the code doesn't do what the request asks. Reply with exactly two lines:\n"
+             "TEST or CODE\nBecause: one plain sentence that quotes the request's words it rests on"}]
+
+
+def judge_test(ctx, request: str, test: str, test_src: str, failure: str, code: dict[str, str],
+               min_b: float = 70) -> tuple[str, str] | None:
+    """("test" | "code", why) for a test that keeps failing, by a strong model against the request; None when no
+    strong model is free or the answer can't be read. The Smithy judges it itself: a person using Othos can't be
+    expected to (Nov 17, the user; task 58's test_query_writes_inside_queries wanted / in a Windows path)."""
+    try:
+        with worker_shared.strong_models(min_b):
+            # room to think first: gpt-oss models reason before answering, and 400 tokens gave empty replies from
+            # every provider (Nov 17, task 58's judgments of test_request.py's tests)
+            text = ctx.chat(_judge_messages(request, test, test_src, failure, code), 2000)
+    except (BudgetOut, TooLongForLocal):
+        raise
+    except (worker_cloud.NoStrongModel, RuntimeError, ValueError):
+        return None
+    m = _VERDICT.search(text or "")
+    if not m:
+        return None
+    return m.group(1).lower(), " ".join((m.group(2) or "").split())[:400]
+
+
+# -- tests written from the request itself, which the fix rounds don't change (Nov 17, task 58: every test passed
+# while 7 of the request's rules had no test, so "syntax error" and "Python" were "not in my glossary" and nobody knew)
+REQUEST_TESTS = "test_request.py"
+
+
+def _request_checks(items: dict[int, str]) -> list[str]:
+    """Each lettered check and each rule no check covers, as "2a: ..." lines."""
+    out = []
+    for n, t in items.items():
+        subs = sub_points(t)
+        out += [f"{n}{k}: {v}" for k, v in subs.items()]
+        rules = dict(zip([c for c in "zyxwvutsrq" if c not in subs], smithy_diagnose.rules_of(t)))
+        out += [f"{n}{k}: {v}" for k, v in rules.items()]
+    return out
+
+
+def _request_tests_messages(items: dict[int, str], written: dict[str, str], checks: list[str]) -> list[dict]:
+    code = "\n\n".join(f"--- {r} (outline) ---\n{outline(r, written[r])}" for r in sorted(written)
+                       if r.lower().endswith(".py") and not smithy_sandbox.is_test(r))
+    return [{"role": "system", "content": SYSTEM},
+            {"role": "user", "content":
+             "The request:\n\n" + redact("\n\n".join(items.values())) + "\n\nThe program's Python files (outlines: "
+             "imports, functions, classes):\n\n" + code},
+            {"role": "user", "content":
+             f"Write {REQUEST_TESTS}: a Python 3.12 unittest file with ONE test for each of these checks and rules "
+             "from the request, and no other tests:\n\n" + "\n".join(f"- {c}" for c in checks) + "\n\n"
+             "Each test is a method named test_<key>_<a few words> (for example test_2a_yes_no_go_ahead) of one "
+             "unittest.TestCase class, and its first line is a comment that quotes the check word for word. "
+             "Use the request's own example inputs and expected answers wherever it gives them. Test what the "
+             "program does (call its functions, read what they write), never how it's written. Only the standard "
+             "library and the program's own modules; files only in a tempfile.TemporaryDirectory(); compare paths "
+             "as pathlib.Path objects or with os.path, never as text with / or \\ in it; no network. End with one "
+             "top-level `if __name__ == \"__main__\":` and unittest.main(). Reply with the file only."}]
+
+
+# -- the user's benchmarks, measured (Nov 17): one line in each result, and one row per run in a running log, so
+# whether The Smithy gets better over time can be seen
+BENCHMARKS_LOG = "smithy-benchmarks.jsonl"
+_SAFETY = ("for network use", "outside the build's own folder", "part of Python's own")
+
+
+def _test_counts(output: str) -> tuple[int, int] | None:
+    """(tests run, tests failed or in error) from unittest's last lines; None when it didn't say."""
+    ran = re.findall(r"\bRan (\d+) tests?\b", output or "")
+    if not ran:
+        return None
+    bad = sum(int(n) for n in re.findall(r"\b(?:failures|errors)=(\d+)", output.split(f"Ran {ran[-1]}")[-1]))
+    return int(ran[-1]), bad
+
+
+def _benchmarks(job_id: int, hist: Path | None, problems: list[str], sandbox: dict, left: list[str],
+                seconds: float) -> str:
+    events = smithy_diagnose.read(hist)
+    checks = [e for e in events if e.get("kind") == "check"]
+    first_clean = bool(checks) and not checks[0].get("missing") and not checks[0].get("problems")
+    runs = [e for e in events if e.get("kind") == "sandbox"]
+    first_tests = runs[0].get("status") if runs else ""
+    this_run = len([e for e in events[max((i for i, e in enumerate(events) if e.get("kind") == "run"), default=0):]
+                    if e.get("kind") == "check"])
+    unsafe = [x for x in problems if any(s in x for s in _SAFETY)]
+    req = _test_counts(sandbox.get("full", {}).get(REQUEST_TESTS) or sandbox.get("output", {}).get(REQUEST_TESTS, ""))
+    tokens = worker_cloud.task_tokens()
+    row = {"ts": round(time.time()), "task": job_id, "clean": not left, "safety": "passed" if not unsafe else "failed",
+           "first_check_clean": first_clean, "first_tests": first_tests, "checks_this_run": this_run,
+           "request_tests": list(req) if req else None, "task_tokens": tokens, "check_seconds": round(seconds)}
+    if job_id:
+        try:
+            with (SMITHY.results_dir / BENCHMARKS_LOG).open("a", encoding="utf-8") as f:
+                f.write(json.dumps(row) + "\n")
+        except OSError:
+            pass
+    return ("**Benchmarks:** safety " + ("passed" if not unsafe else f"FAILED ({len(unsafe)} problem"
+                                         f"{'s' if len(unsafe) != 1 else ''})")
+            + "; first check " + ("clean" if first_clean else "not clean")
+            + (f"; first test run {first_tests}" if first_tests else "")
+            + f"; {this_run} check{'s' if this_run != 1 else ''} this run"
+            + (f"; request tests {req[0] - req[1]} of {req[0]} passed" if req else "")
+            + f"; {tokens:,} cloud tokens for the task so far; {round(seconds / 60, 1)} minutes of checks"
+            + ("; checks clean." if not left else "; NOT clean yet."))
+
+
 def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path, written: dict[str, str],
                   cap: int, only: dict[int, str] | None = None,
                   rounds: int | None = None) -> tuple[list[str], str, list[str]]:
@@ -1712,6 +2123,7 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
     edits for whatever failed; up to `build_check_rounds` rounds (default 3).
     Returns (notes for the result, the truth for the README, what's still wrong: empty = checks clean)."""
     notes = []
+    started = time.monotonic()
     code = [r for r in written if not r.lower().endswith(".md")]
     rounds = max(1, int(rounds or ctx.cfg.get("build_check_rounds", 3)))
     # `only`: one stage's changes (a staged build checks each stage before the next)
@@ -1722,7 +2134,8 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
     items = {n: t for n, t in items.items() if not _README_ITEM.match(t)}
     use_list = len(items) >= (1 if only is not None else 2)
     stdlib_only = bool(_STDLIB_ONLY.search(p.get("request", "")))
-    wants_tests = only is None and bool(_WANTS_TESTS.search(p.get("request", "")))
+    net_ok = net_ok_for(p.get("request", "") + "\n" + p.get("change", ""))    # the safety gate: network only if asked
+    wants_tests = only is None and bool(_WANTS_TESTS.search(p.get("request", "") + "\n" + p.get("change", "")))
 
     def _adds_problems(rel: str, old: str, new: str) -> str:
         """The build problems an edit adds to this file ('' when none: the same number or fewer), from the build
@@ -1735,13 +2148,17 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
         # checked with the whole build, so the build's own modules are known (Nov 16, task 56: alone, a new
         # `import academy_explain` in the test read as "not in Python's standard library", and a good fix was dropped)
         try:
-            before = build_problems(folder, code, stdlib_only)[0]
+            before = build_problems(folder, code, stdlib_only, net_ok)[0]
             path.write_text(new, encoding="utf-8")
-            after = build_problems(folder, code, stdlib_only)[0]
+            after = build_problems(folder, code, stdlib_only, net_ok)[0]
         except Exception:
             return ""
         finally:
             path.write_text(old, encoding="utf-8")
+        # an unused import or variable alone never refuses an edit (one edit may add an import that the next uses);
+        # the fix rounds still clean it up, as a build problem (Nov 17)
+        before = [x for x in before if not _DEAD_CODE.match(x)]
+        after = [x for x in after if not _DEAD_CODE.match(x)]
         if len(after) <= len(before):
             return ""
         old_kinds = {re.sub(r"line \d+", "", x) for x in before}
@@ -1784,7 +2201,7 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
         if changed:
             # task 57: test_write_query_... failed 4 runs in a row, then its folder was narrowed so it passed
             why.append(f"it changes {', '.join(changed)}, which failed in several test runs in a row and is locked: "
-                       "the code is fixed for it, or a person decides")
+                       "the code is fixed for it, or The Smithy judges which side is wrong")
         if gone:
             why.append("it removes what the request names: " + ", ".join(f'"{t}"' for t in gone[:4])
                        + " (never take out a check the request asks for)")
@@ -1793,8 +2210,23 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
                        + " (a test checks the request, not what the code happens to want)")
         return "; ".join(why)
 
+    def _request_tests_kept(rel: str, old: str, new: str) -> str:
+        """The tests written from the request aren't changed by a fix, except one judged wrong (judge_test)."""
+        if rel != REQUEST_TESTS or new == old:
+            return ""
+        try:
+            names = {n.name for n in ast.walk(ast.parse(old)) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        except SyntaxError:
+            return ""                                  # it didn't parse before: the parse check says so
+        changed = [n for n in _changed_tests(old, new, names) if n not in wrong_tests]   # changed or removed
+        if changed:
+            return (f"{REQUEST_TESTS} holds the tests written from the request and a fix doesn't change them "
+                    f"({', '.join(changed)}); the code is fixed, or The Smithy judges which side is wrong")
+        return ""
+
     def refused(rel: str, old: str, new: str) -> str:
-        return _breaks(rel, old, new) or _adds_problems(rel, old, new) or _bends_test(rel, old, new)
+        return _breaks(rel, old, new) or _adds_problems(rel, old, new) or _request_tests_kept(rel, old, new) \
+            or _bends_test(rel, old, new)
 
     def fix(rel: str, what: str, must: bool = False) -> None:
         """`must`: the check named this file for a change it found missing, so "no edits" isn't an answer: the
@@ -1812,9 +2244,12 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
             else:
                 notes.append(f"`{rel}`: still empty after asking again")
             return
+        elsewhere: dict[str, list[tuple[str, str]]] = {}
+        movable = {r for r in code if r not in same and r != REQUEST_TESTS and r in written}
         try:
             body, note = _edit_file(ctx, job_id, _edit_messages(p, desc, plan, rel, written, written[rel], what, cap),
-                                    rel, written[rel], none_ok=not must, others=written)
+                                    rel, written[rel], none_ok=not must, others=written,
+                                    movable=movable, elsewhere=elsewhere)
         except ValueError:
             steps.info("%s: the check found a change missing here, but no edits came back.", rel)
             whole = _rewrite_whole(rel, what)
@@ -1841,6 +2276,7 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
                 steps.info("%s: the edits weren't kept again (%s); not kept.", rel, again[:200])
                 notes.append(f"`{rel}`: its edits were refused twice ({again}), so they weren't kept")
                 smithy_diagnose.record(hist, "fix", file=rel, kept=False, why=again[:160])
+                moved_in(rel, elsewhere)
                 return
             note += f" (the first edits broke the file: {broke}; asked again)"
         if body != written[rel]:
@@ -1851,13 +2287,32 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
         notes.append(note)
         smithy_diagnose.record(hist, "fix", file=rel, kept=True, broke_first=bool(broke),
                                missed="**Not applied" in note)
+        moved_in(rel, elsewhere)
+
+    def moved_in(src: str, elsewhere: dict[str, list[tuple[str, str]]]) -> None:
+        """Edits sent for `src` whose FIND is clearly in another file: applied there, with the same guards as any
+        edit of that file (never the request's tests, never a file the plan keeps the same)."""
+        for other, eds in elsewhere.items():
+            old = written[other]
+            new, done, _ = apply_edits(old, eds, Path(other).suffix.lower() in _BRACES)
+            why = refused(other, old, new) if new != old else ""
+            if done and not why:
+                inside(folder, other).write_text(new, encoding="utf-8")
+                written[other] = new
+                steps.info("%s: %d edit%s sent for %s belonged here; applied.", other, done,
+                           "" if done == 1 else "s", src)
+                notes.append(f"`{other}`: {done} edit{'s' if done != 1 else ''} sent for `{src}` belonged here, "
+                             "so they were applied here")
+            elif why:
+                steps.info("%s: edits sent for %s belonged here but weren't kept (%s).", other, src, why[:160])
+                notes.append(f"`{other}`: edits sent for `{src}` belonged here but weren't kept ({why})")
 
     def _rewrite_whole(rel: str, what: str) -> str:
         """Edits that couldn't be found (task 51: 0 of 2 went in, twice): the file is written whole instead,
         with the current text to keep. Only kept when it's no shorter than half the old one, isn't a refusal
         and (Python, JSON) still parses; else the old file stays. Returns how it went, or '' (not tried)."""
         old = written[rel]
-        if len(old) > 24_000 or rel.lower().endswith(".md"):
+        if len(old) > 24_000 or rel.lower().endswith(".md") or rel == REQUEST_TESTS:
             return ""                                   # too long to rewrite safely: the edits stay the only way
         if redact(old) != old:                          # something in it was hidden from the model: a rewrite
             return "not tried: the file has a hidden value a rewrite could lose"   # could write [REDACTED] over it
@@ -1893,6 +2348,11 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
         if not ok:
             steps.info("%s: the whole rewrite came back short or broken, so the file was left as it was.", rel)
             return "not kept: it came back short or broken"
+        patched = stdlib_patch_problems(rel, body) if rel.endswith(".py") else []
+        why = _bends_test(rel, old, body) or (patched[0] if len(patched) > len(stdlib_patch_problems(rel, old)) else "")
+        if why:                                         # a whole rewrite gets the same guards as an edit (Nov 17)
+            steps.info("%s: the whole rewrite wasn't kept (%s).", rel, why[:200])
+            return "not kept: " + why
         inside(folder, rel).write_text(body, encoding="utf-8")
         written[rel] = body
         if rel.endswith(".py"):                         # it mustn't break what the other files import (task 51:
@@ -1913,7 +2373,71 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
     hist = SMITHY.results_dir / f"{job_id:05d}-history.jsonl" if job_id and only is None else None
     smithy_diagnose.record(hist, "run", code=smithy_diagnose.commit(Path(__file__).parent),
                            backend=str(getattr(getattr(ctx, "backend", None), "name", "")))
-    locked.update(s["test"] for s in smithy_diagnose.stuck_tests(smithy_diagnose.read(hist)))  # from earlier runs
+    # a test that keeps failing is judged by The Smithy itself against the request (judge_test): "test" = the test
+    # is wrong and is corrected to the request, "code" = the test is right and the code is fixed for it (the test
+    # stays locked against edits). Never left to the person using it (Nov 17, the user). A judgment holds for the
+    # task; when the test still fails twice after it, it's judged once more, and that one is final.
+    verdicts = decisions(job_id) if job_id else {}
+    word: dict[str, str] = {}
+    wrong_tests: set[str] = set()
+    to_judge: set[str] = set()                         # locked, and not (or no longer) verdicts
+
+    def relock() -> None:
+        events = smithy_diagnose.read(hist)
+        stuck = {s["test"] for s in smithy_diagnose.stuck_tests(events)}
+        word.clear()
+        word.update({t: d["side"] for t, d in verdicts.items()})
+        again = set()
+        for t, d in verdicts.items():
+            if d.get("by") == "smithy" and int(d.get("times", 1)) < 2 and t in stuck:
+                since = [e for e in events[int(d.get("at", 0)):] if e.get("kind") == "sandbox"]
+                if len(since) >= 2 and all(t in (e.get("failing") or []) for e in since[-2:]):
+                    again.add(t)
+        wrong_tests.clear()
+        wrong_tests.update(t for t, s in word.items() if s == "test" and t not in again)
+        locked.clear()
+        locked.update(stuck - wrong_tests)
+        to_judge.clear()
+        to_judge.update((stuck - set(word)) | again)
+    relock()                                           # from earlier runs
+    for t, d in sorted(verdicts.items()):
+        who = "You decided" if d.get("by") == "person" else "The Smithy verdicts"
+        notes.append(f"**{who} `{t}`:** " + ("the test is wrong, so it's corrected to match the request and the "
+                                              "code isn't changed to fit it" if d["side"] == "test" else
+                                              "the test is right, so the code is fixed for it")
+                     + (f" ({d['why']})" if d.get("why") else "") + ".")
+
+    # the tests written from the request (REQUEST_TESTS): once per build, by a strong model, before the checks;
+    # the fix rounds never change them, except a test judged wrong (judge_test)
+    if only is None and use_list and wants_tests and ctx.cfg.get("sandbox_tests") \
+            and ctx.cfg.get("request_tests", True) and REQUEST_TESTS not in written:
+        target = inside(folder, REQUEST_TESTS)
+        if target.exists():                            # an earlier run of this task wrote it: kept as it is
+            written[REQUEST_TESTS] = target.read_text(encoding="utf-8-sig", errors="replace")
+            code.append(REQUEST_TESTS)
+        elif (checks_asked := _request_checks(items)):
+            steps.info("Writing %s: one test for each of the request's %d checks and rules.", REQUEST_TESTS,
+                       len(checks_asked))
+            try:
+                with worker_shared.strong_models(float(ctx.cfg.get("rewrite_min_model_b", 70) or 0)):
+                    body = _strip_outer_fence(ctx.chat(_request_tests_messages(items, written, checks_asked), 8000),
+                                              False)
+                ast.parse(body)
+                if "unittest" not in body or not re.search(r"(?m)^\s+def test_\w+", body):
+                    raise ValueError("it came back with no unittest tests")
+            except (BudgetOut, TooLongForLocal):
+                raise
+            except (worker_cloud.NoStrongModel, SyntaxError, ValueError, RuntimeError) as e:
+                steps.info("%s wasn't written: %s.", REQUEST_TESTS, e)
+                notes.append(f"**`{REQUEST_TESTS}` wasn't written** ({e}), so only the build's own tests ran.")
+            else:
+                target.write_text(body, encoding="utf-8")
+                written[REQUEST_TESTS] = body
+                code.append(REQUEST_TESTS)
+                n_tests = len(re.findall(r"(?m)^\s+def test_\w+", body))
+                notes.append(f"`{REQUEST_TESTS}`: {n_tests} tests written from the request's {len(checks_asked)} "
+                             "checks and rules; the fix rounds don't change them.")
+                smithy_diagnose.record(hist, "request_tests", tests=n_tests, checks=len(checks_asked))
 
     def check() -> tuple[dict[int, tuple[str, str]], list[str], list[str]]:
         ticks = _checklist(ctx, p, desc, plan, written, items, cap, check_log, done_path) if use_list else {}
@@ -1938,7 +2462,15 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
                     written[rel] = new
                     steps.info("%s: %d import%s inside a function repeated the file's own imports; taken out.",
                                rel, n, "" if n == 1 else "s")
-        problems, checked = build_problems(folder, code, stdlib_only)
+        # unused imports: taken out by ruff's own safe fix, no model; never in a file the plan keeps the same
+        for rel in smithy_checkers.drop_unused_imports(folder, [r for r in code if r not in same and r in written]):
+            written[rel] = inside(folder, rel).read_text(encoding="utf-8")
+            steps.info("%s: unused imports taken out (no model needed).", rel)
+        problems, checked = build_problems(folder, code, stdlib_only, net_ok)
+        # an unused variable alone never holds a build back or starts a fix round (Nov 17, task 58: one F841 took 3
+        # rounds and kept it from checking clean); it's fixed along with a file's other problems, else listed
+        dead[:] = [x for x in problems if _DEAD_CODE.match(x) and x.split(" line ")[0] not in same]
+        problems = [x for x in problems if not _DEAD_CODE.match(x)]
         # the JSON fields a change asks for, checked on every entry (task 56: the glossary had no ids for hours
         # while models said it did)
         jsons = [r for r in code if r.lower().endswith(".json")]
@@ -1969,13 +2501,15 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
         return problems, checked
 
     same = {f["path"] for f in (plan or {}).get("files", []) if f.get("change") == "same"}
+    dead: list[str] = []                       # unused imports/variables: never a build problem on their own
 
     def files_for(n: int) -> list[str]:
         """The files to fix for item n, at most 3: the ones the check's note names, else the ones the whole item
         names (its "Files:" lines, names without .py), in the order they're named; else the longest. Never a file
         the plan keeps the same (Nov 15, task 56: the notes named no file, the item's first line neither, so all
-        three items went to academy_sources.py, the longest, which the request said to leave as it is)."""
-        pick = [r for r in code if r not in same] or list(code)
+        three items went to academy_sources.py, the longest, which the request said to leave as it is). Never the
+        tests written from the request, which no fix changes (Nov 17, task 58: a missing change went there, refused)."""
+        pick = [r for r in code if r not in same and r != REQUEST_TESTS] or [r for r in code if r != REQUEST_TESTS]
         for text in (ticks[n][1], items[n]):
             found = _names(text, [{"path": r} for r in pick], stems=True)
             if found:
@@ -2033,6 +2567,7 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
                 for rel in code:
                     mine = [x for x in problems if x.startswith(rel + " ")]
                     if mine:
+                        mine += [x for x in dead if x.startswith(rel + " ")]     # tidied along with the rest
                         # the change's own words for this file, so "never calls record()" says what record() is
                         # and when it's called (Nov 16, task 56)
                         asked = [items[n] for n in items
@@ -2089,8 +2624,7 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
                                            sandbox.get("full", {}).get(t, sandbox["output"].get(t, ""))).items()})
                 # a test that has failed in several runs in a row is locked: a test fix may not change it (Nov 16,
                 # task 57: one that failed 4 times was narrowed until it passed)
-                locked.clear()
-                locked.update(s["test"] for s in smithy_diagnose.stuck_tests(smithy_diagnose.read(hist)))
+                relock()
                 if sandbox["status"] != "failed" or rnd >= int(ctx.cfg.get("sandbox_fix_rounds", 1)):
                     break
                 before = {r: (folder / r).read_bytes() for r in code if (folder / r).exists()}
@@ -2099,8 +2633,9 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
                         continue
                     out = sandbox["output"].get(t, "")
                     same = {f["path"] for f in plan.get("files", []) if f.get("change") == "same"}
-                    named = _failing_files(sandbox.get("full", {}).get(t, out), t, code, same) or \
-                        [r for r in _imported_by(folder, t, code) if r not in same] or [t]
+                    # the files the traceback names, then the ones whose functions the failing tests call, then
+                    # (neither found) the files the test imports
+                    named = fix_files(folder, t, sandbox.get("full", {}).get(t, out), code, same)
                     shown = _failing_test_code(folder / t, sandbox.get("full", {}).get(t, out))
                     # what the change asks for, where it names these files or has lettered checks, so a test that
                     # disagrees with the request can be put right instead of the code being bent to it (Nov 16,
@@ -2110,25 +2645,56 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
                              or _names(items[n], [{"path": r} for r in named], stems=True)][:3]
                     wanted = ("\n\nWhat the change asks for (the request; it decides who's right):\n\n"
                               + "\n\n".join(asked)) if asked else ""
-                    named = ([t] if t in named else []) + [r for r in named if r != t]
                     full = sandbox.get("full", {}).get(t, out)
-                    none_ran = bool(re.search(r"\bRan 0 tests?\b|NO TESTS RAN", full))
-                    if none_ran:
-                        # no test ran: the test file's own fault, never the code's (Nov 16, task 57: unittest.main()
-                        # inside the test class; the fix went to academy_confusion.py and began rewriting it whole)
-                        named = [t]
+                    if _none_ran(full):
                         wanted += ("\n\nNo test ran at all (\"Ran 0 tests\"). The cause is in this test file: most "
                                    "often unittest.main() inside a class or before the tests, or tests that aren't "
                                    "methods named test_... of a unittest.TestCase class. Fix only that.")
                     said, held, judged = "", [], False
                     failing = re.findall(r"(?m)^(?:FAIL|ERROR): (\w+)", full)
-                    stuck_here = [n for n in failing if n in locked]
+                    # a test that keeps failing is judged here, against the request, by a strong model: never left
+                    # to the person using The Smithy (Nov 17, the user; task 58: a test wrong on Windows failed 7
+                    # runs in a row, and the code fix rewired Python's own Path.__str__ to fit it)
+                    srcs = _test_funcs(folder / t, [n for n in failing if n in to_judge])
+                    for n in [n for n in failing if n in to_judge]:
+                        code_seen = {r: written[r] for r in named if r != t and r in written}
+                        verdict = judge_test(ctx, request_text, n, srcs.get(n, ""), full, code_seen,
+                                             float(ctx.cfg.get("rewrite_min_model_b", 70) or 0))
+                        if verdict is None:
+                            continue
+                        side, why = verdict
+                        verdicts[n] = record_decision(job_id, n, side, "smithy", why, len(smithy_diagnose.read(hist)),
+                                                      verdicts)
+                        smithy_diagnose.record(hist, "judged", test=n, side=side)
+                        steps.info("%s: judged against the request: the %s is wrong (%s).", n, side, why[:160])
+                        notes.append(f"**The Smithy judged `{n}`** (it failed in several runs in a row): the "
+                                     + ("test is wrong, so it's corrected to match the request" if side == "test"
+                                        else "code is wrong, so the code is fixed for it")
+                                     + (f". {why}" if why else "."))
+                    relock()
+                    stuck_here = [n for n in failing if n in to_judge]       # not judged: no strong model free
+                    wrong_here = [n for n in failing if n in wrong_tests]
+                    named = fix_files_judged(folder, t, named, code, same, bool(wrong_here))
+                    if wrong_here:                     # judged wrong: the test is corrected to the request
+                        wanted += ("\n\nThese tests were checked against the request and found wrong: "
+                                   + ", ".join(wrong_here) + ". Correct each one so it checks what the request asks "
+                                   "for (the request decides), keeping its checks; the code isn't changed to fit them."
+                                   + "".join(f"\nWhy {n} is wrong: {verdicts[n].get('why')}" for n in wrong_here
+                                             if verdicts.get(n, {}).get("why")))
                     if stuck_here:
-                        wanted += ("\n\nThese tests have failed in several test runs in a row and are locked: don't "
-                                   "change them in the test file; " + ", ".join(stuck_here) + ".")
-                        notes.append(f"**`{t}`: {', '.join(stuck_here)} failed in several test runs in a row**, so "
-                                     "the test fix may not change them: the code is fixed for them, or you decide "
-                                     "whether the test or the code is right.")
+                        # not judged yet (no strong model was free): neither the test nor the code is changed for
+                        # it this round, and it's judged on the next
+                        smithy_diagnose.record(hist, "not_judged", test=t, tests=stuck_here)
+                        wanted += ("\n\nThese tests have failed in several test runs in a row and aren't judged yet: "
+                                   "don't change them, and don't change the code to fit them: "
+                                   + ", ".join(stuck_here) + ".")
+                        notes.append(f"**`{t}`: {', '.join(stuck_here)} failed in several test runs in a row.** No "
+                                     "strong model was free to judge whether the test or the code is wrong, so "
+                                     "neither was changed for them; they're judged on the next run.")
+                        if not [n for n in failing if n not in to_judge]:
+                            steps.info("%s: only tests not judged yet fail (%s); judged on the next run.",
+                                       t, ", ".join(stuck_here))
+                            continue
                     funcs_before = _test_funcs(folder / t, failing)
                     request_text = "\n".join(items.values()) or p.get("change") or p.get("request", "")
                     for rel in named[:4]:
@@ -2143,13 +2709,15 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
                             held = [n for n in failing if n in funcs_before
                                     and _test_fix_missed(t, said, funcs_before[n], funcs_after.get(n, ""))
                                     and not _backed_by_request(funcs_before[n], request_text)
-                                    and n not in locked]          # locked: the code is the only way left
+                                    and n not in locked and n not in wrong_tests]   # those have their own way
+                            held_or_locked = held + [n for n in failing if (n in to_judge or n in wrong_tests)
+                                                     and n not in held]
                             if held:
                                 smithy_diagnose.record(hist, "test_disagrees", test=t, tests=held)
                                 notes.append(f"**`{t}`: {', '.join(held)} may disagree with the request.** A fix "
                                              "for the test was tried, but they came out the same, so the code wasn't "
                                              "changed to fit them this round. Check them against the request.")
-                            left = [n for n in failing if n not in held]
+                            left = [n for n in failing if n not in held_or_locked]
                             if failing and not left:
                                 steps.info("%s: its fix was tried but the failing tests didn't change; the code isn't "
                                            "changed to fit them this round.", t)
@@ -2195,6 +2763,8 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
         truth.append("It does NOT build yet. The build check found:\n- " + "\n- ".join(problems[:15]))
     elif checked:
         notes.append(f"**Build check passed:** {'; '.join(checked)}. Nothing was run.")
+    if dead:
+        notes.append(f"**Unused code left ({len(dead)}; it doesn't stop the build):** " + "; ".join(dead[:10]))
         truth.append("Build check passed (" + "; ".join(checked) + "). Nothing has been run.")
     else:
         notes.append("**Build check:** none of these file types can be checked automatically here.")
@@ -2246,6 +2816,8 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
         notes.append("**Self-check:** " + ("nothing found." if not found else "\n- " + "\n- ".join(found)))
         if found:
             steps.info("Self-check: %s", " | ".join(x[:140] for x in found))
+    if only is None:
+        notes.append(_benchmarks(job_id, hist, problems, sandbox, left, time.monotonic() - started))
     steps.info("Checks clean." if not left else "Still not clean after %d round%s: %s.", *(
         () if not left else (rounds, "" if rounds == 1 else "s", "; ".join(left))))
     return notes, "\n".join(truth), left
@@ -2517,7 +3089,7 @@ def request_facts(request: str, limit_chars: int = 3500) -> str:
             heads = [l for l in text.splitlines() if l.startswith("#")][:6]
             first = "\n".join(text.splitlines()[:12])
             out.append(f"- `{n}` (`{hits[0].name}`): its headings look like: " + " | ".join(h[:90] for h in heads)
-                       + f"\n  It starts:\n  " + first[:900].replace("\n", "\n  "))
+                       + "\n  It starts:\n  " + first[:900].replace("\n", "\n  "))
     return "\n".join(out)[:limit_chars]
 
 
@@ -3274,6 +3846,39 @@ _SMALL_WORDS = {"a", "an", "the", "and", "or", "of", "in", "on", "to", "for", "t
                 "it", "its", "is", "are", "from", "by", "at", "as"}
 
 
+_WEAK = re.compile(r"(?i)this PC|20b|flash|8b|3b|mini|small")
+
+
+def see_me_text(job_id: int, minutes: float, on: str) -> str:
+    """The "See me" check-in on a long build, in plain words: how long, where the tests stand against the best so
+    far this run, the model it's on, and whether it's getting better, holding or going backwards (Nov 17, the user:
+    task 58 passed all 25 request tests at 6:41 pm, then slid back for an hour on weak models, and nothing said so)."""
+    events = smithy_diagnose.read(SMITHY.results_dir / f"{job_id:05d}-history.jsonl")
+    start = max((i for i, e in enumerate(events) if e.get("kind") == "run"), default=-1)
+    runs = [e for e in events[start + 1:] if e.get("kind") == "sandbox"]
+    head = f"Task {job_id} has been running {minutes:.0f} minutes, now on {on}."
+    if not runs:
+        return head + " No test run yet."
+    sets = [set(e.get("failing") or []) if e.get("status") != "passed" else set() for e in runs]
+    fails = [len(s) for s in sets]
+    best = min(fails)
+    b = fails.index(best)
+    best_at = time.strftime("%I:%M %p", time.localtime(runs[b].get("ts", 0))).lstrip("0")
+    now = fails[-1]
+    broke = sorted(sets[-1] - sets[b])               # failing now, though they passed in the best run
+    where = "all tests pass" if now == 0 else f"{now} failing test{'s' if now != 1 else ''}"
+    if now > best or broke:
+        trend = (f"Going backwards: the best this run was {best or 'none'} failing, at {best_at}"
+                 + (f", and {', '.join(broke[:3])} passed then" if broke else "") + ". "
+                 + ("It's on a weaker model now; stopping it until the stronger ones are back may be best."
+                    if _WEAK.search(on) else "Worth a look."))
+    elif len(fails) > 1 and now < fails[-2]:
+        trend = "Getting better."
+    else:
+        trend = "Holding steady."
+    return f"{head} Last test run: {where}. {trend}"
+
+
 REGISTRY: dict[str, JobType] = {
     "review": JobType("review", "Review a code file for bugs and risks.", "code",
                       _review, lambda p: {"path": _file(p)},
@@ -3288,15 +3893,18 @@ REGISTRY: dict[str, JobType] = {
                       run=_run_script),               # parsed until it checks clean, never run
     "joomla": JobType("joomla", "A Joomla / YOOtheme override or CSS, in its own folder.", "code",
                       None, lambda p: _check_build(p, joomla=True), _title_build,
-                      max_tokens=3000, run=_with_base_file(run_build), minutes_key="max_build_minutes", coding=True),
+                      max_tokens=3000, run=_with_base_file(run_build), minutes_key="max_build_minutes", coding=True,
+                      see_me=lambda j, m, on: see_me_text(j, m, on)),
     "build": JobType("build", "Build a project from scratch: plan, files, README (never run).", "code",
                      None, _check_build, _title_build,
-                     max_tokens=3000, run=_with_base_file(run_build), minutes_key="max_build_minutes", coding=True),
+                     max_tokens=3000, run=_with_base_file(run_build), minutes_key="max_build_minutes", coding=True,
+                     see_me=lambda j, m, on: see_me_text(j, m, on)),
     "followup": JobType("followup", "A follow-up question; on a build, a new version of it.", "code",
                         None, _check_followup_any,
                         lambda p: (f"version {p['version']} of Smithy task {p['parent_id']}" if "change" in p
                                    else f"the answer about Smithy task {p['parent_id']}"),
-                        max_tokens=1000, run=_run_followup, minutes_key="max_build_minutes", coding=True),
+                        max_tokens=1000, run=_run_followup, minutes_key="max_build_minutes", coding=True,
+                        see_me=lambda j, m, on: see_me_text(j, m, on)),
 }
 if smithy_check is not None:                     # not in the shared copy of Othos
     REGISTRY["check"] = JobType(

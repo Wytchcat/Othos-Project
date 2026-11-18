@@ -100,6 +100,8 @@ class JobType:
     run: Callable | None = None                # (ctx, params) -> (summary, full, artifact path): several calls
     minutes_key: str = "max_job_minutes"       # which time limit applies
     coding: bool = False                       # for the board's chip
+    # (job id, minutes running, the model it's on now) -> the "See me" check-in's text on a long job, or ""
+    see_me: Callable[[int, float, str], str] | None = None
 
 
 @dataclass
@@ -262,6 +264,7 @@ class Worker:
                 "started_ts": cur.get("started"),
                 "elapsed": round(time.time() - cur["started"]) if cur.get("started") else None,
                 "progress": cur.get("progress"),
+                "see_me": cur.get("see_me"),           # the last "See me" check-in on a long job: {ts, text}
                 "paused_task": self.paused_task if state == "paused" else None,
                 # every provider in the switch order is out (worker_cloud.Chain): when they're back, and her answer
                 "free_tokens_back_ts": cur.get("free_tokens_back") if state == "waiting for free tokens" else None,
@@ -348,6 +351,24 @@ class Worker:
         self.write_status("held back" if held else "working")
         deadline = [time.monotonic() + 60 * float(self.cfg.get(jt.minutes_key, self.cfg.get("max_job_minutes", 30)))]
         last_check = [0.0]
+        # a "See me" check-in every see_me_minutes on a long job (Nov 17, the user: task 58 peaked at 6:41 pm and slid
+        # backwards for an hour with nothing said); 0 turns it off
+        every = 60 * float(self.cfg.get("see_me_minutes", 30) or 0)
+        next_see_me = [time.monotonic() + every]
+
+        def see_me() -> None:
+            next_see_me[0] = time.monotonic() + every
+            mins = (time.time() - self.current["started"]) / 60
+            on = backend.used[-1] if isinstance(backend, worker_cloud.Chain) and backend.used else model
+            try:
+                text = jt.see_me(row["id"], mins, on) if jt.see_me else ""
+            except Exception as e:                    # a check-in never stops the task
+                log.info("task %d: no See me text (%s)", row["id"], e)
+                text = ""
+            text = text or f"Task {row['id']} has been running {mins:.0f} minutes, on {on}."
+            self.current["see_me"] = {"ts": time.time(), "text": text}
+            log.info("see me: task %d: %s", row["id"], text)
+            steps.info("See me: %s", text)
 
         def should_stop(chars: int = 0, frac: float | None = None):
             # rough progress: answer length against the most it may write (~3.5 characters per token)
@@ -362,6 +383,8 @@ class Worker:
                 raise Stopped("games")       # paused, or held-back settings changed
             if time.monotonic() > deadline[0]:
                 raise Stopped("timeout")
+            if every > 0 and time.monotonic() >= next_see_me[0]:
+                see_me()
             self.write_status("held back" if held else "working")
 
         if isinstance(backend, worker_cloud.Chain) and \

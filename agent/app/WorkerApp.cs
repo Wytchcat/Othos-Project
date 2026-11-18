@@ -940,6 +940,7 @@ class FirestarterForm : Form
     bool loadingModels, stopping;
     string runningTask = "";   // the task the worker is on now ("" = none), for the Close button's question
     string askedOut = "";      // the task already asked about free tokens (worker_cloud.Chain)
+    string seenSeeMe = "";     // the last "See me" check-in shown (its ts), so each one shows once
     ProgressForm progress;     // the live steps window (one at a time)
 
     public FirestarterForm()
@@ -1431,6 +1432,17 @@ class FirestarterForm : Form
                 string title = Get(s, "task_title");
                 BeginInvoke((Action)(() => AskOut(tid, title, back)));
             }
+        }
+        // a long job's "See me" check-in (worker_engine, every see_me_minutes): shown once, only while it's fresh
+        var sm = alive && s.ContainsKey("see_me") ? s["see_me"] as Dictionary<string, object> : null;
+        if (sm != null && Get(sm, "ts") != "" && Get(sm, "ts") != seenSeeMe)
+        {
+            string ts = Get(sm, "ts"), text = Get(sm, "text");
+            double t;
+            bool fresh = double.TryParse(ts, out t) && (DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalSeconds - t < 300;
+            seenSeeMe = ts;
+            if (fresh && text != "")
+                BeginInvoke((Action)(() => ThemedBox.Show(this, text, FirestarterApp.Name + ": See me")));
         }
         queue.Text = "Queued: " + (alive ? Get(s, "queued") : "-") + "     Waiting for review: " + (alive ? Get(s, "review") : "-");
         string g = Get(s, "game");

@@ -81,12 +81,13 @@ def ruff_errors(folder: Path, rels: list[str]) -> list[str] | None:
     """ruff's serious checks only: syntax, undefined names, `return` outside a function and the like (E9, F63,
     F7, F82), and a name defined again before it's used (F811: Nov 16, task 56's test file held a pasted copy of
     academy_readme.py's functions, overwritten by the import below them; it also catches two tests with one name,
-    where only the second runs), not style."""
+    where only the second runs), and an unused import or variable (F401, F841: the user's benchmarks, Nov 17: no dead
+    code), not style."""
     exe = _tool("ruff", Path(sys.executable).parent / "ruff.exe")
     if not exe:
         return None
-    r = _run([exe, "check", "--no-cache", "--isolated", "--output-format", "json", "--select", "E9,F63,F7,F82,F811",
-              "--target-version", "py312", *rels], folder)
+    r = _run([exe, "check", "--no-cache", "--isolated", "--output-format", "json",
+              "--select", "E9,F63,F7,F82,F811,F401,F841", "--target-version", "py312", *rels], folder)
     if r is None:
         return None
     try:
@@ -95,6 +96,20 @@ def ruff_errors(folder: Path, rels: list[str]) -> list[str] | None:
         return None
     return _cap([(_rel(folder, i.get("filename", ""), rels), int((i.get("location") or {}).get("row") or 1),
                   f"{i.get('code') or 'ruff'} {i.get('message', '')}") for i in items])
+
+
+def drop_unused_imports(folder: Path, rels: list[str]) -> list[str]:
+    """Unused imports (F401) taken out by ruff's own safe fix, with no model (the user's benchmarks, Nov 17: no dead
+    code, and the best use of the tools already here). Returns the files it changed; [] when ruff isn't here."""
+    exe = _tool("ruff", Path(sys.executable).parent / "ruff.exe")
+    py = [r for r in rels if r.lower().endswith(".py")]
+    if not exe or not py:
+        return []
+    before = {r: (folder / r).read_bytes() for r in py if (folder / r).exists()}
+    if _run([exe, "check", "--no-cache", "--isolated", "--select", "F401", "--fix", "--target-version", "py312",
+             *py], folder) is None:
+        return []
+    return [r for r, b in before.items() if (folder / r).read_bytes() != b]
 
 
 def pyright_errors(folder: Path, rels: list[str]) -> list[str] | None:

@@ -18,6 +18,11 @@ worker_engine.py.
                                            is answers or changes and gets a revised plan
     smithy.py plans | plan ID              plans waiting for an answer (JSON, for the app)
     smithy.py continue ID                  a stopped or failed build carries on from the files it wrote
+    smithy.py replay ID [RUN]              The Smithy's own decisions on a task's last test run, no model,
+                                           nothing run: where each fix would go, and what would hold it back
+    smithy.py decide ID TEST test|code     an override only: The Smithy judges a test that keeps failing
+                                           itself; this replaces its judgment ("test" = the test is wrong,
+                                           "code" = the code is wrong)
     smithy.py add joomla WHAT [--file PATH]
     smithy.py add followup ID QUESTION     (on a build: a new version)
     smithy.py add ... --provider NAME      on another model provider (worker_cloud.py; off by default)
@@ -93,6 +98,23 @@ def _cloud(argv: list[str]) -> bool:
             raise SystemExit("usage: smithy.py continue TASK_ID")
         try:
             print(smithy_jobs.carry_on(int(argv[2])))
+        except ValueError as e:
+            raise SystemExit(f"can't do that: {e}")
+        return True
+    if cmd == "replay":                                  # The Smithy's own decisions on a task's last test run, no model
+        if len(argv) < 3 or not argv[2].isdigit() or (len(argv) > 3 and not argv[3].isdigit()):
+            raise SystemExit("usage: smithy.py replay TASK_ID [RUN]")
+        import smithy_replay
+        try:
+            print(smithy_replay.replay(int(argv[2]), int(argv[3]) if len(argv) > 3 else None))
+        except ValueError as e:
+            raise SystemExit(f"can't do that: {e}")
+        return True
+    if cmd == "decide":                                  # an override of The Smithy's own judgment of a locked test
+        if len(argv) < 5 or not argv[2].isdigit():
+            raise SystemExit("usage: smithy.py decide TASK_ID TEST_NAME test|code")
+        try:
+            print(smithy_jobs.decide(int(argv[2]), argv[3], argv[4].lower()))
         except ValueError as e:
             raise SystemExit(f"can't do that: {e}")
         return True

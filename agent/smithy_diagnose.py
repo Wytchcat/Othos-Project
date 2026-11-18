@@ -174,7 +174,7 @@ def self_check(events: list[dict], items: dict[int, str]) -> list[str]:
     for s in stuck_tests(events):
         lines.append(f"{s['test']} has failed in {s['runs']} test runs in a row"
                      + (f" ({', then '.join(s['asserts'][-4:])})" if s["asserts"] else "")
-                     + ": check that the test matches the request before changing the code again.")
+                     + ": The Smithy judges it against the request (the test or the code is wrong) and fixes that side.")
     n = no_progress(events)
     if n:
         lines.append(f"the last {n + 1} checks found the same changes missing and the same build problems, though "
