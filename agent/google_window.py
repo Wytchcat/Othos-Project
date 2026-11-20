@@ -12,7 +12,7 @@ from tkinter import ttk
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import google_tools  # noqa: E402
-from library_window import BG, DIM, GOLD, GREEN, INK, LINE, PANEL, RED, theme, themed_box  # noqa: E402
+from library_window import DIM, GOLD, GREEN, INK, LINE, PANEL, RED, theme, themed_box  # noqa: E402
 
 SEPARATE_ACCOUNT = """Optional: a separate Google account just for Othos
 Instead of connecting your main Google account, you can make a new free Google account only for Othos, and send it just what you want Othos to see: forward chosen mail to it with a Gmail filter, and share chosen calendars, docs and sheets with it (as Viewer). Then connect that account here.

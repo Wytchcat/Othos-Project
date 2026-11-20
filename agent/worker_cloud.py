@@ -900,9 +900,27 @@ def out_choice(status_path: Path, task_id: int) -> str:
         return ""
 
 
+def _why_short(e: Exception) -> str:
+    """A provider's refusal in a few plain words, for the stop message."""
+    text = str(e).lower()
+    status = getattr(e, "status", 0)
+    if status == 429 and ("daily" in text or "day" in text or "quota" in text):
+        return "its day is used up"
+    if status == 429:
+        return "too many requests"
+    if status in (500, 502, 503, 504) or "demand" in text or "overloaded" in text:
+        return "busy"
+    if isinstance(e, httpx.HTTPError):
+        return "couldn't be reached"
+    return "it refused (" + (str(e)[:60] or type(e).__name__) + ")"
+
+
 class TooLongForLocal(ValueError):
     """A step too long for this PC's model: refused, and the task fails without a retry (it would be
     the same again)."""
+
+
+CLOUD_QUIET_S = 180          # seconds a cloud provider may send nothing before the step goes to the next one
 
 
 class NoStrongModel(RuntimeError):
@@ -980,6 +998,8 @@ class Chain:
         # large is skipped for steps that size; one that keeps saying no rests twice as long each time
         self.too_big: dict[str, int] = {}              # name -> the smallest step (tokens) it refused as too large
         self.fails: dict[str, int] = {}
+        self.why_not: dict[str, str] = {}              # this step: spoken name -> why it didn't take it
+        self.short_rest: set[str] = set()              # this step: names resting only for their minute
         names = [l[1] for l in links] + (["this PC"] if local else [])
         self.name = "switching (" + " -> ".join(names) + ")"
 
@@ -996,6 +1016,24 @@ class Chain:
                 LOCAL_SHRINK(messages, self.local_ctx - 512), self.local_ctx):
             return ""
         return why
+
+    def _none_took(self) -> str:
+        """Why no provider took the step, in a sentence (Nov 19, task 67: "every provider is out of free tokens"
+        was said when Cerebras was only over its minute, Gemini busy, NVIDIA and OpenRouter empty)."""
+        if not self.why_not:
+            return "every provider in the switch order is out of free tokens for now"
+        return "no provider in the switch order could take this step (" + "; ".join(
+            f"{who}: {why}" for who, why in self.why_not.items()) + ")"
+
+    def _back_soon(self, messages) -> float | None:
+        """Seconds until the first provider that turned this step down only for its minute is back (0 = it already
+        is: its rest ran out while the others were tried; Nov 19, task 67's second run: NVIDIA took 2 minutes to
+        send nothing, and Cerebras's minute was over by then), or None when none is back within short_out_wait."""
+        size, now = prompt_tokens(messages), time.time()
+        backs = [max(0.0, _out_until(l[0]) - now) for l in self.links if l[0] in self.short_rest
+                 and not (l[0] in self.too_big and size >= self.too_big[l[0]]) and not _too_small(l[3])]
+        wait = min(backs) if backs else None
+        return wait if wait is not None and wait <= float(self.cc.get("short_out_wait", 180)) else None
 
     def _did(self, who: str) -> None:
         if not self.used or self.used[-1] != who:
@@ -1015,10 +1053,26 @@ class Chain:
                 steps.info("This step was made smaller (the other files as outlines): about %s tokens instead of "
                            "%s.", f"{prompt_tokens(smaller):,}", f"{prompt_tokens(messages):,}")
                 messages = smaller
+        short_waits = 0
         while True:
             out = self._try_links(messages, threads, max_tokens, should_stop)
             if out is not None:
                 return out
+            # every provider turned the step down, but one is only resting a minute or two (its per-minute
+            # limit): wait for it, a few times, before this PC's model or giving up (Nov 19, task 67 stopped
+            # with both Cerebras keys back a minute later)
+            wait = self._back_soon(messages)
+            if wait is not None and short_waits < int(self.cc.get("short_out_tries", 3)):
+                short_waits += 1
+                log.info("switching: no provider took this step; one is back in %.0f s: waiting (%d)", wait,
+                         short_waits)
+                steps.info("No provider could take this step right now (%s); one is back in about %.0f seconds, "
+                           "so it waits for it.", "; ".join(f"{w}: {y}" for w, y in self.why_not.items()), wait)
+                end = time.monotonic() + wait + 1
+                while time.monotonic() < end:
+                    should_stop(0)
+                    time.sleep(1)
+                continue
             if worker_shared.MIN_MODEL_B.get():         # strong models only: never this PC's or a smaller one
                 strong = [l[1] for l in self.links if not _too_small(l[3])]
                 raise NoStrongModel("no strong model is free for this step right now ("
@@ -1049,6 +1103,7 @@ class Chain:
         # task 58: Cerebras's 2nd key sent an empty reply, the step went on past the 1st key, which had room 18 s
         # later, and down to this PC's 3B model)
         order, passed, given_back = list(self.links), {}, set()
+        self.why_not, self.short_rest = {}, set()
         i = 0
         while i < len(order):
             name, spoken, backend, m = order[i]
@@ -1066,6 +1121,7 @@ class Chain:
                 pc = pace_for(self.cc, name)
                 tpm = pc.get("tpm_total", pc.get("tpm", 0))
                 log.info("switching: %s takes about %d tokens a minute; a step of about %d won't fit", spoken, tpm, size)
+                self.why_not[spoken] = "a step this big doesn't fit its minute"
                 steps.info("%s takes about %s tokens a minute, and this step is about %s; trying the next provider.",
                            spoken, f"{tpm:,}", f"{size:,}")
                 continue
@@ -1100,6 +1156,7 @@ class Chain:
                         # replies were read as "no edits needed" for 6 files); the next provider, not marked out
                         log.warning("switching: %s sent an empty reply; trying the next", spoken)
                         steps.info("%s sent back nothing; trying the next provider.", spoken)
+                        self.why_not[spoken] = "an empty reply"
                         break
                     self._did(f"{spoken} ({m})")
                     return out
@@ -1114,6 +1171,7 @@ class Chain:
                     return self._local(e, messages, threads, max_tokens, should_stop)
                 except ProviderCapOut as e:            # this provider's own day is used up: the next one
                     _mark_out(name, _to_midnight())
+                    self.why_not[spoken] = "its day is used up"
                     log.warning("switching: %s; trying the next", e)
                     steps.info("%s; trying the next provider.", e)
                     break
@@ -1129,12 +1187,15 @@ class Chain:
                         continue
                     if isinstance(e, Refused) and e.status == 413:     # too large: not a matter of waiting
                         self.too_big[name] = min(size, self.too_big.get(name, size))
+                        self.why_not[spoken] = "it says a step this big is too large"
                         log.warning("switching: %s says a step of about %d tokens is too large; skipped for steps "
                                     "this big in this task", spoken, size)
                         steps.info("%s can't take a step this big; trying the next provider.", spoken)
                         break
                     if 0 < wait <= 60:                 # still only its minute (Nov 15: Cerebras rested for hours
                         _mark_out(name, 60.0)          # after per-minute refusals): back for the next step
+                        self.why_not[spoken] = "over its per-minute limit"
+                        self.short_rest.add(name)
                         log.warning("switching: %s is still over its per-minute limit; trying the next", spoken)
                         steps.info("%s is still over its per-minute limit; this step goes to the next provider.",
                                    spoken)
@@ -1142,6 +1203,7 @@ class Chain:
                     self.fails[name] = self.fails.get(name, 0) + 1     # 10, 20, 40 minutes... up to midnight
                     _mark_out(name, min(_rest_for(e) * 2 ** (self.fails[name] - 1), max(_to_midnight(), 60.0)))
                     log.warning("switching: %s can't take this step (%s); trying the next", spoken, str(e)[:160])
+                    self.why_not[spoken] = _why_short(e)
                     steps.info("%s can't take this step; trying the next provider.", spoken)
                     break
             if name in passed:                         # it failed: the key passed over for it is next
@@ -1153,7 +1215,7 @@ class Chain:
 
     def _local(self, why, messages, threads, max_tokens, should_stop) -> str:
         if not self.local:
-            raise RuntimeError(str(why) if why else "every provider in the switch order is out of free tokens for now")
+            raise RuntimeError(str(why) if why else self._none_took())
         too_long = too_long_for_local(messages, self.local_ctx)
         # the answer needs room too, and a long prompt is slow here (Nov 15, task 56: a 31,001-token step in a
         # 32,768 window had ~1,700 tokens left for a 6,000 answer, written at 1 token a second): made smaller
@@ -1171,8 +1233,7 @@ class Chain:
         if too_long:                                   # never a silent cut-off on this PC's model
             log.warning("switching: not going to this PC's model: %s", too_long)
             steps.info("This PC's model can't take this step: %s.", too_long.split(", so")[0])
-            raise TooLongForLocal((f"{why}; and " if why else "every provider in the switch order is out of free "
-                                   "tokens, and ") + too_long)
+            raise TooLongForLocal((f"{why}; and " if why else self._none_took() + ", and ") + too_long)
         self._did("this PC's model")
         backend, model = self.local
         return backend.chat(model, messages, threads, max_tokens, should_stop)
@@ -1272,8 +1333,10 @@ class OpenAICompatible(_Base):
             body.pop("model")
         out, tin, tout, accepted = [], 0, 0, False
         try:
+            # a cloud provider that sends nothing for 3 minutes is given up on (the next provider takes the step); a
+            # model on this PC may think quietly for longer (Nov 18: Gemini sent nothing for 10 minutes)
             with httpx.stream("POST", f"{self.url}/chat/completions", json=body, headers=headers,
-                              timeout=httpx.Timeout(30, read=600)) as r:
+                              timeout=httpx.Timeout(30, read=600 if self.p.local else CLOUD_QUIET_S)) as r:
                 if r.status_code != 200:
                     raise Refused(_refused(self.p.spoken, r.status_code,
                                            _scrub(r.read().decode(errors="replace"), self.key)),

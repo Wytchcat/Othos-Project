@@ -171,6 +171,8 @@ class GamingMonitor:
         self.mode = Mode()
         self.failed_gaming_model = False
         self.cpu_llm = None  # the agent's LLM object for gaming_model (set in entrypoint)
+        # False when the normal model runs on llama-server (llm_server.py): then Ollama never loads or unloads it
+        self.normal_on_ollama = True
         self._override_game: str | None = None  # game running when the override was set
         self._task: asyncio.Task | None = None
 
@@ -283,19 +285,22 @@ class GamingMonitor:
     # unloading llama3.2 afterwards also unloaded the gaming model that had just loaded.
     async def _to_cpu_model(self) -> None:
         t = time.monotonic()
-        await self._ollama(self.cfg.normal_model, 0)   # free its memory / VRAM for the game
+        if self.normal_on_ollama:
+            await self._ollama(self.cfg.normal_model, 0)   # free its memory / VRAM for the game
         if not await self._ollama(self.cfg.gaming_model, self.keep_alive):
             # fall back to the normal model rather than breaking the call
             self.failed_gaming_model = True
             log.warning("gaming mode: %s didn't load; back on %s", self.cfg.gaming_model, self.cfg.normal_model)
-            await self._ollama(self.cfg.normal_model, self.keep_alive)
+            if self.normal_on_ollama:
+                await self._ollama(self.cfg.normal_model, self.keep_alive)
             return
         log.info("gaming mode: voice moved to %s in %.1f s", self.cfg.gaming_model, time.monotonic() - t)
 
     async def _to_normal_model(self) -> None:
         t = time.monotonic()
         await self._ollama(self.cfg.gaming_model, 0)
-        await self._ollama(self.cfg.normal_model, self.keep_alive)
+        if self.normal_on_ollama:
+            await self._ollama(self.cfg.normal_model, self.keep_alive)
         log.info("gaming mode: voice back on %s in %.1f s", self.cfg.normal_model, time.monotonic() - t)
 
     def _write_status(self) -> None:

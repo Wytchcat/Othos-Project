@@ -59,19 +59,7 @@ def assistant_heard_as() -> list[str]:
     return _words(_assistant().get("heard_as"))
 
 
-def assistant_logo() -> str:
-    """An image file (PNG or SVG) for the call page and the app icon; '' = the green chip."""
-    v = _assistant().get("logo")
-    if not isinstance(v, str) or not v.strip():
-        return ""
-    p = Path(v.strip())
-    return str(p if p.is_absolute() else HERE / p)
-
-
-def assistant_color() -> str:
-    """An accent colour like "#9d7bff" for the name and logo; '' = the board's green."""
-    v = _assistant().get("color")
-    return v.strip() if isinstance(v, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", v.strip()) else ""
+# (the assistant's "logo" and "color" are read straight from personal.json by the app, Othos.cs, and the call page)
 
 
 def name() -> str:

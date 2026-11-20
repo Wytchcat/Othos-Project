@@ -1,0 +1,8 @@
+{
+  "_about": "Which engine runs voice Othos's conversation model. 'ollama' (as before) or 'llama-server' (llama.cpp's own server, with a prompt top that never changes, two slots and the instructions kept between calls: llm_server.py). Empty llama_server_exe = the newest Documents\\llama.cpp\\*\\llama-server.exe. threads 0 = this PC's cores minus 2, so hearing and the voice keep some; 6 was tried Nov 20 and was slower (reading 5-9 tokens/s, writing 1.7-4, against 10-17 and 4-5.5 with 8), so it's back to 0.",
+  "backend": "llama-server",
+  "llama_server_exe": "",
+  "port": 11440,
+  "threads": 0,
+  "context_per_slot": 6144
+}

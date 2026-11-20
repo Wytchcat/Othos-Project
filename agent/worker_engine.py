@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -198,6 +199,30 @@ FREE_TOKENS_GRACE = 300   # carry on 5 minutes after free tokens are back (the u
 NOT_COMPLETE = "NOT COMPLETE, doesn't check clean"
 
 
+class CheckInTimer:
+    """Calls `fire` whenever `due()` says so, checked every `every_s` seconds on its own thread, until stop(): a
+    long job's "See me" check-in keeps its own time, so a quiet step can't hold it back (Nov 18, Smithy task 60: due
+    at 30 minutes, it came at 48, while one step on this PC's model said nothing for 40 minutes)."""
+
+    def __init__(self, due, fire, every_s: float = 15, name: str = "check-in"):
+        self.due, self.fire, self.every_s, self.name = due, fire, every_s, name
+        self._stop = threading.Event()
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self.every_s):
+            try:
+                if self.due():
+                    self.fire()
+            except Exception as e:                       # a check-in never stops the task
+                log.info("%s: check-in skipped (%s)", self.name, e)
+
+    def start(self) -> None:
+        threading.Thread(target=self._loop, name=self.name, daemon=True).start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
 class TaskContext:
     """What a several-step task (run=...) gets: the model, and a chat() that keeps
     pausing, stopping and the progress figure working across all its steps."""
@@ -355,9 +380,13 @@ class Worker:
         # backwards for an hour with nothing said); 0 turns it off
         every = 60 * float(self.cfg.get("see_me_minutes", 30) or 0)
         next_see_me = [time.monotonic() + every]
+        see_me_lock = threading.Lock()                 # the step and the timer never both say it
 
         def see_me() -> None:
-            next_see_me[0] = time.monotonic() + every
+            with see_me_lock:
+                if time.monotonic() < next_see_me[0]:
+                    return
+                next_see_me[0] = time.monotonic() + every
             mins = (time.time() - self.current["started"]) / 60
             on = backend.used[-1] if isinstance(backend, worker_cloud.Chain) and backend.used else model
             try:
@@ -390,6 +419,12 @@ class Worker:
         if isinstance(backend, worker_cloud.Chain) and \
                 str((self.cfg.get("cloud") or {}).get("when_all_out", "ask")).lower() != "local":
             backend.ask = lambda back: self._wait_for_tokens(row, back, deadline)
+        # the check-in keeps its own time, so a quiet step can't hold it back (Nov 18, task 60: due at 30 minutes, it
+        # came at 48, while this PC's model worked 40 minutes on one step and said nothing)
+        ticker = CheckInTimer(lambda: every > 0 and time.monotonic() >= next_see_me[0] and self.current is not None,
+                              see_me, name=f"see-me-{row['id']}")
+        if every > 0:
+            ticker.start()
         t0 = time.monotonic()
         artifact = None
         try:
@@ -429,6 +464,7 @@ class Worker:
             time.sleep(5)
             return
         finally:
+            ticker.stop()
             self.current = None
         if copied_back(params.get("path"), full):
             # small models sometimes describe the file and paste it back instead of reviewing it

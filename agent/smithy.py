@@ -20,9 +20,9 @@ worker_engine.py.
     smithy.py continue ID                  a stopped or failed build carries on from the files it wrote
     smithy.py replay ID [RUN]              The Smithy's own decisions on a task's last test run, no model,
                                            nothing run: where each fix would go, and what would hold it back
-    smithy.py decide ID TEST test|code     an override only: The Smithy judges a test that keeps failing
+    smithy.py decide ID TEST test|code|both  an override only: The Smithy judges a test that keeps failing
                                            itself; this replaces its judgment ("test" = the test is wrong,
-                                           "code" = the code is wrong)
+                                           "code" = the code is wrong, "both" = each is)
     smithy.py add joomla WHAT [--file PATH]
     smithy.py add followup ID QUESTION     (on a build: a new version)
     smithy.py add ... --provider NAME      on another model provider (worker_cloud.py; off by default)
@@ -112,7 +112,7 @@ def _cloud(argv: list[str]) -> bool:
         return True
     if cmd == "decide":                                  # an override of The Smithy's own judgment of a locked test
         if len(argv) < 5 or not argv[2].isdigit():
-            raise SystemExit("usage: smithy.py decide TASK_ID TEST_NAME test|code")
+            raise SystemExit("usage: smithy.py decide TASK_ID TEST_NAME test|code|both")
         try:
             print(smithy_jobs.decide(int(argv[2]), argv[3], argv[4].lower()))
         except ValueError as e:

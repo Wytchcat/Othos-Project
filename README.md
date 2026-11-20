@@ -1,6 +1,9 @@
 # Othos
 
-*Othos Project V1*
+*Othos Project V1 (beta)*
+
+> **Beta:** Othos and The Smithy are beta versions. They work, but they are still being
+> built and tested, so expect rough edges and changes between updates.
 
 **Full guide:** a step-by-step beginner's guide is in [docs/index.html](docs/index.html). Download
 Othos, then open that file in your browser (it works offline, no internet needed).

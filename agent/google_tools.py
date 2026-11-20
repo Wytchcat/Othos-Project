@@ -222,6 +222,27 @@ def _email_from(id_token: str) -> str:
         return ""
 
 
+def forbidden_reason(r: httpx.Response) -> str:
+    """Google's real reason for a 403, in plain words. Nov 18: the Calendar API was switched off in her own Google
+    project, and every 403 was reported as "permission not given". Never includes the project number."""
+    try:
+        err = r.json().get("error")
+    except ValueError:
+        err = None
+    err = err if isinstance(err, dict) else {}
+    found = {str(x.get("reason", "")) for key in ("errors", "details") for x in err.get(key, []) if isinstance(x, dict)}
+    found.add(str(err.get("status", "")))
+    if found & {"accessNotConfigured", "SERVICE_DISABLED"}:
+        return ("The Google Calendar API isn't switched on in your Google Cloud project. In the Google Cloud console open "
+                "APIs & Services, then Library, find Google Calendar API and press Enable. Then ask me again.")
+    if found & {"insufficientPermissions", "ACCESS_TOKEN_SCOPE_INSUFFICIENT"}:
+        return "Google won't let Othos read the calendar (permission not given). Press Connect again and tick the calendar."
+    if found & {"rateLimitExceeded", "userRateLimitExceeded", "RESOURCE_EXHAUSTED", "quotaExceeded"}:
+        return "Google says there have been too many requests just now. Try again in a minute."
+    msg = re.sub(r"\bproject \d+", "your project", str(err.get("message", "")))[:160]
+    return f"Google said no (403): {msg}".rstrip(": ") if msg else "Google said no (403)."
+
+
 def _google_said(r: httpx.Response) -> str:
     try:
         j = r.json()
@@ -310,7 +331,7 @@ def events(start: datetime, end: datetime, http_client: httpx.Client | None = No
         _cache.update(token="", until=0.0)
         raise NeedsConnect("Google needs you to connect again.")
     if r.status_code == 403:
-        raise GoogleError("Google won't let Othos read the calendar (permission not given). Press Connect again and tick the calendar.")
+        raise GoogleError(forbidden_reason(r))
     if r.status_code != 200:
         raise GoogleError(_google_said(r))
     out = []

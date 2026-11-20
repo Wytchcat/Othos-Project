@@ -216,6 +216,29 @@ def _summary(job) -> str:
     return speakable(s)
 
 
+def _brief(text: str, limit: int = 220) -> tuple[str, bool]:
+    """A spoken result cut to what matters by voice (Nov 20: a failed build's checker lines, with file names and line
+    numbers, were read aloud for 40 s): up to the first bracket, at most two sentences and `limit` characters.
+    Returns (text, was it cut)."""
+    t = (text or "").strip()
+    out = t
+    cut = out.find("(")
+    if cut > 30:
+        out = out[:cut].rstrip(" :;,-")
+    out = " ".join(re.split(r"(?<=[.!?])\s+", out)[:2])
+    if len(out) > limit:
+        out = out[:limit].rsplit(" ", 1)[0].rstrip(",;:- ")
+    if out and out[-1] not in ".!?":
+        out += "."
+    return out, out.rstrip(".!? ") != t.rstrip(".!? ")
+
+
+def _brief_summary(q: Queue, job) -> str:
+    """The spoken summary, short, with a pointer to the rest when something was left out."""
+    text, cut = _brief(_summary(job))
+    return text + (f" Say read me {_name(q, job['id'])} for the details." if cut else "")
+
+
 def _readme_about(job, words: int = 70) -> str:
     """The README's opening paragraph (what it is), with code and headings left out, a few sentences long."""
     try:
@@ -234,7 +257,7 @@ def _readme_about(job, words: int = 70) -> str:
     return out
 
 
-def _title(q: Queue, job) -> str:
+def _own_title(q: Queue, job) -> str:
     if job["title"]:
         return job["title"]
     jt = REGISTRIES[q.key].get(job["type"])
@@ -244,8 +267,92 @@ def _title(q: Queue, job) -> str:
         return job["type"]
 
 
+_VERSION_TITLE = re.compile(r"^version (\d+) of .+ task \d+$", re.I)
+
+
+def _title(q: Queue, job) -> str:
+    """What a task is, in words that still make sense a day later. A new version is titled only "version 6 of Smithy
+    task 63" (The Smithy's own title), so it's followed back through its parents to the task it started from:
+    "version 6 of the build: floss calculator" (the user, Nov 19: "what's the current task?" got only task numbers)."""
+    title = _own_title(q, job)
+    m = _VERSION_TITLE.match(title.strip())
+    if not m:
+        return title
+    root = job
+    for _ in range(12):
+        try:
+            parent = int(json.loads(root["params"] or "{}").get("parent_id") or 0)
+        except (ValueError, TypeError):
+            parent = 0
+        nxt = q.get(parent) if parent else None
+        if not nxt:
+            break
+        root = nxt
+    if root is job:
+        return title
+    base = _own_title(q, root)
+    return title if _VERSION_TITLE.match(base.strip()) else f"version {m.group(1)} of {base}"
+
+
+def _ago(ts, now: float | None = None) -> str:
+    """'12 minutes ago', '3 hours ago', else the clock time ('at 11:03 AM', 'yesterday at 4:10 PM')."""
+    import time as _t
+    now = now or _t.time()
+    secs = max(0, now - float(ts))
+    if secs < 90:
+        return "just now"
+    if secs < 3600:
+        return f"{round(secs / 60)} minutes ago"
+    if secs < 6 * 3600:
+        hours = round(secs / 3600)
+        return f"{hours} hour{'s' if hours != 1 else ''} ago"
+    return _spoken_time(ts)
+
+
+def _latest_step(q: Queue, job_id: int) -> str:
+    """The running task's latest step line ('Writing the answer.'), from the steps file; '' if none."""
+    try:
+        path = worker_engine.steps_path(q.status_path)
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            f.seek(max(0, size - 20000))
+            lines = f.read().decode("utf-8", errors="replace").splitlines()
+    except Exception:
+        return ""
+    for line in reversed(lines):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        text = str(d.get("text", "")).strip()
+        if d.get("task") == job_id and text and not _DONE_STEP.match(text):
+            return speakable(text[:200])
+    return ""
+
+
 def _name(q: Queue, job_id: int) -> str:
     return f"{q.spoken} {job_id}"                     # "Smithy task 3", "Firestarter task 5"
+
+
+def _ready_line(q: Queue) -> str:
+    """'44 results are waiting for your review; the newest is Smithy task 67, <title>. Say read me Smithy task 67 to
+    hear it', or '' when nothing waits (Nov 19 call: "What is the Smithy doing?" got only "nothing queued")."""
+    n = int(q.counts().get("review", 0))
+    if not n:
+        return ""
+    j = q.by_status("review", limit=1)[0]
+    lead = "1 result is waiting" if n == 1 else f"{n} results are waiting"
+    when = f", finished {_ago(j['finished'])}" if j["finished"] else ""
+    return (f"{lead} for your review; the newest is {_name(q, j['id'])}, {_title(q, j)}{when}. "
+            f"Say read me {_name(q, j['id'])} to hear it")
+
+
+_COUNT_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "couple": 2, "couple of": 2, "few": 3}
+# "its last two task results", "the latest result", "the most recent tasks" (the worker's name taken out first)
+_LATEST = re.compile(r"\b(?:last|latest|newest|most\s+recent|recent)\s+(?:(?P<n>one|two|three|four|five|couple(?:\s+of)?|"
+                     r"few|[1-5])\s+)?(?:(?:task|coding|build)\s+)?(?P<what>results?|tasks?|reviews?|builds?)\b", re.I)
+LAST_WHO_SECONDS = 300   # "its last results" means the worker talked about within this long
+QUIET_SECONDS = 3.0      # an announcement waits this long after speech-to-text last heard her
 
 
 def _not_running(q: Queue) -> str:
@@ -367,6 +474,8 @@ class WorkersVoice:
         # read: {"q", "id", "stage": "intro" | "decide" | "confirm", "text", "ts"}. Conversational: yes
         # builds it, no leaves it waiting (never dropped by voice), anything else is read back first.
         self.plan_pending: dict | None = None
+        self._last_who: tuple[str | None, float] = (None, 0.0)       # the worker last named, for "its last results"
+        self._last_heard = 0.0                                      # when speech-to-text last heard her (any piece)
 
     # -- one turn: a reply from code ('' = say nothing), or None for "not about the workers"
     def handle(self, text: str) -> str | None:
@@ -395,7 +504,7 @@ class WorkersVoice:
         pending, self.pending = self.pending, None
         if pending:
             q, job_id, verdict = pending
-            ans = worker_shared.answer(text)
+            ans = worker_shared.answer(text, verdict)        # "keep it" is a yes only to a keep question
             if ans == "yes":
                 done = q.decide(job_id, text, verdict)
                 return (f"Okay, {_name(q, job_id)} is marked {verdict}." if done else
@@ -413,6 +522,14 @@ class WorkersVoice:
         who, t = _who(text)
         if who == "firestarter" and not HAS_FIRESTARTER:
             return NO_FIRESTARTER
+        if who:
+            self._last_who = (who, time.time())
+        if m := _LATEST.search(t):
+            # "What are its last two task results?" right after asking about the Smithy (Nov 19 call: the model said
+            # "I don't have access to that information")
+            recent = self._last_who[0] if time.time() - self._last_who[1] < LAST_WHO_SECONDS else None
+            if who or recent or re.search(r"\btasks?\b", t, re.I):
+                return self._latest(who or recent, m)
         if m := _MARK.search(t):
             return self._ask_mark(who, _first(m), "kept" if m.group("verb").lower() == "keep" else "discarded")
         if m := _ASK.search(t):
@@ -652,6 +769,25 @@ class WorkersVoice:
         return "", "", f"I couldn't find a file called {name} in the Othos folders the Smithy may read."
 
     # -- listing and progress
+    def _latest(self, who: str | None, m: re.Match) -> str:
+        """The newest finished tasks with their spoken summaries, newest first."""
+        word = (m.group("n") or "").lower()
+        n = int(word) if word.isdigit() else _COUNT_WORDS.get(re.sub(r"\s+", " ", word), 0)
+        n = n or (1 if not m.group("what").lower().endswith("s") else 2)
+        done = ("review", "kept", "discarded", "failed")
+        jobs = sorted(((q, j) for q in self._queues(who) for j in q.by_status(*done, limit=n)),
+                      key=lambda qj: (qj[1]["finished"] or 0, qj[1]["id"]), reverse=True)[:n]
+        if not jobs:
+            return f"{self._queues(who)[0].name if who else 'The workers'} {'has' if who else 'have'}n't finished any tasks yet."
+        lines = []
+        for q, j in jobs:
+            state = {"review": "waiting for your review", "kept": "kept", "discarded": "discarded",
+                     "failed": "it failed"}.get(j["status"], j["status"])
+            summary = _summary(j)
+            lines.append(f"{_name(q, j['id'])}, {_title(q, j)}, {state}." + (f" {summary}" if summary else ""))
+        q0, j0 = jobs[0]
+        return " ".join(lines) + f" Say read me {_name(q0, j0['id'])} for the full result."
+
     def _list_done(self, who: str | None) -> str:
         jobs = [(q, j) for q in self._queues(who) for j in q.by_status("review", limit=6)]
         if not jobs:
@@ -660,32 +796,36 @@ class WorkersVoice:
         return f"{len(jobs)} ready: {names}. Say read me, and the task."
 
     def _status(self, who: str | None) -> str:
-        """What each worker is doing, what's ready and what's waiting, in a sentence or two."""
+        """What each worker is doing right now (and since when, and its latest step), then what's ready and what's
+        waiting. Written to make sense a day after the task started (the user, Nov 19)."""
         parts = []
         for q in self._queues(who):
             running = q.by_status("running", limit=1)
-            ready = q.by_status("review", limit=6)
             queued = q.by_status("queued", limit=6)
             bits = []
             if running:
                 job = running[0]
                 s = q.read_status()
+                live = q.running() and s.get("task_id") == job["id"]
                 pct = ""
-                if q.running() and s.get("task_id") == job["id"] and s.get("progress"):
+                if live and s.get("progress"):
                     pct = f", about {int(float(s['progress']) * 100)} percent done"
-                still = "is still running" if q.running() else f"is waiting for you to open {q.app}"
-                bits.append(f"{_name(q, job['id'])}, {_title(q, job)}, {still}{pct}")
-            if ready:
-                names = "; ".join(f"{_name(q, j['id'])}, {_title(q, j)}" for j in ready[:3])
-                what = "result" if len(ready) == 1 else "results"
-                bits.append(f"{q.name} has {len(ready)} {what} ready: {names}. "
-                            f"Say read me {_name(q, ready[0]['id'])} to hear it")
-            if queued:
-                bits.append(f"{len(queued)} more waiting in the queue")
-            if not bits:
-                parts.append(f"{q.name} has nothing running or ready" + ("" if q.running() else ", and isn't running"))
+                since = f", started {_ago(job['started'])}" if job["started"] else ""
+                if live:
+                    step = _latest_step(q, job["id"])
+                    bits.append(f"{q.name} is working on {_name(q, job['id'])}, {_title(q, job)}{since}{pct}"
+                                + (f". Its latest step: {step}" if step else ""))
+                else:
+                    bits.append(f"{_name(q, job['id'])}, {_title(q, job)}{since}, is waiting for you to open {q.app}")
             else:
-                parts.append(". ".join(bits[:1] + [b[0].upper() + b[1:] for b in bits[1:]]))
+                bits.append(f"Nothing is running in {q.name} right now" + ("" if q.running() else ", and it isn't open"))
+            ready = _ready_line(q)
+            if ready:
+                bits.append(ready)
+            if queued:
+                names = "; ".join(f"{_name(q, j['id'])}, {_title(q, j)}" for j in reversed(queued[:3]))
+                bits.append(f"{len(queued)} more waiting in the queue: {names}")
+            parts.append(". ".join(b.rstrip(".") for b in bits))
         return ". ".join(parts) + "."
 
     def _queue(self, who: str | None) -> str:
@@ -693,12 +833,17 @@ class WorkersVoice:
         for q in self._queues(who):
             running = q.by_status("running", limit=1)
             queued = q.by_status("queued", limit=6)
+            ready = _ready_line(q)
             if not running and not queued:
-                parts.append(f"{q.name} has nothing queued" + ("" if q.running() else ", and isn't running"))
+                parts.append(f"{q.name} has nothing running or queued" + ("" if q.running() else ", and isn't running")
+                             + (f". {ready[0].upper()}{ready[1:]}" if ready else ""))
                 continue
             bits = []
             if running:
-                bits.append(f"is working on {_name(q, running[0]['id'])}, {_title(q, running[0])}")
+                since = f", started {_ago(running[0]['started'])}" if running[0]["started"] else ""
+                step = _latest_step(q, running[0]["id"]) if q.running() else ""
+                bits.append(f"is working on {_name(q, running[0]['id'])}, {_title(q, running[0])}{since}"
+                            + (f". Its latest step: {step.rstrip('.')}" if step else ""))
             if queued:
                 bits.append(f"has {len(queued)} waiting: " +
                             "; ".join(f"task {j['id']}, {_title(q, j)}" for j in reversed(queued[:4])))
@@ -707,7 +852,7 @@ class WorkersVoice:
                 bits.append(f"is waiting for {s.get('waiting_for_cpu') or 'the other worker'} to finish")
             if not q.running():
                 bits.append(f"isn't running, so nothing will start until you open {q.app}")
-            parts.append(f"{q.name} " + ", and ".join(bits))
+            parts.append(f"{q.name} " + ", and ".join(bits) + (f". {ready[0].upper()}{ready[1:]}" if ready else ""))
         return ". ".join(parts) + "."
 
     def _progress(self, who: str | None, job_id: int) -> str:
@@ -973,17 +1118,27 @@ class WorkersVoice:
         return q.key == "smithy" and j["status"] == "review" and smithy_jobs.load_proposal(int(j["id"])) is not None
 
     def _away_question(self, jobs) -> str:
-        """Plans waiting for her answer first, since they're the ones that need her (Nov 14, suggestion 5)."""
+        """Asked after the greeting's well-being exchange, not in the greeting (the user, Nov 20: inside the greeting it
+        broke the flow): 'A task finished since we last spoke. Want to hear about it?' Plans waiting for her answer
+        come first, since they're the ones that need her (Nov 14, suggestion 5)."""
         plans = sum(1 for q, j in jobs if self._is_plan(q, j))
         rest = len(jobs) - plans
         bits = []
         if plans:
             bits.append("a build plan is waiting for your answer" if plans == 1 else f"{plans} build plans are waiting for your answer")
         if rest:
-            bits.append(("a task" if rest == 1 else f"{rest} tasks") + " finished" if plans else
-                        ("a task finished" if rest == 1 else f"{rest} tasks finished"))
+            bits.append(("a task finished" if rest == 1 else f"{rest} tasks finished") + " since we last spoke")
         what = "it" if len(jobs) == 1 else "them"
-        return f"While you were away, {' and '.join(bits)}. Want to hear about {what}?"
+        text = " and ".join(bits)
+        return f"{text[0].upper()}{text[1:]}. Want to hear about {what}?"
+
+    def _she_has_spoken(self) -> bool:
+        """She has said something in this call (so the greeting's well-being exchange has begun)."""
+        try:
+            items = list(getattr(getattr(self.session, "history", None), "items", []) or [])
+        except Exception:
+            return False
+        return any(getattr(i, "role", None) == "user" for i in items)
 
     def _away_reply_text(self, jobs) -> str:
         jobs = sorted(jobs, key=lambda qj: not self._is_plan(*qj))           # plans first
@@ -991,11 +1146,11 @@ class WorkersVoice:
         if plans and len(jobs) > 1:
             q, j = plans[0]
             others = len(jobs) - 1
-            return (f"First, the plan for {_name(q, j['id'])}, {_title(q, j)}. {_summary(j)}" + self._plan_hook(q, j)
+            return (f"First, the plan for {_name(q, j['id'])}, {_title(q, j)}. {_brief_summary(q, j)}" + self._plan_hook(q, j)
                     + f" After that, {others} more: ask what's ready when you want them.")
         if len(jobs) == 1:
             q, j = jobs[0]
-            return f"{_name(q, j['id'])}, {_title(q, j)}, finished. {_summary(j)}" + self._plan_hook(q, j)
+            return f"{_name(q, j['id'])}, {_title(q, j)}, finished. {_brief_summary(q, j)}" + self._plan_hook(q, j)
         names = "; ".join(f"{_name(q, j['id'])}, {_title(q, j)}" for q, j in jobs[:5])
         more = f", and {len(jobs) - 5} more" if len(jobs) > 5 else ""
         return f"{len(jobs)} tasks finished: {names}{more}. Say read me, and the task."
@@ -1007,12 +1162,14 @@ class WorkersVoice:
 
     def _away_answer(self, text: str) -> str | None:
         jobs = self.away or []
-        # each sentence on its own; a no anywhere wins (Nov 16: "Sure. No. Not currently." was an answer to
+        # each sentence on its own, for the yes as well (Nov 19, 13:51: "I'd love to hear about it. Yes." was neither, the
+        # offer was dropped, and the model made up an answer); a no anywhere wins (Nov 16: "Sure. No. Not currently." was an answer to
         # another question merged with this one, and the list was read)
         parts = [p for p in re.split(r"[.!?;,]+", text) if p.strip()] or [text]
         if _AWAY_NO.search(text) or any(_AWAY_NO.search(p) for p in parts):
             ans = "no"
-        elif _AWAY_YES.search(text) or worker_shared.answer(text) == "yes":
+        elif (_AWAY_YES.search(text) or any(_AWAY_YES.search(p.strip()) for p in parts)
+              or worker_shared.answer(text) == "yes"):
             ans = "yes"
         else:
             self._away_drop()                          # something else: carry on with what she said
@@ -1223,10 +1380,30 @@ class WorkersVoice:
                 return (getattr(item, "text_content", "") or "").rstrip().endswith("?")
         return False
 
+    def heard(self) -> None:
+        """Speech-to-text heard a piece of what she said (called for every piece, finished or not)."""
+        self._last_heard = time.monotonic()
+
+    def _owes_reply(self) -> bool:
+        """Her last words haven't been answered yet (the newest message in the call is hers)."""
+        try:
+            items = list(getattr(getattr(self.session, "history", None), "items", []) or [])
+        except Exception:
+            return False
+        for item in reversed(items):
+            role = getattr(item, "role", None)
+            if role in ("user", "assistant"):
+                return role == "user"
+        return False
+
     def _between_turns(self) -> bool:
+        # The voice detector can fall behind when the PC is busy (Nov 19: Discord opening put it 19 s behind), and
+        # then says she's quiet while she's mid-sentence. So also wait until speech-to-text has heard nothing for a
+        # few seconds and her last words have had their reply (the away question came out in the middle of hers).
         s = self.session
         return (getattr(s, "agent_state", "") == "listening" and getattr(s, "user_state", "") != "speaking"
-                and (s.current_speech is None or s.current_speech.done()))
+                and (s.current_speech is None or s.current_speech.done())
+                and time.monotonic() - self._last_heard >= QUIET_SECONDS and not self._owes_reply())
 
     async def _announce_loop(self) -> None:
         first, held = True, 0.0
@@ -1271,6 +1448,9 @@ class WorkersVoice:
                         await asyncio.sleep(5)              # a plan's "is ready" asks too: after her answer
                         continue
                     if jobs:
+                        if first and not self._she_has_spoken():
+                            await asyncio.sleep(2)          # not before the greeting's "How are things?" has had its answer
+                            continue
                         if first:   # finished while the user was away: ask first (the user, Nov 14)
                             first = False
                             self.away, self._away_ts = jobs, time.time()
@@ -1281,7 +1461,7 @@ class WorkersVoice:
                             continue
                         else:
                             q, j = jobs[0]
-                            text, done = f"{_name(q, j['id'])}, {_title(q, j)}, is ready. {_summary(j)}", [jobs[0]]
+                            text, done = f"{_name(q, j['id'])}, {_title(q, j)}, is ready. {_brief_summary(q, j)}", [jobs[0]]
                             text += self._plan_hook(q, j)       # a plan: asks for her answer
                         for q, j in done:
                             await asyncio.to_thread(q.mark_announced, j["id"])
@@ -1331,6 +1511,7 @@ _PLAN_LATER = re.compile(r"\b(?:not\s+(?:yet|now|today)|later|hold\s+on|wait|ano
 _AWAY_YES = re.compile(r"^\W*(?:(?:othos|osos|um+|uh+|oh|well)\W+)*(?:yes|yeah|yep|yup|sure|ok(?:ay)?|go\s+ahead|"
                        r"please|tell\s+me(?=\W*$|\s+about\s+(?:them|it|those)|\s+more)|read\s+(?:them|it)|"
                        r"let'?s\s+hear|i'?d\s+like\s+that|go\s+on|"
+                       r"(?:i'?d|i\s+would|i\s+do|i)\s+(?:really\s+)?(?:love|like|want)\s+to\s+(?:hear|know|see)|"
                        r"absolutely|of\s+course|definitely|what\s+(?:are|were)\s+they|what\s+(?:is|was)\s+it|"
                        r"which\s+ones?|what\s+finished)\b", re.I)
 _AWAY_NO = re.compile(r"^\W*(?:(?:othos|osos|um+|uh+|oh|well)\W+)*(?:no|nope|nah|not\s+(?:now|yet|right\s+now|currently)|"

@@ -43,9 +43,12 @@ import gaming  # gaming mode: gaming.py + gaming.json
 from workers_voice import WorkersVoice  # Firestarter (site work) and the Smithy (coding) by voice
 import workers_voice  # (its INSTALLED list, for the self-check)
 import selfcheck  # the quiet self-check behind "How are you?"
+import voices  # who is speaking, when speech-to-text labels speakers (feeds guest mode)
+import llm_server  # the conversation on llama-server when voice-llm.json says so (a prompt top that never changes)
 import searchctx  # searches keep the topic and the user's town: searchctx.py
 import library  # the user's own saved reference pages: library.py
 import google_tools  # Google Calendar (read-only) once connected: google_tools.py, google-connect.ps1
+import held as holdon  # what the user asked Othos to hold on to (held.py: permanent disability, pronouns, names): caught by code, kept in state\held.json
 import humor  # hints about the jokes ("go easy on the puns"): caught by code, kept in state\humor.json
 import sources  # free sources tried before Tavily: sources.py
 import personal  # the user's name, town, feeds and respellings: personal.json
@@ -421,8 +424,17 @@ def _warm_models() -> None:
     """Load both models in Ollama and keep them loaded (runs in a background
     thread at worker start, so it never holds up a call)."""
     try:
-        httpx.post(f"{_OLLAMA_ROOT}/api/generate", timeout=60,
-                   json={"model": os.getenv("OLLAMA_MODEL", "llama3.2:3b"), "keep_alive": KEEP_ALIVE})
+        if llm_server.enabled():
+            # the conversation runs on llama-server (llm_server.py): start it; Ollama keeps notes search and the camera
+            if not llm_server.start(os.getenv("OLLAMA_MODEL", "llama3.2:3b")):
+                log.warning("llama-server isn't running: calls can't get replies until it does (voice-llm.json)")
+            else:
+                # Ollama's own copy of the same model would stay loaded (keep_alive -1m) and double the memory
+                httpx.post(f"{_OLLAMA_ROOT}/api/generate", timeout=30,
+                           json={"model": os.getenv("OLLAMA_MODEL", "llama3.2:3b"), "keep_alive": 0})
+        else:
+            httpx.post(f"{_OLLAMA_ROOT}/api/generate", timeout=60,
+                       json={"model": os.getenv("OLLAMA_MODEL", "llama3.2:3b"), "keep_alive": KEEP_ALIVE})
         if not backfill_note_vectors():
             _embed_sync(["search_query: warm up"])
     except Exception as e:
@@ -440,6 +452,30 @@ log = logging.getLogger("othos")
 _TOOL_WORD = re.compile(r"^\s*(?:save_note|search_notes|web_search|more_results)\b[\s:(\"']*", re.I)
 _LEAK_START = re.compile(r'^\s*[\[{]?\s*"?(name|function|tool_call)"?\s*[:=]', re.IGNORECASE)
 _LEAK_CHECK_CHARS = 12  # characters held back before deciding it is normal speech
+# Replies that say Othos is searching right now. On a turn with no search, a reply is held back only while it could
+# still turn out to be one of these, so "I'm glad..." or "Let me think" is spoken at once.
+_CLAIMS = ("let me check", "let me look", "let me search", "let me see if i can find", "let me find", "let me google",
+           "let me do a search", "let me do a web search", "let me do a quick search", "let me do a quick web search",
+           "i'll search", "i'll check", "i'll look that up", "i'll look it up", "i'll do a search", "i'll do a web search",
+           "i'll do a quick search", "i'll do a quick web search", "i'll run a search", "i'll run a web search",
+           "i'll run a quick search", "i will search", "i will check", "i will do a web search", "i'm searching",
+           "i'm checking", "i'm looking that up", "i'm looking it up", "searching now", "searching for", "checking now",
+           # said as done, with nothing searched (Nov 19, 13:34: "I've looked up some options for you" after a yes)
+           "i've looked up", "i have looked up", "i've searched", "i have searched", "i've done a search",
+           "i've done a web search", "i've run a search")
+_CLAIM_LEAD = re.compile(r"^(?:ok(?:ay)?|sure|alright|all right)\b\W*")
+
+
+def _claim_state(held: str) -> str:
+    """'yes' (the reply claims a lookup), 'maybe' (it still could) or 'no'."""
+    t = re.sub(r"\s+", " ", held.replace("’", "'").lower()).lstrip(" \t\n\"'.,!?-")
+    if t and any(w.startswith(t) for w in ("okay", "ok", "sure", "alright", "all right")):
+        return "maybe"
+    t = _CLAIM_LEAD.sub("", t)
+    for c in _CLAIMS:
+        if t.startswith(c) and (len(t) == len(c) or not t[len(c)].isalnum()):
+            return "yes"
+    return "maybe" if any(c.startswith(t.rstrip()) for c in _CLAIMS) and not t.endswith((".", "!", "?")) else "no"
 # llama3.2 sometimes starts a reply with its own role label: "assistant\n\nHello..."
 _ROLE_PREFIX = re.compile(r"^\s*assistant\s*:?\s*\n+", re.IGNORECASE)
 _ROLE_ONLY = re.compile(r"^\s*assistant\s*[:.!]?\s*$", re.IGNORECASE)  # checked once the reply has ended
@@ -528,6 +564,132 @@ _FILLER_ONLY = re.compile(r"^\W*(?:also|and|so|um+|uh+|hmm+|er+|well|but|oh|like
                           r"othos|otis|orthos|othus)\W*$", re.I)
 
 
+# A turn cut off mid-question: it ends on a word that can't end a sentence and has no closing mark ("What are its",
+# Nov 19 call: the rest, "last two task results?", came as its own turn and neither half was understood)
+_CUT_OFF = re.compile(r"\b(?:its|the|a|an|my|your|our|their|of|with|and|or|but|from|some|any|if|because|than|into|"
+                      r"to|about|for|whether|which|whose|what|why|how|when|where|who)\s*,?\s*$"
+                      r"|\b(?:can|could|shall|should|will|would|do|does|did|may|might)\s+(?:we|you|i|they)\s*,?\s*$",
+                      re.I)   # the second half: "Okay. Can we" (Nov 19, 13:34: answered with "Sorry, I didn't catch...")
+
+
+def _dangling(text: str) -> bool:
+    """True for a turn the user hasn't finished ("What are its", "Can you tell me about the")."""
+    t = (text or "").strip()
+    return bool(t) and not re.search(r"[.?!]\W*$", t) and bool(_CUT_OFF.search(t))
+
+
+def _filler_turn(text: str, pending: list[str]) -> str | None:
+    """A turn that's only "Oh," / "Also,": 'silent' (the user is still talking), or 'answer_pending' when the turn
+    before it is still unanswered (Nov 18: the user's "Oh," dropped the reply to Tina's "Hello, Othos. How are you?").
+    None when it isn't a filler-only turn."""
+    if not _FILLER_ONLY.match(text.strip()):
+        return None
+    real = [p for p in pending if not _FILLER_ONLY.match(p.strip())]   # "Also," then "um": still waiting
+    return "answer_pending" if real else "silent"
+
+
+def _earlier_question(chat_ctx) -> str | None:
+    """The search query for the user's last real question before this turn (skipping "Please do." and "Go ahead."),
+    or None. For a yes to Othos's own "Can I look that up?" (Nov 19 call: "Please do" never searched).
+    A short fragment between ("Plant nurseries.", said to sharpen the question) is skipped and added to the query
+    (Nov 19, 13:33: the walk stopped at the fragment, found nothing, and no search ran)."""
+    fragments: list[str] = []
+    for i in reversed(chat_ctx.items[:-1]):
+        if not (isinstance(i, llm.ChatMessage) and i.role == "user"):
+            continue
+        said = (i.text_content or "").strip()
+        if not said or _YES_ONLY.match(said) or _FILLER_ONLY.match(said):
+            continue
+        q = _searchable(said, chat_ctx)
+        if q:
+            extra = " ".join(re.sub(r"[.?!,]+$", "", f).strip() for f in reversed(fragments))
+            return f"{extra} {q}".strip() if extra else q
+        if len(said.split()) <= 5:
+            fragments.append(said)
+            continue
+        return None
+    return None
+
+
+def _searchable(said: str, chat_ctx) -> str | None:
+    """The search query for a turn that asks something ("Any new businesses in X?"), or None for small talk, so a
+    promised lookup never searches "It's a sunny morning"."""
+    said = _as_othos(said)
+    if not (_QUESTION.search(said) or _SEARCH_WORDS.search(said) or _LOCAL_NEW.search(said)):
+        return None
+    return _query_from(said, chat_ctx)
+
+
+def _offered_lookup(chat_ctx) -> bool:
+    """Othos's last reply offered to look something up, or said it would."""
+    said = next((i.text_content or "" for i in reversed(chat_ctx.items[:-1])
+                 if isinstance(i, llm.ChatMessage) and i.role == "assistant"), "")
+    return bool(_OFFERS_LOOKUP.search(said))
+
+
+def _unanswered(chat_ctx) -> list[str]:
+    """What the user side said since Othos last spoke, oldest first, without this turn."""
+    out: list[str] = []
+    for i in reversed(chat_ctx.items[:-1]):
+        if isinstance(i, llm.ChatMessage):
+            if i.role == "assistant":
+                break
+            if i.role == "user":
+                out.insert(0, i.text_content or "")
+    return out
+
+
+# ---------------------------------------------------------------- a guest in the room (Nov 18: Tina on speakerphone)
+# One microphone can't tell voices apart, so a guest is known from the introduction. While a guest is there, Othos
+# answers only when someone says its name or right after it asked something: the two of them talking to each other
+# ("He's still thinking.", "Do I say hello?") cut off every reply and got none of their own.
+_G = holdon.NAME_RX
+_GUEST_IN = re.compile(
+    rf"\b(?i:my)\s+(?i:{holdon.RELATION_RX})\s+(?P<a>{_G})(?:\s+(?i:is)|'s)\s+(?i:here|with me|on the phone|on speaker|"
+    rf"joining us|meeting you|listening)\b|"
+    rf"\b(?P<b>{_G})(?:\s+(?i:is)|'s)\s+(?i:here with me|on the phone with me|on speaker|joining us|meeting you)\b|"
+    rf"\b(?i:this is my)\s+(?i:{holdon.RELATION_RX})\s+(?P<c>{_G})\b|"
+    rf"\b(?i:say hi to|say hello to)\s+(?:(?i:my)\s+(?i:{holdon.RELATION_RX})\s+)?(?P<d>{_G})\b|"
+    rf"^\W*(?:(?i:othos)\W+)?(?i:meet)\s+(?:(?i:my)\s+(?i:{holdon.RELATION_RX})\s+)?(?P<e>{_G})\b")
+_ADDRESSED = re.compile(r"\b(?:othos|osos|otis|orthos|othus)\b", re.I)
+
+
+def _guest_intro(text: str) -> str | None:
+    """The guest's name when this turn introduces someone ("my friend Tina is meeting you"), else None."""
+    for m in _GUEST_IN.finditer(text):
+        name = next((g for g in m.groups() if g), None)
+        if name and holdon.name_ok(name):
+            return name
+    return None
+
+
+def _guest_left(text: str, guest: str) -> bool:
+    """'Tina had to go', 'Tina's gone', 'Bye, Tina!'."""
+    g = re.escape(guest)
+    return bool(re.search(rf"\b{g}(?:'s|\s+(?:has|is))?\s+(?:gone|left|off the phone|hung up)\b|"
+                          rf"\b{g}\s+(?:had to go|has to go|had to leave|has to leave|hung up)\b|"
+                          rf"\b(?:bye|goodbye|see you),?\s+{g}\b", text, re.I))
+
+
+def _addressed(text: str) -> bool:
+    """Someone said Othos's name (speech-to-text's usual mishearings included)."""
+    return bool(_ADDRESSED.search(_as_othos(text)))
+
+
+def _guest_turn(text: str, guest: str | None, pending: list[str], last_reply: str,
+                speaker: str | None = None, asked: str | None = None) -> str:
+    """What to do with this turn: 'reply' as usual, 'silent' (the people are talking to each other), or
+    'answer_pending' (a side remark came right after a question to Othos: answer that question).
+    With speaker labels (voices.py), an answer to Othos's question counts only from the person it was asking."""
+    if not guest or _addressed(text):
+        return "reply"
+    if not pending and last_reply.rstrip().endswith("?") and (speaker is None or asked is None or speaker == asked):
+        return "reply"   # Othos just asked something: this is the answer
+    if any(_addressed(p) for p in pending):
+        return "answer_pending"
+    return "silent"
+
+
 # "Oh, so stop." (Othos, stop) went to the model and took 61 s (12:25 PM call): any short
 # turn with a stop word is a stop, however speech-to-text garbles "Othos"
 _SHORT_STOP = re.compile(r"\b(?:stop|enough|never ?mind|quiet|hush|shh+|cancel)\b", re.I)
@@ -606,7 +768,7 @@ def _parse_leaked_call(text: str, tool_names: set[str]) -> tuple[str, str] | Non
 # goes to the notes, not the web.
 _ASKS_NOTES = re.compile(
     r"\b(remember|note|notes|save|saved|remind|appointments?|schedule|calendar|plans?|planned|"
-    r"meetings?|birthday|anniversary|told you|did i (say|tell|mention)|do i have(?! to\b)|"  # not "how old do I have to be"
+    r"meetings?(?!\s+(?:you|him|her|them|us|othos)\b)|birthday|anniversary|told you|did i (say|tell|mention)|do i have(?! to\b)|"  # not "how old do I have to be"
 
     r"am i (busy|free|doing)|don'?t (let me )?forget)\b",
     re.IGNORECASE,
@@ -693,6 +855,20 @@ def _wants_list(text: str) -> bool:
     return bool(_SEARCH_WORDS.search(text)) and not _QUESTION.search(text)
 # "Yes." after "Want to hear more?"
 _YES = re.compile(r"^\W*(yes|yeah|yep|yup|sure|ok|okay|please|go ahead|of course|definitely)\b", re.I)
+# A whole turn that only says yes ("Please do.", "Go ahead.", "Yes, please"): not "Please tell me about X"
+_YES_ONLY = re.compile(r"^\W*(?:(?:yes|yeah|yep|yup|sure|ok(?:ay)?|please|go ahead|of course|definitely|do it|"
+                       r"go for it|do|that'?d be (?:great|nice)|thanks|thank you|othos)\W*){1,4}$", re.I)
+# Othos offered, or said it would, look something up ("Can I look that up for you?", "I'll do a web search.")
+_OFFERS_LOOKUP = re.compile(
+    r"\b(?:(?:can|shall|should) i (?:look (?:that|it|this) up|search|check|find out)|"
+    r"(?:want|would you like) me to (?:look|search|check|find|google)|i can (?:look|search|check)|"
+    r"i'?ll (?:do a |run a )?(?:quick )?(?:web )?search|i'?ll look (?:that|it|this) up)\b", re.I)
+# "Any new businesses in Fairview?", "new restaurants around Riverton": local news a search answers
+# (Nov 19 call: no search was offered, so Othos only said it didn't know)
+_LOCAL_NEW = re.compile(
+    r"(?i:\b(?:any|new|newest|recent|recently opened|just opened)\b[^.?!]{0,30}?\b(?:business(?:es)?|shops?|stores?|"
+    r"restaurants?|caf[eé]s?|bakery|bakeries|bars?|breweries|brewery|places?|openings?|clinics?|markets?)\b"
+    r"[^.?!]{0,20}?\b(?:in|near|around|by)\s+)(?:[A-Z][\w'.-]+)")
 _MORE_WORDS = re.compile(r"\b(more|next|keep going|continue|go on|other results)\b", re.I)
 
 
@@ -805,6 +981,8 @@ _REQUEST_FILLER = re.compile(
 # Left in a query, these mean "personal" (stay private) or "refers back" (needs
 # the conversation to make sense): the model writes those queries instead.
 _PERSONAL = re.compile(r"\b(i|i'm|i've|i'd|my|me|mine|we|our|(?-i:us))\b", re.I)  # "US" is a country
+# "Look that up", "search for it", "google this": the thing to search was said before
+_LOOK_BACK = re.compile(r"\b(?:look|search|google|research|verify|check)(?: (?:for|up|out))? (?:it|that|this|them|those)\b", re.I)
 _REFERS_BACK = re.compile(r"\b(it|its|that|those|they|them|these|he|she|his|her|hers|one|ones)\b", re.I)
 
 
@@ -851,6 +1029,9 @@ def _query_from(text: str, chat_ctx) -> str | None:
             r"\b(?:tell me|search|look up|look into|can you|could you|would you|find out|explain)\b", s, re.I)]
         if asks:
             text = asks[-1]
+    said_before = any(isinstance(i, llm.ChatMessage) and i.role == "user" for i in chat_ctx.items[:-1])
+    if said_before and _LOOK_BACK.search(text):
+        return None  # "You should look that up for me": the filler words below would drop the "that"; the model knows what it was
     text = _spoken_models(text)  # "RTX four sixty Ti" -> "RTX 4060 Ti"
     # "Griffin, g r I f f I n": the spelled "I" made it personal, so the model wrote the
     # query (63 s, Nov 10 call); letters said one by one are one word
@@ -874,12 +1055,12 @@ def _query_from(text: str, chat_ctx) -> str | None:
     q = re.sub(r"\b(othos|osos|orthos|othus|otis)\b", " ", q, flags=re.I)
     q = re.sub(r"\s+([,.?!])", r"\1", re.sub(r"\s+", " ", q))
     q = re.sub(r"^[\s,.!?]+|[\s,.!]+$|([.?!])[\s,.!?]*$", r"\1", q).strip()
-    q = re.sub(r"^(?:but|and|so|also|okay|ok|well|then|now|about)\b[\s,]*", "", q, flags=re.I)  # "But what's the forecast?"
+    # "But what's the forecast?", "So can you tell me of any new..." -> "any new..."
+    q = re.sub(r"^(?:(?:but|and|so|also|okay|ok|well|then|now|about|of|actually)\b[\s,]*)+", "", q, flags=re.I)
     name = _user_name()
     if len(re.findall(r"\w+", q)) < 2 or _PERSONAL.search(q) or (
             name and re.search(rf"\b{re.escape(name)}\b", q, re.I)):
         return None
-    said_before = any(isinstance(i, llm.ChatMessage) and i.role == "user" for i in chat_ctx.items[:-1])
     # weather's "it" ("Will it rain tomorrow?") doesn't refer back to anything
     check = re.sub(r"\b(?:is|was|will|does|did|isn't|wasn't|won't)\s+it\b", "", q, flags=re.I) \
         if _WEATHER_TOPIC.search(q) else q
@@ -1681,6 +1862,8 @@ def _tool_names_for(text: str, has_results: bool) -> set[str]:
         names.add("web_search")
     if searchctx.says_near_me(text) and not _ABOUT_OTHOS.search(plain):
         names.add("web_search")  # "Where's a butcher near me?", "Find me a coffee shop nearby": found by the contraction
+    if _LOCAL_NEW.search(text):
+        names.add("web_search")  # "Any new businesses in Fairview?"
     if has_results and _ASKS_MORE.search(text):
         names |= {"more_results", "web_search"}
     return names
@@ -1707,8 +1890,43 @@ _URGENT = re.compile(
 _SENTENCE_END = re.compile(r"[.!?](\s+)")
 
 
+def _timing_line(item) -> str:
+    """Where a turn's wait went, from LiveKit's metrics on each message (never the words). Nov 19: replies took
+    12-20 s and the log couldn't say whether the model or the voice was slow."""
+    m = getattr(item, "metrics", None) or {}
+    if getattr(item, "role", "") == "assistant":
+        parts = [f"{label} {m[key]:.1f} s" for key, label in (("llm_node_ttft", "model's first words"),
+                                                              ("tts_node_ttfb", "voice's first audio")) if key in m]
+        if "e2e_latency" in m:
+            return f"reply timing: {m['e2e_latency']:.1f} s until Othos spoke" + (f" ({', '.join(parts)})" if parts else "")
+        return f"reply timing: {', '.join(parts)}" if parts else ""
+    if getattr(item, "role", "") == "user":
+        parts = [f"{label} {m[key]:.1f} s" for key, label in (("transcription_delay", "transcript"),
+                                                              ("end_of_turn_delay", "end of turn")) if key in m]
+        return f"heard timing: {', '.join(parts)}" if parts else ""
+    return ""
+
+
+def _note_timing(item) -> None:
+    """Log a message's timing line, and give the self-check ("How are you?") the time Othos took to start answering."""
+    if line := _timing_line(item):
+        log.info(line)
+    m = getattr(item, "metrics", None) or {}
+    if getattr(item, "role", "") == "assistant" and m.get("llm_node_ttft", -1) >= 0:
+        selfcheck.note_reply(m["llm_node_ttft"])
+
+
+def _held_whole_turn(text: str) -> bool:
+    """A short turn that was just the thing to hold on to ("I'm nonbinary", "My name is now Jo"): Othos says its
+    one line back. A longer turn gets the model's normal reply instead (the held thing is saved either way)."""
+    return len(re.findall(r"\w+", text)) <= 8
+
+
 def _user_name() -> str | None:
-    """personal.json's name, or else profile.md's "Address the user as ..."."""
+    """The name the user asked to be called (held.py), else personal.json's name, else profile.md's "Address the
+    user as ...". What the user said in a call wins, so an old name in a settings file is never used."""
+    if said := holdon.current_name(holdon.load()):
+        return said
     if personal.name():
         return personal.name()
     m = re.search(r"(?:address the user as|user's name is|my name is|name is)\s+([A-Z][\w'-]*)",
@@ -2342,6 +2560,14 @@ class Assistant(Agent):
             "Never say you searched, researched or checked sources unless a web_search result "
             "is right in front of you; otherwise say you don't know. "
             "Never give specs, prices, figures or facts about places from memory; offer to look them up. "
+            "Never say a shop, restaurant, event or local happening exists, is new or is open unless you were told; "
+            "in small talk ask about the user's day instead, and if the user asks about something you "
+            "don't know, offer to look it up yourself, never ask the user to look it up. "
+            "When the user is tired, hurting or disabled, acknowledge it once in their own words, "
+            "don't ask what causes it, don't try to fix it, never suggest going out or moving, and ask at most "
+            "one gentle question; after a no, stop asking and just keep them company. Don't assume their tastes "
+            "or condition beyond what they said, and never guess what they meant: say you don't know or ask. "
+            "\"Disabled\" alone doesn't mean permanent: don't call it permanent or chronic unless they said so. "
             "You can't see your own audio, settings, or logs: if asked why you did something "
             "or how you work, just say you don't know; never make up a reason. "
             "Don't address the user by name in normal replies; use their name only "
@@ -2355,15 +2581,22 @@ class Assistant(Agent):
         if HOME_LOCATION:  # from .env; stays on the laptop
             instructions += f"\nThe user lives in {_home_spoken()}."
         # what the user said about the jokes (humor.py) is read at the start of every call
-        self._instr_base = instructions
         self._humor = humor.load()
-        instructions += humor.prompt_line(self._humor)
+        # what the user asked Othos to hold on to (held.py): a permanent disability, pronouns, names. A name they
+        # no longer use never reaches the model, even from profile.md or personal.json: it is swapped out here.
+        self._held = holdon.load()
+        self._instr_base = instructions = holdon.scrub_text(instructions, self._held)
+        instructions += self._prompt_extras()
         # The time goes last: it changes every minute, and anything after it can't
         # reuse Ollama's cache from the previous call. Without the time it greeted
         # with "Good morning" just after midnight.
         instructions += f"\n\nIt is {datetime.now():%A, %B %d, %Y, %I:%M %p}."
         super().__init__(instructions=instructions)
         self._humor_seen: set[str] = set()   # user messages whose hints were already applied
+        self._held_seen: set[str] = set()
+        self._guest: str | None = None   # someone introduced as in the room this call ("my friend Tina is here")
+        self._voices = voices.Speakers()   # who is speaking, when speech-to-text labels speakers (voices.py)
+        self._asked_speaker: str | None = None
         self._handoff = None  # the "open code chat" task (kept so it isn't garbage-collected)
         self._gaming: gaming.GamingMonitor | None = None  # set in entrypoint
         self._workers = WorkersVoice()  # session set in entrypoint
@@ -2382,6 +2615,7 @@ class Assistant(Agent):
         self._say_first = ""     # spoken before the model's answer to a search
         self._force_web = False  # next web_search skips the free sources ("yes, search the web")
         self._offered_web = ""   # the query a Q and A answer offered to search the web for
+        self._wait_rest = False  # this turn stopped mid-question ("What are its"): no reply until the rest comes
         self._brave_next = False  # the next web search goes to Brave (reviews, after an OpenStreetMap list)
         self._twitch_turns = 0   # Twitch was mentioned this recently (turns left)
         self._allowed = set()    # tools the gate allowed this turn
@@ -2421,6 +2655,7 @@ class Assistant(Agent):
         So offer tools only when the user's words call for them. Fewer tools in
         the request also makes small-talk replies faster."""
         last = chat_ctx.items[-1] if chat_ctx.items else None
+        self._wait_rest = False
         if not (isinstance(last, llm.ChatMessage) and last.role == "user"):
             # answering a tool result (or greeting): no tools. Offering tools changes
             # the start of Ollama's prompt, so it re-reads the whole call (up to 28 s)
@@ -2429,6 +2664,14 @@ class Assistant(Agent):
         if self._user_text:
             self._recent_user = (self._recent_user + [self._user_text])[-4:]
         self._user_text = _as_othos(last.text_content or "")  # the chosen name reads as "Othos" here
+        before = _unanswered(chat_ctx)
+        if before and _dangling(before[-1]):
+            # "What are its" + "last two task results?": answered as one question
+            self._user_text = _as_othos(before[-1]).strip().rstrip(",") + " " + self._user_text
+        if _dangling(self._user_text):
+            self._wait_rest = True   # still talking: no tools, no reply (llm_node)
+            self._allowed = set()
+            return []
         allowed = _tool_names_for(self._user_text, has_results=bool(self._results))
         if self._recent_pic() and _LOOK_FOLLOWUP.search(self._user_text) \
                 and not _ASKS_NOTES.search(self._user_text):
@@ -2443,8 +2686,14 @@ class Assistant(Agent):
 
     async def tts_node(self, text, model_settings):
         """The voice, with pronunciations.json / personal.json respellings ("VRAM" -> "vee ram")."""
-        async for frame in Agent.default.tts_node(self, _respelled(text), model_settings):  # (file names too)
+        # never-say names (held.py) swapped out first, whatever wrote the text: model, code, or session.say
+        async for frame in Agent.default.tts_node(self, _respelled(holdon.scrub(text, self._held)), model_settings):
             yield frame
+
+    async def transcription_node(self, text, model_settings):
+        """What the call page shows: never-say names swapped out, the same as the voice (held.py)."""
+        async for piece in holdon.scrub(text, self._held):
+            yield piece
 
     async def _model_stream(self, chat_ctx, tools, model_settings):
         """The language model for this turn: the normal one, or in gaming mode
@@ -2452,6 +2701,8 @@ class Assistant(Agent):
         never lands in the middle of a reply."""
         g = self._gaming
         if g is None or not g.use_gaming_model or g.cpu_llm is None:
+            if llm_server.enabled() and not await llm_server.wait_ready(wait=60):
+                log.warning("llama-server isn't answering: this turn can't get a reply")
             async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
                 yield chunk
             return
@@ -2462,6 +2713,35 @@ class Assistant(Agent):
                                   conn_options=self.session.conn_options.llm_conn_options, **kwargs) as stream:
             async for chunk in stream:
                 yield chunk
+
+    def _prompt_extras(self) -> str:
+        """What the user said about the jokes and what they asked Othos to hold on to, as instruction sentences."""
+        return humor.prompt_line(self._humor) + holdon.prompt_line(self._held)
+
+    async def _held_hints(self, msg_id: str, user_text: str) -> str:
+        """"I'm permanently disabled", "my pronouns are she/they", "my name is now Jo", "my friend Sam said she...":
+        kept for every later call (held.py). Returns the short line to say back when the whole turn was that
+        statement, else ''. Caught by code, never by the model."""
+        if msg_id in self._held_seen:
+            return ""
+        self._held_seen.add(msg_id)
+        kinds = holdon.catch(user_text, self._held)
+        if not _held_whole_turn(user_text):   # the line won't be said, so the one-time pronoun question isn't used up
+            kinds = [k for k in kinds if k != "ask_pronouns"]
+        if not kinds:
+            return ""
+        new, line = holdon.apply(self._held, kinds)
+        if new != self._held:
+            self._held = new
+            holdon.save(new)
+            self._instr_base = holdon.scrub_text(self._instr_base, new)   # a name just retired leaves the instructions
+            try:
+                await self.update_instructions(self._instr_base + self._prompt_extras()
+                                               + f"\n\nIt is {datetime.now():%A, %B %d, %Y, %I:%M %p}.")
+            except Exception as e:
+                log.info("held: instructions not updated mid-call: %s", e)
+            log.info("held: %s", kinds)   # the kind only, never the words
+        return line
 
     async def _humor_hints(self, msg_id: str, user_text: str, prev_assistant: str) -> str:
         """Apply what the user said about the humor (once per message). Returns the short line to say back
@@ -2477,7 +2757,7 @@ class Assistant(Agent):
             self._humor = new
             humor.save(new)
             try:
-                await self.update_instructions(self._instr_base + humor.prompt_line(new)
+                await self.update_instructions(self._instr_base + humor.prompt_line(new) + holdon.prompt_line(self._held)
                                                + f"\n\nIt is {datetime.now():%A, %B %d, %Y, %I:%M %p}.")
             except Exception as e:
                 log.info("humor: instructions not updated mid-call: %s", e)
@@ -2498,6 +2778,7 @@ class Assistant(Agent):
         g = self._gaming
         facts = await asyncio.to_thread(
             selfcheck.gather, _OLLAMA_ROOT, os.getenv("OLLAMA_MODEL", "llama3.2:3b"),
+            health=llm_server.root() + "/health" if llm_server.enabled() else "",
             workers=workers, gaming=bool(g and g.mode.on), camera=bool(_camera_publication()))
         reply = selfcheck.describe(facts, user_text)
         log.info("self-check: %s -> %r", {k: v for k, v in facts.items() if k != "workers"}, reply)
@@ -2519,6 +2800,10 @@ class Assistant(Agent):
             yield self._say_first
         self._say_first = ""
         tools = self._tools_for_turn(chat_ctx, tools)  # also reads this turn's words into _user_text
+        if isinstance(last, llm.ChatMessage) and last.role == "user" and self._wait_rest:
+            # "What are its": cut off mid-question; say nothing and answer it with the rest (_tools_for_turn joins them)
+            log.info("unfinished turn: waiting for the rest")
+            return
         if isinstance(last, llm.ChatMessage) and last.role == "user":
             _note_her_sky(self._user_text)  # "it's actually gray outside" beats the reading
         if isinstance(last, llm.ChatMessage) and last.role == "user" and _END_CALL.match(self._user_text.strip()):
@@ -2527,6 +2812,44 @@ class Assistant(Agent):
             self._handoff = asyncio.create_task(_end_call(self.session))
             yield "Okay, ending the call. Bye!"
             return
+        if isinstance(last, llm.ChatMessage) and last.role == "user":
+            # a guest in the room: known from the introduction, or from a second voice when speech-to-text labels
+            # speakers (voices.py; none today, so this part waits for Deepgram's labels or a local voiceprint)
+            spk = self._voices.take()
+            if spk and self._voices.is_new_voice(spk):
+                self._voices.note_guest_voice(spk)
+                if not self._guest:
+                    self._guest = "a guest"   # a name comes with an introduction
+                    log.info("guest mode on (a second voice)")
+            if guest := _guest_intro(self._user_text):
+                self._guest = guest
+                self._voices.expect_guest(guest)
+                await self._held_hints(last.id, self._user_text)   # "my friend Tina ... She's" kept (held.py)
+                log.info("guest mode on")   # never the guest's name
+                yield f"Hi {guest}, nice to meet you. I'm {ASSISTANT}."
+                return
+            if self._guest and _guest_left(self._user_text, self._guest):
+                log.info("guest mode off")
+                self._guest = None
+            pending = _unanswered(chat_ctx)
+            last_reply = next((i.text_content or "" for i in reversed(chat_ctx.items[:-1])
+                               if isinstance(i, llm.ChatMessage) and i.role == "assistant"), "")
+            what = _guest_turn(self._user_text, self._guest, pending, last_reply, speaker=spk, asked=self._asked_speaker)
+            if what != "silent":
+                self._asked_speaker = spk   # whom Othos is answering: their reply to a question is the one that counts
+                if who := self._voices.label_for_model(spk):
+                    # the model is told who spoke ("(said by Tina) Othos, what's your name?"); the call keeps the words
+                    chat_ctx = chat_ctx.copy()
+                    chat_ctx.items[-1] = llm.ChatMessage(role="user", content=[f"(said by {who}) {self._user_text}"])
+            if what == "silent":
+                await self._held_hints(last.id, self._user_text)   # "Sam's pronouns are..." still kept
+                log.info("guest mode: not spoken to, no reply")
+                return
+            if what == "answer_pending":
+                # a side remark right after a question to Othos: answer the question, with the model and no tools
+                log.info("guest mode: side remark after a question; answering the question")
+                self._user_text = _as_othos(next(p for p in reversed(pending) if _addressed(p)))
+                tools, self._allowed = [], set()
         if (isinstance(last, llm.ChatMessage) and last.role == "user"
                 and (request := _code_chat_request(self._user_text)) is not None):
             # "Switch to code chat": code handles it; the page ends the call and opens /code
@@ -2594,6 +2917,20 @@ class Assistant(Agent):
                     )]),
                 )
                 return
+        if (isinstance(last, llm.ChatMessage) and last.role == "user" and _YES_ONLY.match(self._user_text.strip())
+                and _offered_lookup(chat_ctx) and (q := _earlier_question(chat_ctx))):
+            # "Please do." to the model's own "Can I look that up for you?": search the question it offered to look
+            # up (Nov 19 call: two yeses never searched, then the model said "Let me check..." without searching)
+            log.info("search after a yes to Othos's offer: %r", q)
+            yield _lookup_lead(q)
+            yield llm.ChatChunk(
+                id="othos-search",
+                delta=llm.ChoiceDelta(role="assistant", tool_calls=[llm.FunctionToolCall(
+                    name="web_search", arguments=json.dumps({"query": q, "count": 4}),
+                    call_id=f"search_{uuid.uuid4().hex[:12]}",
+                )]),
+            )
+            return
         if isinstance(last, llm.ChatMessage) and last.role == "user":
             self._offered_web = "" if not _YES.match(self._user_text) else self._offered_web
         if (isinstance(last, llm.ChatMessage) and last.role == "user" and self._results and not self._news
@@ -2729,15 +3066,24 @@ class Assistant(Agent):
             log.info("home location answered by code")
             return
         if (isinstance(last, llm.ChatMessage) and last.role == "user"
-                and _FILLER_ONLY.match(self._user_text.strip())):
-            # "Also," on its own: the user is still talking; say nothing and wait for the rest
-            log.info("filler-only turn %r: no reply", self._user_text)
-            return
+                and (filler := _filler_turn(self._user_text, pending := _unanswered(chat_ctx)))):
+            if filler == "silent":
+                # "Also," on its own: the user is still talking; say nothing and wait for the rest
+                log.info("filler-only turn %r: no reply", self._user_text)
+                return
+            # "Oh," right after an unanswered turn cut that reply off: answer that turn instead (Nov 18, Tina)
+            log.info("filler-only turn %r after an unanswered turn: answering that one", self._user_text)
+            self._user_text = _as_othos(next(p for p in reversed(pending) if not _FILLER_ONLY.match(p.strip())))
+            tools, self._allowed = [], set()
         if isinstance(last, llm.ChatMessage) and last.role == "user":
             # "Go easy on the puns", "I like the humor, keep it": caught by code, kept for next time (humor.py)
             prev = next((i.text_content or "" for i in reversed(chat_ctx.items[:-1])
                          if isinstance(i, llm.ChatMessage) and i.role == "assistant"), "")
             hint_reply = await self._humor_hints(last.id, self._user_text, prev)
+            held_reply = await self._held_hints(last.id, self._user_text)   # said only when that was the whole turn
+            if held_reply and not self._allowed and _held_whole_turn(self._user_text):
+                yield held_reply
+                return
             if hint_reply and not self._allowed:
                 yield hint_reply
                 return
@@ -2785,6 +3131,7 @@ class Assistant(Agent):
         mode = None  # None = undecided, "speech" = normal reply, "leak" = tool-call text
         chunk_id = "othos"
         called = False  # the model made a real tool call this turn
+        claimed = False  # the model began "Let me check..." on a turn with no search
         async for chunk in self._model_stream(chat_ctx, tools, model_settings):
             if isinstance(chunk, llm.ChatChunk):
                 chunk_id = chunk.id
@@ -2808,6 +3155,12 @@ class Assistant(Agent):
                 if len(held.lstrip()) >= check_chars and _TOOL_WORD.match(held) and not _LEAK_START.match(held):
                     log.warning("dropped a tool name the model said as a word: %r", held[:60])
                     held = _TOOL_WORD.sub("", held)
+                if not self._allowed and not called and (claim := _claim_state(held)) != "no":
+                    # "Let me check..." with no search to run: hold until it's clear, then search for real
+                    if claim == "yes":
+                        claimed = True
+                        break
+                    continue
                 if len(held.lstrip()) >= check_chars:
                     mode = "leak" if _LEAK_START.match(held) else "speech"
                     if mode == "speech":
@@ -2815,6 +3168,27 @@ class Assistant(Agent):
                             yield out
                         held = ""
 
+        if mode is None and not claimed and not self._allowed and not called and _claim_state(held) == "yes":
+            claimed = True   # a short reply that was only "Let me check."
+        if claimed:
+            # the model said it was searching, but no search was offered or run (Nov 19 call: "Let me check... Ah, it
+            # looks like I don't have the latest information"): run the search it promised, or say none was run
+            q = _searchable(self._user_text, chat_ctx) if not _YES_ONLY.match(self._user_text.strip()) else None
+            q = q or _earlier_question(chat_ctx)
+            if not q:
+                log.info("model claimed a lookup with nothing to search; said so instead")
+                yield "I haven't looked anything up yet. What would you like me to search for?"
+                return
+            log.info("model claimed a lookup; searching for real: %r", q)
+            yield _lookup_lead(q)
+            yield llm.ChatChunk(
+                id="othos-search",
+                delta=llm.ChoiceDelta(role="assistant", tool_calls=[llm.FunctionToolCall(
+                    name="web_search", arguments=json.dumps({"query": q, "count": 4}),
+                    call_id=f"search_{uuid.uuid4().hex[:12]}",
+                )]),
+            )
+            return
         if mode is None:  # very short reply: decide now
             held = _ROLE_PREFIX.sub("", held)
             if _TOOL_WORD.match(held) and not _LEAK_START.match(held):
@@ -3498,8 +3872,6 @@ class Assistant(Agent):
             (rest if site in seen else first).append(r)
             seen.add(site)
         self._results, self._cursor, self._news = first + rest, 0, True
-        when = ("the latest" if breaking else "today's" if span == "day" else "this week's")
-        what = f"{label} headlines" if label else "headlines"
         if summarize:
             spoken = _short_answer(answer)
             if spoken and _backed_by(spoken, results):
@@ -3870,6 +4242,13 @@ class Assistant(Agent):
 server = AgentServer(
     port=int(os.getenv("AGENT_HTTP_PORT", "8081")),
     num_idle_processes=1,
+    # One person, one call: the worker's "too busy" check (it turns a call away when the processor is 70%+ busy)
+    # only ever sent the user's call away (Nov 20, 7:42: three tries, "no servers available", PC at 65-84% right after
+    # The Smithy loaded its model). The load is always reported as 0, so a call is never declined for it.
+    load_fnc=lambda: 0.0,
+    # starting a call's process took 8.2 s of the default 10 s on a busy PC, and failed at 7:18 ("error initializing
+    # process"): give it a minute
+    initialize_process_timeout=60.0,
 )
 
 
@@ -3902,12 +4281,15 @@ def _ssl_context() -> ssl.SSLContext:
     return sources.ssl_context()  # one shared list for the model and the free sources
 
 
-def _llm_client():
+def _llm_client(ollama: bool = False):
+    """The conversation's client: llama-server when voice-llm.json says so, else Ollama. ollama=True: always Ollama
+    (gaming mode's model stays there)."""
     import openai as openai_sdk
+    ollama_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1")
     # the same settings LiveKit's plugin uses for its own client
     return openai_sdk.AsyncClient(
         api_key="ollama",
-        base_url=os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1"),
+        base_url=ollama_url if ollama or not llm_server.enabled() else llm_server.root() + "/v1",
         max_retries=0,
         http_client=httpx.AsyncClient(
             verify=_ssl_context(),
@@ -3974,7 +4356,8 @@ async def entrypoint(ctx: JobContext):
         llm=openai.LLM(
             model=os.getenv("OLLAMA_MODEL", "llama3.2:3b"),
             client=llm_client,  # made with the shared certificate list (_llm_client)
-            extra_body={"keep_alive": KEEP_ALIVE},
+            # llama-server: the call's own slot, keeping what's been read; Ollama: stay loaded between calls
+            extra_body=llm_server.request_extras() if llm_server.enabled() else {"keep_alive": KEEP_ALIVE},
         ),
         tts=_make_tts(),
         vad=ctx.proc.userdata["vad"],
@@ -4011,22 +4394,33 @@ async def entrypoint(ctx: JobContext):
     # counters for the quiet self-check ("How are you?"): how long answers take, errors this call
     selfcheck.reset()
 
-    def _count_metrics(ev):
-        m = getattr(ev, "metrics", None)
-        if getattr(m, "type", "") == "llm_metrics" and not getattr(m, "cancelled", False) \
-                and getattr(m, "ttft", -1) is not None and m.ttft >= 0:
-            selfcheck.note_reply(m.ttft)
-
-    session.on("metrics_collected", _count_metrics)
+    # each message's timing (where a slow reply's wait went) and the self-check's reply times; this replaces the
+    # deprecated metrics_collected event
+    session.on("conversation_item_added", lambda ev: _note_timing(ev.item))
     # (only errors that weren't retried away: a recoverable one worked on the next try)
     session.on("error", lambda ev: None if getattr(ev.error, "recoverable", False) else selfcheck.note_error())
 
     assistant = Assistant()
+    # who said each final piece of transcript, when speech-to-text labels speakers (voices.py; none yet)
+    # and when she was last heard at all, so worker announcements never start mid-sentence (workers_voice.py)
+    def _on_transcribed(ev) -> None:
+        assistant._workers.heard()
+        if ev.is_final:
+            assistant._voices.heard(ev.speaker_id, ev.transcript)
+    session.on("user_input_transcribed", _on_transcribed)
     # gaming mode: watches for listed games and switches the voice model between turns
     monitor = gaming.GamingMonitor(session, _OLLAMA_ROOT, KEEP_ALIVE)
+    gaming_client = llm_client
+    if llm_server.enabled():
+        # the conversation is on llama-server; gaming mode's model stays in Ollama, and Ollama's copy of the
+        # normal model is never loaded (it would double the memory)
+        gaming_client = _llm_client(ollama=True)
+        ctx.add_shutdown_callback(gaming_client.close)
+        monitor.normal_on_ollama = False
+        asyncio.create_task(llm_server.warm(str(assistant.instructions)))   # instructions read while greeting
     monitor.cpu_llm = openai.LLM(
         model=monitor.cfg.gaming_model,
-        client=llm_client,  # the same Ollama client (the model name goes with each request)
+        client=gaming_client,  # an Ollama client (the model name goes with each request)
         extra_body={"keep_alive": KEEP_ALIVE},
     )
     assistant._gaming = monitor

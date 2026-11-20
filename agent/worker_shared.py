@@ -67,15 +67,28 @@ RULES = ("You cannot run code, send, publish, install or change anything, and yo
 
 
 # ---------------------------------------------------------------- the Yes/No gate
-_YES = re.compile(r"^\W*(?:(?:othos|osos)\W+)?(?:yes|yeah|yep|yup|keep it|discard it|do it|go ahead|ok(?:ay)?|sure|please do)\b", re.I)
+_YES = re.compile(r"^\W*(?:(?:othos|osos)\W+)?(?:yes|yeah|yep|yup|do it|go ahead|ok(?:ay)?|sure|please do)\b", re.I)
 _NO = re.compile(r"\b(?:no|nope|don't|do not|cancel|never mind|wait|stop)\b", re.I)
+# "keep it" / "discard it" are a yes only to the question that asked for that action (Nov 18; the Nov 13
+# review: both were a yes to any question, so "discard it" to "Keep task 12?" kept it, and to a plan built it)
+_SAYS = {"kept": re.compile(r"^\W*(?:(?:othos|osos)\W+)?(?:(?:yes|yeah|yep|ok(?:ay)?)\W+)?keep (?:it|that|them)\b", re.I),
+         "discarded": re.compile(r"^\W*(?:(?:othos|osos)\W+)?(?:(?:yes|yeah|yep|ok(?:ay)?)\W+)?(?:discard|delete|bin|scrap) (?:it|that|them)\b", re.I)}
+_OTHER = {"kept": re.compile(r"\b(?:discard|delete|bin|scrap|throw\w* (?:it )?away|get rid)", re.I),
+          "discarded": re.compile(r"\b(?:keep|kept|save)\b", re.I)}
 
 
-def answer(transcript: str) -> str | None:
-    """'yes', 'no', or None for the user's reply to a keep/discard question. Any 'no' word wins."""
+def answer(transcript: str, verdict: str | None = None) -> str | None:
+    """'yes', 'no', or None for the user's reply to a yes/no question. Any 'no' word wins.
+    verdict ('kept' or 'discarded') is what a keep/discard question asked: its own words ("keep it" to a keep
+    question) are a yes, and a reply naming the other action ("yes, discard it" to "Keep task 12?") is None,
+    so it's asked again. Without a verdict, "keep it" and "discard it" are None."""
     text = (transcript or "").strip()
     if _NO.search(text):
         return "no"
+    if verdict in _OTHER and _OTHER[verdict].search(text):
+        return None
+    if verdict in _SAYS and _SAYS[verdict].search(text):
+        return "yes"
     return "yes" if _YES.search(text) else None
 
 
@@ -87,6 +100,9 @@ _REDACT = [
     re.compile(r"(?i)\bdefine\s*\(\s*(['\"][A-Z0-9_]*(?:PASSWORD|PASS|SECRET|KEY|SALT|TOKEN)[A-Z0-9_]*['\"]\s*,\s*)"
                r"(?:'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")"),
     re.compile(r"\b(?:sk|pk|rk|tvly|ghp|gho|ghs|github_pat|xox[abpr]|AKIA|AIza|hf)[-_][A-Za-z0-9_\-]{12,}\b"),
+    # an AWS access key ID: AKIA (or ASIA, a temporary one) and 16 capitals or digits, with no dash after it,
+    # so the rule above missed every real one (Nov 13 review, item 7; fixed Nov 18)
+    re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
     # NAME = value, where the value isn't code: a call, index or attribute after it (`total_tokens =
     # sum(...)`, `passed = data.get(...)`) is left alone (Nov 14, Smithy task 39: the model saw
     # `total_tokens=[REDACTED]`, called it placeholder code, and its edits couldn't find the real lines)

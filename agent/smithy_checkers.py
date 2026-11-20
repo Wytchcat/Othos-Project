@@ -86,7 +86,8 @@ def ruff_errors(folder: Path, rels: list[str]) -> list[str] | None:
     exe = _tool("ruff", Path(sys.executable).parent / "ruff.exe")
     if not exe:
         return None
-    r = _run([exe, "check", "--no-cache", "--isolated", "--output-format", "json",
+    # --ignore-noqa: a noqa comment can't hide a problem from the build check (Nov 18, task 60)
+    r = _run([exe, "check", "--no-cache", "--isolated", "--ignore-noqa", "--output-format", "json",
               "--select", "E9,F63,F7,F82,F811,F401,F841", "--target-version", "py312", *rels], folder)
     if r is None:
         return None
@@ -132,6 +133,9 @@ def pyright_errors(folder: Path, rels: list[str]) -> list[str] | None:
                                    "typeCheckingMode": "off", "pythonVersion": "3.12",
                                    "reportUndefinedVariable": "error", "reportAttributeAccessIssue": "error",
                                    "reportCallIssue": "error",
+                                   # a "# type: ignore" can't hide a wrong call (Nov 18, task 60: two calls of
+                                   # record() missing 3 arguments each were silenced that way)
+                                   "enableTypeIgnoreComments": False,
                                    "reportMissingImports": "none", "reportMissingModuleSource": "none"}),
                        encoding="utf-8")
         r = _run([exe, "--outputjson", "-p", str(cfg)], folder)

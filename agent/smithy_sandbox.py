@@ -272,6 +272,15 @@ def run_tests(job_id: int, folder: Path, rels: list[str], cfg: dict, results_dir
                 "why": "Python didn't install in the Sandbox"}
     status = ("timeout" if timed_out or "timeout" in result.values() else
               "passed" if all(v == "passed" for v in result.values()) else "failed")
-    log.info("build %d: Sandbox tests %s: %s", job_id, status, result)
-    steps.info("Sandbox test run: %s.", ", ".join(f"{t} {v}" for t, v in result.items()))
-    return {"status": status, "tests": result, "output": output, "full": full, "why": ""}
+    skipped = {t: n for t in tests if (n := skipped_count(full.get(t, "")))}
+    log.info("build %d: Sandbox tests %s: %s%s", job_id, status, result, f", skipped {skipped}" if skipped else "")
+    steps.info("Sandbox test run: %s.", ", ".join(f"{t} {v}" + (f" ({skipped[t]} skipped)" if t in skipped else "")
+                                                 for t, v in result.items()))
+    return {"status": status, "tests": result, "output": output, "full": full, "why": "", "skipped": skipped}
+
+
+def skipped_count(out: str) -> int:
+    """How many tests a run skipped: unittest's "OK (skipped=37)" / "FAILED (failures=1, skipped=2)", or pytest's
+    "3 skipped". A skipped test checks nothing (Nov 19, task 61: 37 of 47 skipped and the run read as passed)."""
+    m = re.search(r"\bskipped=(\d+)\)", out) or re.search(r"\b(\d+) skipped\b", out)
+    return int(m.group(1)) if m else 0

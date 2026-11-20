@@ -117,6 +117,23 @@ def _signature(e: dict) -> tuple:
     return tuple(sorted(e.get("missing") or [])), tuple(e.get("problems") or [])
 
 
+def progressed(events: list[dict]) -> bool:
+    """Whether this run's last check round put right something the one before found (a missing item or a build
+    problem gone), while something is still left to fix. Nov 18, task 59: each of the 3 rounds fixed what it was
+    given; the last fix brought a one-word error, and the rounds ran out before it was put right."""
+    run = []
+    for e in events:
+        if e.get("kind") == "run":
+            run = []
+        elif e.get("kind") == "check":
+            run.append(e)
+    if len(run) < 2:
+        return False
+    before = set(run[-2].get("missing") or []) | set(run[-2].get("problems") or [])
+    now = set(run[-1].get("missing") or []) | set(run[-1].get("problems") or [])
+    return bool(now) and bool(before - now)
+
+
 def no_progress(events: list[dict]) -> int:
     """How many check rounds in a row, at the end of this run, found exactly what the one before found (missing
     items and build problems), while there was something to fix. 0 = progress (or nothing left)."""
@@ -159,6 +176,9 @@ def rules_of(text: str, limit: int = 6) -> list[str]:
     body = _CHECKS.split(text)[0]
     checks = [_words(v) for v in subs.values()]
     out = []
+    # an item's own Markdown heading names the change, it isn't a rule (Nov 18, task 60: "## 3. Tests for the rules
+    # your Self-check found no lettered test for" became a "rule", and its test checked nothing)
+    body = re.sub(r"(?m)^[ \t]*#{1,6}[^\n]*$", "", body)
     for s in re.split(r"(?<=[.;])\s+|\n+", body):
         s = " ".join(s.split()).strip(" -")
         if len(s) < 20 or not _RULE_WORDS.search(s):

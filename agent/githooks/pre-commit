@@ -9,3 +9,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$agent/update-requireme
   echo "Commit stopped: requirements.txt needs exact versions that match .venv (see above)."
   exit 1
 }
+# BUGFIXES.md is written only by bugfixes_merge.py; each change adds its own file in bugfixes\ instead, so
+# sessions sharing this checkout never commit each other's entries (Nov 18). Skipped where the script isn't
+# (the public copy leaves it out).
+py="$agent/.venv/Scripts/python.exe"
+if [ -f "$agent/bugfixes_merge.py" ] && [ -f "$py" ]; then
+  "$py" "$agent/bugfixes_merge.py" --hook || exit 1
+fi

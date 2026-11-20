@@ -12,7 +12,6 @@ import logging
 import random
 import re
 import shutil
-import time
 from pathlib import Path
 
 import httpx
@@ -94,13 +93,14 @@ def user_state(text: str) -> str:
 
 # ---------------------------------------------------------------- the check
 def gather(ollama_root: str, model: str = "", *, workers: list[dict] | None = None, gaming: bool = False,
-           camera: bool = False) -> dict:
+           camera: bool = False, health: str = "") -> dict:
     """Blocking (about 1 s at most); call it with asyncio.to_thread. Every part is optional: a part that
-    can't be read is left out, never guessed."""
+    can't be read is left out, never guessed. `health`: the conversation model's own server to ask instead of
+    Ollama (llama-server's /health, llm_server.py)."""
     facts: dict = {"errors": _errors, "last_reply": _replies[-1] if _replies else None,
                    "gaming": gaming, "camera": camera, "workers": workers or []}
     try:
-        r = httpx.get(f"{ollama_root}/api/ps", timeout=1.5)
+        r = httpx.get(health or f"{ollama_root}/api/ps", timeout=1.5)
         r.raise_for_status()
         facts["ollama"] = True    # (a model that isn't loaded right now is normal: Ollama loads it on demand)
     except Exception:

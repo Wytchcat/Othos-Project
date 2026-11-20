@@ -577,7 +577,6 @@ async def joomla_release() -> dict | None:
 
 
 JOOMLA_SECURITY_FEED = "https://developer.joomla.org/security-centre.feed?type=rss"
-JOOMLA_NEWS_FEED = "https://www.joomla.org/announcements.feed?type=rss"
 
 
 # ---------------------------------------------------------------- RSS / Atom

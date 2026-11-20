@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import collections
 import difflib
 import hashlib
 import json
@@ -76,7 +77,12 @@ SYSTEM = (f"You are the Smithy, a careful coding assistant for Othos on {USERS} 
           "PC (Windows 11, Windows PowerShell 5.1, C# 5 with .NET Framework 4); it's plain and small; windows and "
           "pop-ups follow the app's own colours and can be resized. 3. Use what exists: the standard library and "
           "the project's own code before anything new. 4. Speed never buys errors: no dead code, no unused imports "
-          "or variables, no leftover comments. Say plainly what's done and what isn't, and settle what you can "
+          "or variables, no leftover comments."
+          # Nov 19, task 59: the request's state\google-prompt.json was written under the install folder, while the
+          # same file reached the program's files as Path.Combine(targetFolder, "agent", ...), where Othos reads it
+          + " A path the request names for the program's own files (state\\..., a settings file) is where the "
+          "existing code already keeps that program's files: build it the way the existing code builds its paths, "
+          "from the same base folder and subfolders, never from a new base. Say plainly what's done and what isn't, and settle what you can "
           "yourself instead of asking the person using it.")
 SYSTEM_TWO_PART = SYSTEM + "\n\n" + FORMAT
 
@@ -91,8 +97,26 @@ JOOMLA = ("This is for a Joomla 5 site using the YOOtheme Pro template (and ZOO)
           "sure of an exact file name or path for the installed version, say so in the README.")
 
 
+# A backslash lost on the way in: a request saved through an escaping step (a JSON or Python string) turns
+# "state\academy-glossary.json" into "state" + a bell character + "cademy-glossary.json" (Nov 18, the Academy's
+# task 58 follow-up). These four control characters are never typed in a request, so the backslash is put back.
+_LOST_BACKSLASH = {"\x07": "\\a", "\x08": "\\b", "\x0b": "\\v", "\x0c": "\\f"}
+_LOST_RX = re.compile("[\x07\x08\x0b\x0c]")
+
+
+def lost_backslashes(t: str) -> tuple[str, int]:
+    """(the text with each lost backslash put back, how many were)."""
+    return _LOST_RX.sub(lambda m: _LOST_BACKSLASH[m.group(0)], t), len(_LOST_RX.findall(t))
+
+
+def _repaired(p: dict, key: str) -> dict:
+    """{"repaired": N} when the request had lost backslashes (kept when the params are checked again)."""
+    n = lost_backslashes(str(p.get(key, "")))[1] or int(p.get("repaired") or 0)
+    return {"repaired": n} if n else {}
+
+
 def _text(p: dict, key: str, what: str, min_words: int = 2) -> str:
-    t = str(p.get(key, "")).strip()
+    t = lost_backslashes(str(p.get(key, "")))[0].strip()
     if len(t.split()) < min_words:
         raise ValueError(f"it needs {what}")
     return t[:20_000]
@@ -301,7 +325,7 @@ def _check_followup(p):
     parent = SMITHY.get(pid)
     if parent is None or not parent["result_path"]:
         raise ValueError(f"Smithy task {pid} has no result to ask about")
-    return {"parent_id": pid, "question": _text(p, "question", "a question")}
+    return {"parent_id": pid, "question": _text(p, "question", "a question")} | _repaired(p, "question")
 
 
 # ---------------------------------------------------------------- builds: where files may go
@@ -387,13 +411,45 @@ def _plan_messages(p: dict, max_files: int, parent: dict | None) -> list[dict]:
     return msgs
 
 
-_ONLY = re.compile(r"\b(?:only|no other files?|nothing else|change no other|leave (?:the )?(?:other|rest)|"
+# "only" limits the files only when it's about files or changing them (Nov 19, task 64: "Only coding or Othos terms
+# are topics" froze every file the request didn't name, so the confusion detector and the tests couldn't change)
+_ONLY = re.compile(r"\b(?:only (?:change|fix|edit|touch|update|modify)|(?:change|fix|edit|touch|update|modify) only|"
+                   r"only (?:in |to )?(?:the |these |this )?files?|[\w/\\-]+\.\w{1,5} only|"
+                   r"no other files?|nothing else|change no other|leave (?:the )?(?:other|rest)|"
                    r"leave (?:all )?(?:the )?(?:existing |other )?files? alone|"
                    r"don'?t (?:change|touch) (?:any )?(?:other|anything else))\b", re.I)
 _FILES_LINE = re.compile(r"(?im)^[ \t]*(?:[-*][ \t]*)?files?\b[^:\n]{0,20}:(.*)$")
 _SENT = r"(?:[^.\n]|\.(?=\w))*"                       # within one sentence: a dot in "a.py" doesn't end it
 _LEAVE = re.compile(r"(?i)" + _SENT + r"\bleave (?:them|it|these|those)?[ \t]*(?:as (?:they|it) (?:are|is)|alone|"
                     r"unchanged)" + _SENT)
+_SELF_CHECK = re.compile(r"(?i)\b(?:self[- ]?check|check (?:itself|your(?:self| own))|clean[- ]?up|tidy|bloat|"
+                         r"bad code|dead code|code smells?|lint)\b")
+
+
+def earlier_files(parent: dict) -> list[dict]:
+    """Every file of the earlier version, as plan entries: its plan's files that are there, then any other file in
+    its folder (not the README, which each version writes): the request's tests (test_request.py) are written
+    outside the plan, and the first self check left them out (Nov 19, task 62)."""
+    folder = parent.get("folder")
+    if folder is None:
+        return [{"path": f["path"], "purpose": f.get("purpose", "")} for f in parent["plan"]["files"]]
+    out = [{"path": f["path"], "purpose": f.get("purpose", "")} for f in parent["plan"]["files"]
+           if (folder / f["path"]).is_file()]
+    have = {f["path"] for f in out}
+    for x in sorted(folder.rglob("*")):
+        rel = x.relative_to(folder).as_posix()
+        hidden = any(part.startswith(".") or part == "__pycache__" for part in rel.split("/"))   # caches, tools' folders
+        if x.is_file() and rel not in have and rel.lower() != "readme.md" and not hidden:
+            out.append({"path": rel, "purpose": "kept from the earlier version"})
+    return out
+
+
+def is_self_check(change: str) -> bool:
+    """A change that asks The Smithy to check and clean the code it has, with no numbered changes of its own."""
+    return bool(_SELF_CHECK.search(change)) and not numbered_items(change)
+
+
+_REMOVE = re.compile(r"(?i)" + _SENT + r"\b(?:remove|delete|drop|get rid of|take out|retire|merge)\b" + _SENT)
 
 
 def _names(text: str, files: list[dict], stems: bool = False) -> set[str]:
@@ -574,6 +630,284 @@ def _changed_tests(old: str, new: str, names: set[str]) -> list[str]:
     return sorted(n for n in a if a[n] != b.get(n))
 
 
+# -- a test correction that checks less than before (Nov 18, task 60: test_personal_glossary_sentence_not_kept, judged
+# wrong, went from checking json.dumps(entry), the whole saved entry, to entry.get("lesson") alone, and from 5 words
+# to 3; it kept its one assertion and her sentence, so no guard saw it)
+_ASSERT_TARGET = {"assertIn": 1, "assertNotIn": 1, "assertRegex": 0, "assertNotRegex": 0, "assertCountEqual": 0}
+
+
+def _func_nodes(text: str) -> dict[str, ast.AST]:
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return {}
+    return {n.name: n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and n.name.startswith("test")}
+
+
+def _scopes(fn: ast.AST) -> dict[str, int]:
+    """{name: the fewest keys or fields taken from it} over what the test's assertions look inside: assertIn's
+    container, `assert x in Y`'s Y. `json.dumps(entry)` is entry itself (0); `entry.get("lesson")` and
+    `entry["lesson"]` take one key (1). A name set in the test (`entry = data[0]`) is followed to its root."""
+    assigns: dict[str, ast.AST] = {}
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+            assigns[n.targets[0].id] = n.value
+
+    def walk(e: ast.AST, depth: int, follow: frozenset) -> list[tuple[str, int]]:
+        if isinstance(e, ast.Name):
+            if e.id in assigns and e.id not in follow:
+                return walk(assigns[e.id], depth, follow | {e.id}) or [(e.id, depth)]
+            return [(e.id, depth)]
+        if isinstance(e, ast.Subscript):
+            return walk(e.value, depth + 1, follow)
+        if isinstance(e, ast.Call) and isinstance(e.func, ast.Attribute):
+            if e.func.attr == "get":
+                return walk(e.func.value, depth + 1, follow)
+            if e.func.attr in ("lower", "upper", "strip", "casefold", "read_text", "read_bytes"):
+                return walk(e.func.value, depth, follow)
+            if e.func.attr in ("dumps", "join") and e.args:        # json.dumps(x), " ".join(x): all of x
+                return walk(e.args[0], depth, follow)
+        if isinstance(e, ast.Call) and isinstance(e.func, ast.Name) and e.func.id in ("str", "repr") and e.args:
+            return walk(e.args[0], depth, follow)
+        if isinstance(e, ast.Attribute):
+            return walk(e.value, depth + 1, follow)
+        return []
+    found: dict[str, int] = {}
+    for n in ast.walk(fn):
+        target = None
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in _ASSERT_TARGET:
+            i = _ASSERT_TARGET[n.func.attr]
+            target = n.args[i] if len(n.args) > i else None
+        elif isinstance(n, ast.Assert) and isinstance(n.test, ast.Compare) and \
+                isinstance(n.test.ops[0], (ast.In, ast.NotIn)):
+            target = n.test.comparators[0]
+        for name, d in walk(target, 0, frozenset()) if target is not None else []:
+            found[name] = min(d, found.get(name, d))
+    return found
+
+
+def _loop_values(fn: ast.AST) -> list[set]:
+    """The literal values each `for x in [...]` loop with an assertion in it really checks (lower case; a value the
+    loop skips with `if x in [...]: continue` doesn't count)."""
+    def consts(e: ast.AST) -> set[str]:
+        return {str(c.value).lower() for c in getattr(e, "elts", []) if isinstance(c, ast.Constant)}
+    out = []
+    for n in ast.walk(fn):
+        if isinstance(n, ast.For) and isinstance(n.iter, (ast.List, ast.Tuple, ast.Set)) and any(
+                isinstance(c, ast.Assert) or (isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                                              and c.func.attr.startswith("assert")) for c in ast.walk(n)):
+            skipped = set()
+            for s in n.body:
+                if isinstance(s, ast.If) and len(s.body) == 1 and isinstance(s.body[0], ast.Continue) \
+                        and isinstance(s.test, ast.Compare) and isinstance(s.test.ops[0], ast.In):
+                    skipped |= consts(s.test.comparators[0])
+            vals = consts(n.iter) - skipped
+            if vals:
+                out.append(vals)
+    return out
+
+
+def _words_of(e: ast.AST) -> bool:
+    """`e` gives separate words: text.split(), re.findall(...), set(...)/list(...) of those."""
+    if isinstance(e, ast.Call):
+        f = e.func
+        if isinstance(f, ast.Attribute) and f.attr in ("split", "findall", "finditer"):
+            return True
+        if isinstance(f, ast.Name) and f.id in ("set", "list", "frozenset", "sorted") and e.args:
+            return _words_of(e.args[0])
+    return isinstance(e, (ast.List, ast.Tuple, ast.Set))
+
+
+def copied_tests(old: str, new: str) -> list[str]:
+    """Why an edit is refused for adding a test that copies one already there (its body, docstring aside, at least
+    90% the same): the copy repeats the same check under a new name, and any fix later has to find the same lines
+    twice (Nov 18, task 60: test_rule_a_never_keeps_sentence copied test_personal_glossary_sentence_not_kept, and
+    every edit was refused as "in the file 2 times")."""
+    def body(fn: ast.AST) -> str:
+        stmts = [s for s in fn.body if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant))]
+        return "\n".join(ast.unparse(s) for s in stmts)
+    a, b = _func_nodes(old), _func_nodes(new)
+    out = []
+    for name in sorted(set(b) - set(a)):
+        mine = body(b[name])
+        twin = next((o for o in sorted(a) if difflib.SequenceMatcher(None, mine, body(a[o])).ratio() >= 0.9), "")
+        if twin and mine:
+            out.append(f"it adds {name}, a copy of {twin} (change {twin} instead of adding a copy)")
+    return out
+
+
+def added_fields(old: str, new: str, request_words: set[str], broken: set[str] | frozenset = frozenset()) -> list[str]:
+    """Dict keys (fields) an edit adds to a test file that the request never names (task 57: "voice": True, a field
+    only the code had made up). A test in `broken` (it can't run: a build problem on its own lines) may gain the
+    fields the code needs to be called at all (Nov 18, task 60: record() takes entries with "term" and "id").
+    SyntaxError if either doesn't parse."""
+    def keys(text: str) -> set[str]:
+        return {k.value for n in ast.walk(ast.parse(text)) if isinstance(n, ast.Dict)
+                for k in n.keys if isinstance(k, ast.Constant) and isinstance(k.value, str)}
+    if broken:
+        new = restore_tests(old, new, set(broken))       # the edit with its broken tests' changes left out
+    return sorted(k for k in keys(new) - keys(old) if k.lower() not in request_words)
+
+
+_SILENCER = re.compile(r"#\s*(?:type:\s*ignore|noqa|pyright:\s*ignore)\b", re.IGNORECASE)
+
+
+def added_silencers(old: str, new: str) -> str:
+    """Why an edit is refused for adding comments that silence the checkers ('' when it adds none): a problem is
+    fixed, never hidden (Nov 18, task 60: `# type: ignore[arg-type]` on two wrong calls of record())."""
+    more = len(_SILENCER.findall(new)) - len(_SILENCER.findall(old))
+    return (f"it adds {more} comment{'s' if more != 1 else ''} that silence the checkers (# type: ignore, # noqa): fix "
+            "the problem itself instead") if more > 0 else ""
+
+
+_SKIP = re.compile(r"\b(?:SkipTest|skipTest|skipIf|skipUnless|unittest\.skip|pytest\.skip|mark\.skip)\b")
+
+
+def added_skips(old: str, new: str) -> str:
+    """Why an edit is refused for adding ways to skip tests ('' when it adds none): a skipped test checks nothing
+    (Nov 19, task 61: each missing module's import was caught and its tests made to raise SkipTest, so 37 of 47
+    tests were skipped and the run read as passed)."""
+    more = len(_SKIP.findall(new)) - len(_SKIP.findall(old))
+    return (f"it adds {more} way{'s' if more != 1 else ''} to skip tests (SkipTest, skipIf...): a skipped test checks "
+            "nothing, so fix the code or the test instead") if more > 0 else ""
+
+
+def skips_as_failures(sandbox: dict, earlier: Path | None, asked: str) -> None:
+    """A test file whose run skipped tests counts as failed, unless the request mentions skipping or the version
+    before already had ways to skip in that file (task 61: "passed" with 37 of 47 skipped)."""
+    if re.search(r"(?i)\bskip", asked):
+        return
+    for t, n in (sandbox.get("skipped") or {}).items():
+        before = earlier / t if earlier else None
+        if before is not None and before.is_file() and _SKIP.search(before.read_text(encoding="utf-8", errors="replace")):
+            continue
+        sandbox["tests"][t] = "failed"
+        note = (f"\n{n} test{'s were' if n != 1 else ' was'} skipped in {t}: a skipped test checks nothing, so this "
+                "counts as failed. Make the skipped tests run (the code they need must be there).")
+        sandbox["output"][t] = sandbox["output"].get(t, "") + note
+        if "full" in sandbox:
+            sandbox["full"][t] = sandbox["full"].get(t, "") + note
+        sandbox["status"] = "failed" if sandbox["status"] == "passed" else sandbox["status"]
+        steps.info("%s skipped %d test%s; a skipped test checks nothing, so it counts as failed.", t, n,
+                   "" if n == 1 else "s")
+
+
+def restore_tests(old: str, new: str, names: set[str]) -> str:
+    """`new` with each named test function put back as it is in `old` (a test not in both is left as it is)."""
+    a, b = _func_nodes(old), _func_nodes(new)
+    old_lines, new_lines = old.splitlines(keepends=True), new.splitlines(keepends=True)
+    spans = sorted(((b[n].lineno, b[n].end_lineno or b[n].lineno, n) for n in names if n in a and n in b),
+                   reverse=True)
+    for start, end, n in spans:                                  # from the bottom, so line numbers stay right
+        new_lines[start - 1:end] = old_lines[a[n].lineno - 1:a[n].end_lineno or a[n].lineno]
+    return "".join(new_lines)
+
+
+def never_fail(text: str) -> list[str]:
+    """Tests that can't fail: every assertion in them compares only fixed values (`assertTrue(True)`, `assert 1`),
+    or they hold nothing but a docstring, `pass` or a skip (Nov 18, task 60: test_3z_self_check_missing_tests was
+    `self.assertTrue(True, ...)`)."""
+    out = []
+    for name, fn in _func_nodes(text).items():
+        asserts = [n for n in ast.walk(fn) if isinstance(n, ast.Assert) or (isinstance(n, ast.Call) and isinstance(
+            n.func, ast.Attribute) and n.func.attr.startswith("assert"))]
+        if asserts:
+            fixed = all(all(isinstance(x, ast.Constant) for x in ([a.test] if isinstance(a, ast.Assert)
+                                                                  else a.args[:2] if a.args else [ast.Name()]))
+                        for a in asserts)
+            if fixed:
+                out.append(name)
+            continue
+        body = [s for s in fn.body if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant))]
+        if all(isinstance(s, ast.Pass) or (isinstance(s, ast.Expr) and isinstance(s.value, ast.Call)
+                                           and isinstance(s.value.func, ast.Attribute)
+                                           and s.value.func.attr == "skipTest") for s in body):
+            out.append(name)
+    return out
+
+
+def drop_tests(text: str, names: list[str]) -> str:
+    """`text` without the named test functions."""
+    nodes = _func_nodes(text)
+    lines = text.splitlines(keepends=True)
+    for n in sorted((nodes[x] for x in names if x in nodes), key=lambda n: -n.lineno):
+        start = n.lineno - 1 - len(n.decorator_list)
+        while start > 0 and lines[start - 1].strip().startswith("#"):     # its comment line(s) go with it
+            start -= 1
+        del lines[start:n.end_lineno or n.lineno]
+    return "".join(lines)
+
+
+def broken_tests(text: str, rel: str, problems: list[str]) -> set[str]:
+    """The functions in `rel` (tests, setUp and helpers) with a build problem on their own lines ("rel line N: ..."):
+    they can't run as written."""
+    lines = {int(m.group(1)) for x in problems for m in [re.match(rf"{re.escape(rel)} line (\d+)", x)] if m}
+    try:
+        funcs = [n for n in ast.walk(ast.parse(text)) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    except SyntaxError:
+        return set()
+    return {n.name for n in funcs if any(n.lineno <= ln <= (n.end_lineno or n.lineno) for ln in lines)}
+
+
+def _is_var(e: ast.AST, name: str) -> bool:
+    """`e` is the name itself, or name.lower() / .strip() / .casefold()."""
+    while isinstance(e, ast.Call) and isinstance(e.func, ast.Attribute) and e.func.attr in ("lower", "strip", "casefold"):
+        e = e.func.value
+    return isinstance(e, ast.Name) and e.id == name
+
+
+def part_word_checks(text: str) -> dict[str, str]:
+    """{test: why} for tests that check single words are NOT inside a whole text (assertNotIn), so a short word
+    matches inside another ("i" in "id", "t" in "term") and a correct program fails. Words from a loop over a list
+    with a word of 1 to 3 letters (symbols such as "$" or "?." are fine), or over words split from a sentence (Nov 18,
+    task 60: "I don't get syntax errors" checked against the saved file, which has "id" in it)."""
+    out = {}
+    for name, fn in _func_nodes(text).items():
+        assigns = {n.targets[0].id: n.value for n in ast.walk(fn) if isinstance(n, ast.Assign)
+                   and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)}
+        for loop in [n for n in ast.walk(fn) if isinstance(n, ast.For) and isinstance(n.target, ast.Name)]:
+            it = assigns.get(loop.iter.id, loop.iter) if isinstance(loop.iter, ast.Name) else loop.iter
+            consts = [c.value for c in getattr(it, "elts", []) if isinstance(c, ast.Constant) and isinstance(c.value, str)]
+            words = (isinstance(it, (ast.List, ast.Tuple, ast.Set))
+                     and any(c.strip().isalpha() and len(c.strip()) <= 3 for c in consts)) \
+                or (isinstance(it, ast.Call) and _words_of(it))
+            if not words:
+                continue
+            for c in ast.walk(loop):
+                if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute) \
+                        and c.func.attr == "assertNotIn" and len(c.args) >= 2 \
+                        and _is_var(c.args[0], loop.target.id):
+                    hay = c.args[1]
+                    hay = assigns.get(hay.id, hay) if isinstance(hay, ast.Name) else hay
+                    if not _words_of(hay):
+                        out[name] = (f"{name} looks for single words inside the whole text, so a short word matches "
+                                     "inside another (\"i\" in \"id\"): split the text into words first (for example "
+                                     "re.findall(r\"[\\w']+\", text.lower())) and check against those")
+    return out
+
+
+def weakened_tests(old: str, new: str) -> list[str]:
+    """Why each test an edit changed now checks less than it did (none: []): an assertion looks inside a part of
+    what it looked at whole (the saved entry -> one field of it), or a loop of values to check lost some."""
+    a, b = _func_nodes(old), _func_nodes(new)
+    why = []
+    for name in sorted(n for n in a if n in b and _norm(ast.unparse(a[n])) != _norm(ast.unparse(b[n]))):
+        before, after = _scopes(a[name]), _scopes(b[name])
+        narrowed = [k for k, d in before.items() if k in after and after[k] > d]
+        if narrowed:
+            why.append(f"{name} now checks only a part of what it checked before (of "
+                       + ", ".join(f"`{k}`" for k in narrowed) + "): keep checking all of it, as the request says")
+        old_loops = _loop_values(a[name])
+        new_loops = _loop_values(b[name])
+        lost = [v for v in old_loops if not any(v <= w for w in new_loops)
+                and any(w < v for w in new_loops)]
+        if lost:
+            gone = sorted({str(x) for v in lost for x in v} - {str(x) for w in new_loops for x in w})
+            why.append(f"{name} checks fewer values than before (dropped: {', '.join(gone[:6])})")
+    return why
+
+
 def _test_fix_missed(test: str, said: str, before: str, after: str) -> bool:
     """A Sandbox fix of a failing test that was tried (edits were sent) but left its failing tests as they were.
     "No edits sent" means the model judged the test right, so the code is fixed as usual; so is a test whose code
@@ -613,6 +947,15 @@ def _keep_unasked(plan: dict, parent: dict, change: str) -> None:
             f["change"] = "changed"
         if f["path"] in before and (f["path"] in left or only and f["path"] not in named):
             f["change"] = "same"
+    # every file of the earlier version stays unless the change asks for it to go (Nov 19, task 61: "run your own
+    # self check for bloat" got a plan of 9 of the Academy's 14 files, and the other 5 modules were simply gone)
+    planned = {f["path"] for f in plan["files"]}
+    earlier = earlier_files(parent)
+    gone = _names(" ".join(_REMOVE.findall(change)), earlier, stems=True)
+    for f in earlier:
+        if f["path"] not in planned and f["path"] not in gone:
+            plan["files"].append({"path": f["path"], "purpose": f.get("purpose", ""), "change": "same"})
+            plan.setdefault("kept_unplanned", []).append(f["path"])
 
 
 def parse_plan(text: str, max_files: int) -> tuple[str, str, dict]:
@@ -727,25 +1070,35 @@ CSHARP5 = (" It's compiled with the C# compiler that comes with Windows (.NET Fr
 _WINDOWS_CSC = re.compile(r"csc(?:\.exe)?\b|\.NET Framework|Framework64|compiler that comes with Windows", re.I)
 
 
+def stable_start(paths, plan: dict) -> list[str]:
+    """`paths` with the files this version leaves as they are first, then the files it changes, each group in the
+    order given (the order they were written, which only grows). A step's start is then the same from one step to the
+    next up to the first file that changes, which a provider's prompt cache and this PC's server can reuse (Nov 19,
+    colibri idea: Cerebras's cached tokens, llama-server's cache reuse)."""
+    changed = {f.get("path") for f in plan.get("files", []) if f.get("change") not in ("same", None)}
+    return sorted(paths, key=lambda r: r in changed)
+
+
 def _file_messages(p: dict, desc: str, plan: dict, rel: str, written: dict[str, str], budget: int,
                    old: str | None) -> list[dict]:
     flavour = ("\n\n" + JOOMLA) if p.get("joomla") else ""
     listing = "\n".join(f"- {f['path']}: {f['purpose']}" for f in plan["files"])
     purpose = next((f["purpose"] for f in plan["files"] if f["path"] == rel), "")
     md = rel.lower().endswith(".md")
-    context, used = [], 0
+    context, used = {}, 0
     for path, body in reversed(list(written.items())):            # the most recent files first
         piece = f"--- {path} ---\n{body}"
         if used + len(piece) > budget:
-            context.append(f"--- {path} --- (written; too long to show here)")
+            context[path] = f"--- {path} --- (written; too long to show here)"
             continue
-        context.append(piece)
+        context[path] = piece
         used += len(piece)
     msgs = [{"role": "system", "content": SYSTEM + flavour},
             {"role": "user", "content": f"The project: {redact(p['request'])}\n\nThe design:\n{desc[:4000]}\n\n"
                                         f"All its files:\n{listing}"}]
     if context:
-        msgs.append({"role": "user", "content": "Files already written:\n" + "\n\n".join(reversed(context))})
+        msgs.append({"role": "user", "content": "Files already written:\n" + "\n\n".join(
+            context[r] for r in stable_start(reversed(list(context)), plan))})
     if old is not None:
         msgs.append({"role": "user", "content": f"The earlier version of {rel}:\n{old[:budget // 2]}\n\n"
                                                 f"The change wanted: {redact(p.get('change', ''))}"})
@@ -867,11 +1220,140 @@ def _reindent(repl: str, indent: str, first_has_it: bool) -> str:
 
 
 _ELSEWHERE = "its FIND text is from "
+NEAR_LINES = 15
+
+
+def _occurrences(body: str, find: str) -> list[tuple[int, int]]:
+    """Every place `find` is in `body`, as (start, end): exact copies, else line by line ignoring spaces at the
+    ends of lines (as _find_once matches)."""
+    if body.count(find) > 1:
+        return [(m.start(), m.end()) for m in re.finditer(re.escape(find), body)]
+    lines = body.split("\n")
+    want = [l.strip() for l in find.strip("\n").split("\n")]
+    starts = [0]
+    for l in lines:
+        starts.append(starts[-1] + len(l) + 1)
+    return [(starts[i], starts[i + len(want)] - 1) for i in range(len(lines) - len(want) + 1)
+            if all(lines[i + k].strip() == want[k] for k in range(len(want)))]
+
+
+_QUOTED = re.compile(r'"((?:[^"\\\n]|\\.){8,})"')
+_QUOTE_WORD = re.compile(r"[\w\\/-]+(?:\.[\w\\/-]+)*")     # file names keep their dots, a sentence's end doesn't
+
+
+def keep_quotes(find: str, repl: str, known: str) -> tuple[str, list[tuple[str, str]]]:
+    """A quoted text the edit retyped with one word misspelt gets its original back: (REPLACE, [(new, old)]).
+    Nov 19, task 59: adding a line above the "Setup is done" message, the model retyped that message and wrote
+    start-outhos.bat for start-othos.bat, and "every other line kept" was still said. Only one word changed, a
+    small change to that word, and the new word in nothing the model was given (`known`: its messages), so a
+    change the request asks for ("say start-othos.bat") is never undone."""
+    if not known:
+        return repl, []
+    olds = _QUOTED.findall(find)
+    put_back = []
+    for new in dict.fromkeys(_QUOTED.findall(repl)):
+        if new in olds:
+            continue
+        for old in olds:
+            words = None if f'"{old}"' in repl else _misspelt(old, new, known)
+            if words and repl.count(words[0]) == new.count(words[0]):     # used elsewhere in the edit: a rename
+                repl = repl.replace(f'"{new}"', f'"{old}"')
+                put_back.append(words)
+                break
+    return repl, put_back
+
+
+def _misspelt(old: str, new: str, known: str) -> tuple[str, str] | None:
+    """(new word, old word) when `new` is `old` with one word slightly changed into a word `known` doesn't have."""
+    a, b = _QUOTE_WORD.findall(old), _QUOTE_WORD.findall(new)
+    ops = [o for o in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes() if o[0] != "equal"]
+    if len(ops) != 1 or ops[0][0] != "replace" or ops[0][2] - ops[0][1] != 1 or ops[0][4] - ops[0][3] != 1:
+        return None
+    was, now = a[ops[0][1]], b[ops[0][3]]
+    if now.lower() == was.lower() or "$" in new:      # a capital, or a PowerShell variable renamed inside the quotes
+        return None
+    # a slip changes a letter or two; a word grown or cut at an end (sensitive -> insensitive, a folder put in
+    # front) or only its punctuation changed (unknownterm -> unknown-term) is meant
+    if (was in now or now in was or abs(len(now) - len(was)) > 2
+            or re.sub(r"[\W_]", "", now).lower() == re.sub(r"[\W_]", "", was).lower()):
+        return None
+    if difflib.SequenceMatcher(None, was, now).ratio() >= 0.75 and now not in known and new.replace(now, was) == old:
+        return now, was
+    return None
+
+
+def misspelt_since(folder: Path, before: Path, rels: list[str], asked: str) -> list[str]:
+    """Quoted texts that, since the version this one was built from (`before`), have one word slightly changed
+    into a word neither the request nor that version has (Nov 19, task 59: "start-outhos.bat" for start-othos.bat,
+    made in an earlier run, so the edit-time guard never saw it and a continue left it)."""
+    problems = []
+    for rel in rels:
+        old_path, new_path = before / rel, folder / rel
+        if not old_path.is_file() or not new_path.is_file():
+            continue
+        old_text = old_path.read_text(encoding="utf-8-sig", errors="replace")
+        new_text = new_path.read_text(encoding="utf-8-sig", errors="replace")
+        olds = set(_QUOTED.findall(old_text))
+        news = set(_QUOTED.findall(new_text))
+        gone = [o for o in olds if o not in news]
+        for m in _QUOTED.finditer(new_text):
+            if m.group(1) in olds:
+                continue
+            words = next((w for o in gone if (w := _misspelt(o, m.group(1), asked + "\n" + old_text))), None)
+            # a word the new code uses outside this text too is a rename, not a slip
+            if words and new_text.count(words[0]) == m.group(1).count(words[0]):
+                line = new_text.count("\n", 0, m.start()) + 1
+                problems.append(f"{rel} line {line}: this quoted text says {words[0]}, which was {words[1]} in the "
+                                f"version before, and nothing asks for {words[0]}: put {words[1]} back")
+    return problems
+
+
+_PATH_FROM = re.compile(r'\b(?:Path\.Combine|os\.path\.join|Join-Path)\(?\s*(\$?\w+)\s*,\s*["\']([^"\'\\/]+)["\']')
+
+
+def paths_off_base(folder: Path, before: Path, rels: list[str], asked: str) -> list[str]:
+    """A path the request names built from a folder that the version before only ever took through one subfolder:
+    v23 used targetFolder twice, both as Path.Combine(targetFolder, "agent", ...); v24 saved the request's
+    state\\google-prompt.json as Path.Combine(targetFolder, "state"), outside agent\\, where Othos reads it (Nov 19,
+    task 59). Only for a first folder the request names in a path ("state\\..."), and never for one the version
+    before used too."""
+    used: dict[str, set[str]] = {}
+    counts: dict[str, int] = {}
+    for p in before.rglob("*"):
+        if p.is_file() and p.suffix.lower() in (".cs", ".py", ".ps1", ".psm1"):
+            for base, seg in _PATH_FROM.findall(p.read_text(encoding="utf-8-sig", errors="replace")):
+                used.setdefault(base, set()).add(seg)
+                counts[base] = counts.get(base, 0) + 1
+    problems = []
+    for rel in rels:
+        path = folder / rel
+        if not path.is_file() or path.suffix.lower() not in (".cs", ".py", ".ps1", ".psm1"):
+            continue
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
+        for m in _PATH_FROM.finditer(text):
+            base, seg = m.group(1), m.group(2)
+            only = used.get(base, set())
+            if (len(only) != 1 or counts[base] < 2 or seg in only
+                    or not re.search(rf"(?<![\w-]){re.escape(seg)}[\\/]", asked)):
+                continue
+            sub = next(iter(only))
+            line = text.count("\n", 0, m.start()) + 1
+            problems.append(f"{rel} line {line}: {seg} is built straight from {base}, but the version before only "
+                            f"ever took {base} through \"{sub}\" ({counts[base]} times), where the program's own files "
+                            f"are: build the request's {seg}\\ path inside {base}\\{sub} the same way")
+    return problems
 
 
 def apply_edits(body: str, edits: list[tuple[str, str]], brace: bool = False,
-                others: dict[str, str] | None = None) -> tuple[str, int, list[str]]:
-    """Apply the pairs in order. Returns (new body, how many applied, problems for the ones that weren't).
+                others: dict[str, str] | None = None,
+                spread: list[tuple[int, int]] | None = None,
+                near: list[int] | tuple = (), known: str = "") -> tuple[str, int, list[str]]:
+    """`known`: the text the model was given; a quoted text an edit retyped with a word misspelt gets its
+    original back (keep_quotes).
+    `near`: the lines the problems being fixed name; a FIND that's in the file several times goes to the one
+    copy within NEAR_LINES of such a line, when exactly one copy is (Nov 18, task 59: a fix for unreachable code at
+    line 1279 sent FIND "return;", in the file 12 times; it missed twice and a whole fix round was lost).
+    Apply the pairs in order. Returns (new body, how many applied, problems for the ones that weren't).
     A pair that can't be found exactly once is skipped, never guessed. brace: a brace language (C#, JS,
     PHP, PowerShell, CSS...), where lines that lost their indentation get it back. others: the build's other
     files; a FIND found in one of them (not here) is said to be from that file (Nov 16, task 57: asked for
@@ -888,6 +1370,19 @@ def apply_edits(body: str, edits: list[tuple[str, str]], brace: bool = False,
                             "overwrite a hidden value: leave the lines with [REDACTED] out of the edit")
             continue
         where = _find_once(body, find)
+        if isinstance(where, str) and near and " times (" in where:
+            close = [o for o in _occurrences(body, find)
+                     if any(abs(body.count("\n", 0, o[0]) + 1 - n) <= NEAR_LINES for n in near)]
+            if len(close) == 1:
+                where = close[0]
+        if isinstance(where, str) and spread and find.strip() and body.count(find) > 1:
+            # the same lines in several failing tests that the fix is for: changed in each (Nov 18, task 60: a
+            # copied test held the same part-of-word check, and every edit was refused as "in the file 2 times")
+            at = [body.count("\n", 0, m.start()) + 1 for m in re.finditer(re.escape(find), body)]
+            if all(any(a <= ln <= b for a, b in spread) for ln in at):
+                body = body.replace(find, repl)
+                done += 1
+                continue
         if isinstance(where, str) and _unfence(find) != find and _unfence(find).strip():
             # the model wrapped its FIND in a ``` fence (task 40): try it without, and its REPLACE too
             unf = _find_once(body, _unfence(find))
@@ -903,6 +1398,9 @@ def apply_edits(body: str, edits: list[tuple[str, str]], brace: bool = False,
             problems.append(f"edit {k} (FIND starting \"{first}\"): {where}")
             continue
         a, b = where
+        repl, put_back = keep_quotes(find, repl, known)
+        for now, was in put_back:
+            steps.info("An edit retyped a quoted text with %s for %s; the original is kept.", now, was)
         line_start = body.rfind("\n", 0, a) + 1
         if brace and repl.strip():
             line_end = body.find("\n", line_start)
@@ -925,8 +1423,9 @@ def _edit_messages(p: dict, desc: str, plan: dict, rel: str, written: dict[str, 
     """`cap`: characters of each file already written to show (a README needs to see the code)."""
     flavour = ("\n\n" + JOOMLA) if p.get("joomla") else ""
     listing = "\n".join(f"- {f['path']}: {f['purpose']}" for f in plan["files"])
-    others = "\n\n".join(f"--- {path} ---\n{body[:cap]}" + ("\n(... cut here)" if len(body) > cap else "")
-                         for path, body in written.items())
+    others = "\n\n".join(f"--- {path} ---\n{written[path][:cap]}" + ("\n(... cut here)" if len(written[path]) > cap
+                                                                    else "")
+                         for path in stable_start(written, plan))
     csharp = CSHARP5 if rel.lower().endswith(".cs") and _WINDOWS_CSC.search(
         " ".join([str(p.get("request", "")), str(p.get("change", "")), desc, old] + list(written.values()))) else ""
     msgs = [{"role": "system", "content": SYSTEM + flavour},
@@ -963,10 +1462,16 @@ def _sort_out_elsewhere(edits: list[tuple[str, str]], old: str, others: dict[str
     return mine
 
 
+EXTRA_FIX_ROUNDS = 2     # more check rounds, one at a time, while each round puts something right
+RETRY_WAIT_S = 65        # seconds a second try at missed edits waits for a strong model (a minute's limit clears)
+
+
 def _edit_file(ctx, job_id: int, msgs: list[dict], rel: str, old: str,
                none_ok: bool = True, others: dict[str, str] | None = None,
                movable: set[str] | None = None,
-               elsewhere: dict[str, list[tuple[str, str]]] | None = None) -> tuple[str, str]:
+               elsewhere: dict[str, list[tuple[str, str]]] | None = None,
+               spread: list[tuple[int, int]] | None = None,
+               near: list[int] | tuple = ()) -> tuple[str, str]:
     """A long file changed by find/replace pairs. Returns (new body, a note for the result).
     No edits at all: the file is kept as it was (the plan can call a file "changed" that the change
     doesn't touch; Nov 13, task 18 failed on that), or with none_ok=False, ValueError.
@@ -988,26 +1493,48 @@ def _edit_file(ctx, job_id: int, msgs: list[dict], rel: str, old: str,
             return old, f"`{rel}`: no edits sent, so kept exactly as it was"
         raise ValueError(f"the changes to {rel} didn't come back as edits I could apply")
     brace = Path(rel).suffix.lower() in _BRACES
-    body, done, problems = apply_edits(old, edits, brace, others)
+    known = "\n".join(str(m.get("content", "")) for m in msgs)
+    body, done, problems = apply_edits(old, edits, brace, others, spread, near, known)
     if problems:                                          # one more try for the ones that missed
         log.info("build %d: %s, %d of %d edits applied; asking again for %d", job_id, rel, done, len(edits),
                  len(problems))
         steps.info("%s: %d of %d edits went in; %d couldn't be found, asking again for %s.", rel, done, len(edits),
                    len(problems), "it" if len(problems) == 1 else "them")
-        with worker_shared.answer_shape(EDITS_SCHEMA):
-            again = ctx.chat(msgs + [{"role": "assistant", "content": reply},
-                                     {"role": "user", "content":
-                                      "These edits couldn't be applied, so they weren't:\n- " + "\n- ".join(problems)
-                                      + f"\n\nThe others are already in. Here is {rel} now:\n```\n{body}\n```\n\n"
-                                      + (f"Edits whose FIND is from another file aren't for {rel}: drop them. "
-                                         if any(_ELSEWHERE in x for x in problems) else "")
-                                      + f"Send only the missed edits for {rel} again, with the FIND lines copied "
-                                      "exactly from it. " + EDIT_FORMAT}], 6000)
+        retry_msgs = msgs + [{"role": "assistant", "content": reply},
+                             {"role": "user", "content":
+                              "These edits couldn't be applied, so they weren't:\n- " + "\n- ".join(problems)
+                              + f"\n\nThe others are already in. Here is {rel} now:\n```\n{body}\n```\n\n"
+                              + (f"Edits whose FIND is from another file aren't for {rel}: drop them. "
+                                 if any(_ELSEWHERE in x for x in problems) else "")
+                              + f"Send only the missed edits for {rel} again, with the FIND lines copied "
+                              "exactly from it. " + EDIT_FORMAT}]
+        # the second try waits for a strong cloud model, never this PC's: a per-minute limit clears in about a minute
+        # (Nov 18, task 60: every provider was busy for one minute, so this went to this PC's model, which worked 40
+        # minutes and sent 0 usable edits). Still none after the wait: the missed edits stay missed this round.
+        again = ""
+        min_b = float((getattr(ctx, "cfg", None) or {}).get("rewrite_min_model_b", 70) or 0)
+        stop = getattr(ctx, "_should_stop", None)
+        for wait in (0, RETRY_WAIT_S):
+            if wait:
+                steps.info("No strong model has room for the missed edits; waiting %d seconds for one.", wait)
+                end = time.monotonic() + wait
+                while time.monotonic() < end:
+                    if stop:
+                        stop(0)
+                    time.sleep(1)
+            try:
+                with worker_shared.answer_shape(EDITS_SCHEMA), worker_shared.strong_models(min_b):
+                    again = ctx.chat(retry_msgs, 6000)
+                break
+            except worker_cloud.NoStrongModel as e:
+                log.info("build %d: %s, missed edits: %s", job_id, rel, e)
+        if not again:
+            steps.info("%s: no strong model was free for the missed edits; they're left for the next round.", rel)
         more = parse_edits(again)
         if more and movable and elsewhere is not None:
             more = _sort_out_elsewhere(more, body, others, movable - {rel}, elsewhere)
         if more:                                       # no edits in the reply: the missed ones stay missed
-            body, done2, problems = apply_edits(body, more, brace, others)
+            body, done2, problems = apply_edits(body, more, brace, others, spread, near, known)
             done += done2
     note = f"`{rel}`: changed by {done} edit{'s' if done != 1 else ''}; every other line kept as it was"
     if problems:
@@ -1027,6 +1554,9 @@ _CSC = [Path(os.environ.get("SystemRoot", r"C:\Windows")) / "Microsoft.NET" / fw
 _CSC_REFS = ["System.dll", "System.Core.dll", "System.Data.dll", "System.Drawing.dll",
              "System.Windows.Forms.dll", "System.Xml.dll"]
 _CSC_ERR = re.compile(r"^(.*?)\((\d+),\d+\): error (CS\d+): (.*)$")
+# the compiler warnings that mean code never runs, read as problems (Nov 18, task 59: "return;" right after making the
+# Google page left 80 lines that could never run, CS0162, and the build checked clean because only errors were read)
+_CSC_WARN_BAD = re.compile(r"^(.*?)\((\d+),\d+\): warning (CS0162): (.*)$")
 _NO_WINDOW = 0x08000000                                     # CREATE_NO_WINDOW
 _BRACES = {".cs", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".php", ".ps1", ".psm1", ".css", ".scss", ".java", ".c", ".h"}
 
@@ -1079,7 +1609,7 @@ def _cs_errors(folder: Path, rels: list[str], target: str = "library", refs=()) 
             return [f"the C# compiler couldn't be run ({e})"]
     errors = []
     for line in out.splitlines():
-        m = _CSC_ERR.match(line.strip())
+        m = _CSC_ERR.match(line.strip()) or _CSC_WARN_BAD.match(line.strip())
         if m:
             try:
                 where = Path(m.group(1)).resolve().relative_to(folder.resolve()).as_posix()
@@ -1087,6 +1617,169 @@ def _cs_errors(folder: Path, rels: list[str], target: str = "library", refs=()) 
                 where = Path(m.group(1)).name
             errors.append(f"{where} line {m.group(2)}: {m.group(3)}: {m.group(4)}")
     return errors
+
+
+_CS_NOISE = re.compile(r'//[^\n]*|/\*.*?\*/|@"(?:[^"]|"")*"|"(?:[^"\\\n]|\\.)*"|\'(?:[^\'\\\n]|\\.)+\'', re.DOTALL)
+_CS_TYPE = re.compile(r"^[ \t]*(?:(?:public|internal|private|protected|sealed|abstract|static|partial)\s+)*"
+                      r"(class|struct|enum|interface)\s+(\w+)", re.MULTILINE)
+_CS_MAIN = re.compile(r"\bstatic\s+(?:void|int|async\s+\w+)\s+Main\s*\(")
+
+
+def unused_cs_types(folder: Path, rels: list[str]) -> list[str]:
+    """Types a program (/target:winexe or exe) never uses: a class, struct, enum or interface whose name appears
+    nowhere in the compiled files but its own declaration and constructors (comments and strings don't count).
+    Nov 18, task 59: GooglePrompt.cs's class compiled clean and nothing used it, because OthosSetup.cs had its own
+    copy of the same page; two copies that drift apart, and nothing checked. The problem is named in the file with
+    Main (the program's start), where the fix is to use the class, in place of any copy of it there."""
+    texts = {r: _CS_NOISE.sub(lambda m: "\n" * m.group(0).count("\n"),
+                              (folder / r).read_text(encoding="utf-8-sig", errors="replace")) for r in rels}
+    starts = {r: s.start() for r, t in texts.items() if (s := _CS_MAIN.search(t))}
+    main = next(iter(starts), None)
+    problems = []
+    for rel, text in texts.items():
+        for m in _CS_TYPE.finditer(text):
+            kind, name = m.group(1), m.group(2)
+            if "partial" in m.group(0).split() or (rel == main and _owns_main(text, m.end())):
+                continue
+            word = re.compile(rf"\b{re.escape(name)}\b")
+            ctor = re.compile(rf"(?:public|internal|private|protected|static)\s+{re.escape(name)}\s*\(")
+            uses = sum(len(word.findall(t)) for t in texts.values()) - 1 - len(ctor.findall(text))
+            if uses > 0:
+                continue
+            line = text.count("\n", 0, m.start()) + 1
+            if main and main != rel:
+                at = texts[main].count("\n", 0, starts[main]) + 1
+                problems.append(f"{main} line {at}: the program never uses {kind} {name} from {rel} (line {line}): "
+                                f"nothing creates or calls it, so its code never runs. Where it belongs, create it AND "
+                                f"call what it does (e.g. its Show()), so it really runs; if {main} has its own copy of "
+                                f"what {name} does, remove that copy completely, so there's one copy")
+            else:
+                problems.append(f"{rel} line {line}: the program never uses {kind} {name}: nothing creates or calls "
+                                "it, so its code never runs. Where it belongs, create it AND call what it does, or take "
+                                "it out if other code already does the same job")
+    return problems
+
+
+_CS_NEW_LOCAL = re.compile(r"\b(?:var|[A-Z]\w*(?:<[^<>;=]*>)?)\s+(\w+)\s*=\s*new\s+([A-Z]\w*)")
+
+
+def unused_cs_objects(folder: Path, rels: list[str]) -> list[str]:
+    """A local made with `new` and never used again in its block: `var prompt = new GooglePrompt(...);` and nothing
+    calls prompt.Show(), so the page never shows (Nov 18, task 59, after the unused-class check: the class was
+    "used" by being made, and nothing it does ever ran). `using (var x = new ...)` is left alone."""
+    problems = []
+    for rel in rels:
+        text = _CS_NOISE.sub(lambda m: "\n" * m.group(0).count("\n"),
+                             (folder / rel).read_text(encoding="utf-8-sig", errors="replace"))
+        for m in _CS_NEW_LOCAL.finditer(text):
+            name, made = m.group(1), m.group(2)
+            if text[:m.start()].rstrip().endswith(("(", ".")):  # using (var x = ...), or a dotted type's tail
+                continue
+            depth, end = 0, len(text)
+            for i in range(m.end(), len(text)):          # the rest of the block it's declared in
+                if text[i] == "{":
+                    depth += 1
+                elif text[i] == "}":
+                    depth -= 1
+                    if depth < 0:
+                        end = i
+                        break
+            if re.search(rf"\b{re.escape(name)}\b", text[m.end():end]):
+                continue
+            line = text.count("\n", 0, m.start(1)) + 1
+            problems.append(f"{rel} line {line}: {name} is made (new {made}) and never used after that, so nothing it "
+                            f"does happens: call what it's for (e.g. {name}.Show()), or take it out")
+    return problems
+
+
+_CS_PRIVATE_METHOD = re.compile(r"\bprivate\s+(?:(?:static|async|unsafe|extern)\s+)*[\w<>\[\],.?]+\s+(\w+)\s*\(")
+
+
+def unused_cs_methods(folder: Path, rels: list[str]) -> list[str]:
+    """A private method whose name is nowhere in the build's files but its own declaration: nothing calls it, and
+    the compiler says nothing (Nov 19, task 59: OthosSetup.cs kept its own WriteGooglePromptJson after the page
+    moved to GooglePrompt.cs, which has the one that runs; two copies that drift apart)."""
+    texts = {r: _CS_NOISE.sub(lambda m: "\n" * m.group(0).count("\n"),
+                              (folder / r).read_text(encoding="utf-8-sig", errors="replace")) for r in rels}
+    problems = []
+    for rel, text in texts.items():
+        for m in _CS_PRIVATE_METHOD.finditer(text):
+            name = m.group(1)
+            if name == "Main":
+                continue
+            word = re.compile(rf"\b{re.escape(name)}\b")
+            # private: only its own class can call it, so its own file (all files when a class there is partial)
+            where = texts.values() if re.search(r"\bpartial\s+class\b", text) else [text]
+            if sum(len(word.findall(t)) for t in where) > 1:
+                continue
+            line = text.count("\n", 0, m.start(1)) + 1
+            decl = re.compile(rf"[\w>\]?]\s+{re.escape(name)}\s*\(")
+            twin = next((r for r, t in texts.items() if r != rel and decl.search(t)), "")
+            problems.append(f"{rel} line {line}: the method {name} is never called, so its code never runs"
+                            + (f"; {twin} has its own {name}, the one that runs, so remove this copy completely"
+                               if twin else ": call it where it's needed, or remove it"))
+    return problems
+
+
+_CS1061 = re.compile(r"CS1061: '(?:[\w.]+\.)?(\w+)' does not contain a definition for '(\w+)'")
+_CS_MEMBER = re.compile(r"\b(?:public|internal)\s+(?:(?:static|override|virtual|abstract|new|readonly)\s+)*"
+                        r"[\w<>\[\],.?]+\s+(\w+)\s*(\(|\{|=|;)")
+
+
+def name_cs_members(folder: Path, rels: list[str], errs: list[str]) -> list[str]:
+    """A "does not contain a definition for X" error (CS1061) on a type from the build's own files says what it does
+    have: "GooglePrompt has: Show()" (Nov 18, task 59: the fix called prompt.ShowDialog(), a Form's method, on a
+    class whose method is Show(), and the rounds ran out before it was put right)."""
+    if not any(_CS1061.search(e) for e in errs):
+        return errs
+    texts = {r: _CS_NOISE.sub(lambda m: "\n" * m.group(0).count("\n"),
+                              (folder / r).read_text(encoding="utf-8-sig", errors="replace")) for r in rels}
+    out = []
+    for e in errs:
+        m = _CS1061.search(e)
+        has: list[str] = []
+        if m:
+            for text in texts.values():
+                for t in _CS_TYPE.finditer(text):
+                    if t.group(2) != m.group(1):
+                        continue
+                    body = _block_after(text, t.end())
+                    has += [n + ("()" if k == "(" else "") for n, k in _CS_MEMBER.findall(body) if n != m.group(1)]
+        out.append(e + (f". {m.group(1)} has: {', '.join(dict.fromkeys(has))}; use one of those" if m and has else ""))
+    return out
+
+
+def _block_after(text: str, end: int) -> str:
+    """The text inside the first { ... } after `end` (comments and strings already blanked)."""
+    open_at = text.find("{", end)
+    if open_at < 0:
+        return ""
+    depth = 0
+    for i in range(open_at, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_at + 1:i]
+    return text[open_at + 1:]
+
+
+def _owns_main(text: str, end: int) -> bool:
+    """Whether the type declared just before `end` holds Main within its braces (comments and strings already
+    blanked, so the braces are the code's own)."""
+    open_at = text.find("{", end)
+    if open_at < 0:
+        return False
+    depth = 0
+    for i in range(open_at, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return bool(_CS_MAIN.search(text, open_at, i))
+    return bool(_CS_MAIN.search(text, open_at))
 
 
 _PS_PARSE = ("$ErrorActionPreference = 'SilentlyContinue'\n"
@@ -1138,7 +1831,11 @@ def build_problems(folder: Path, rels: list[str], stdlib_only: bool = False,
         if errs is None:
             checked.append("C# not checked (no compiler on this PC)")
         else:
-            problems += errs
+            problems += name_cs_members(folder, cs, errs)
+            if not errs:
+                problems += unused_cs_objects(folder, cs) + unused_cs_methods(folder, cs)
+                if script and script["target"] in ("winexe", "exe"):
+                    problems += unused_cs_types(folder, cs)    # a program, not a library: nothing may sit unused
             checked.append(f"C# compiled together ({len(cs)} file{'s' if len(cs) != 1 else ''}"
                            + (f", as {script['script']} compiles it: /target:{script['target']}" if script else "")
                            + ")")
@@ -1176,6 +1873,7 @@ def build_problems(folder: Path, rels: list[str], stdlib_only: bool = False,
         tests = [r for r in py if _is_test(r)]
         for r in tests:
             problems += test_main_problems(r, (folder / r).read_text(encoding="utf-8-sig", errors="replace"))
+            problems += chdir_problems(r, (folder / r).read_text(encoding="utf-8-sig", errors="replace"))
         if tests:
             checked.append("unittest.main() placed so the tests run")
         for r in py:
@@ -1184,8 +1882,76 @@ def build_problems(folder: Path, rels: list[str], stdlib_only: bool = False,
                 + ([] if net_ok else network_problems(r, text))
         checked.append("no change to Python's own modules, no deleting outside the build"
                        + ("" if net_ok else ", no network use (the request doesn't ask for it)"))
+        unused = unused_py_code(folder, py)
+        if unused is not None:
+            problems += unused
+            checked.append("no unused copies or private functions")
     more, said = smithy_checkers.check_all(folder, rels)      # ruff, pyright, PSScriptAnalyzer, tsc, javac
     return problems + more, checked + said
+
+
+_PY_COMMENT = re.compile(r"#[^\n]*")
+_WORD = re.compile(r"\b[A-Za-z_]\w*\b")
+_FROM_IMPORT = re.compile(r"\bfrom\s+(\w+)\s+import\s+(?:\(([^)]*)\)|([^\n]*))")
+_DOTTED = re.compile(r"\b(\w+)\.(\w+)\b")
+
+
+def unused_py_code(folder: Path, rels: list[str]) -> list[str] | None:
+    """Top-level functions and classes nothing in the build uses: a private one (_name), and a copy of one another
+    file defines too, where the other copy is the one in use. Uses inside unused code don't count, so a dead copy's
+    helpers go with it. Public names alone are left: other programs may call them (Nov 19, task 61's review:
+    academy_sources.py held a whole unused copy of build_lesson and 8 helpers; academy_lesson.py has the one that
+    runs, and no check saw it). None when a file doesn't parse (the parse error is named elsewhere)."""
+    texts = {r: (folder / r).read_text(encoding="utf-8-sig", errors="replace") for r in rels}
+    defs: dict[str, list[tuple[str, int, int]]] = {}       # rel -> [(name, first line, last line)]
+    try:
+        for r, t in texts.items():
+            defs[r] = [(n.name, n.lineno, n.end_lineno or n.lineno) for n in ast.parse(t).body
+                       if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+    except SyntaxError:
+        return None
+    where: dict[str, set[str]] = {}
+    for r, ds in defs.items():
+        for name, _, _ in ds:
+            where.setdefault(name, set()).add(r)
+    stems = {Path(r).stem: r for r in rels}
+    dead: set[tuple[str, str]] = set()
+    while True:                                            # until nothing new: a dead copy's helpers die with it
+        words: dict[str, collections.Counter] = {}
+        used_from: dict[str, set[str]] = {r: set() for r in rels}     # rel -> names other files take from it
+        for r, t in texts.items():
+            lines = t.splitlines()
+            for name, a, b in defs[r]:
+                if (r, name) in dead:
+                    lines[a - 1:b] = [""] * (b - a + 1)
+            live = _PY_COMMENT.sub("", "\n".join(lines))
+            words[r] = collections.Counter(_WORD.findall(live))
+            for m in _FROM_IMPORT.finditer(live):
+                if m.group(1) in stems and stems[m.group(1)] != r:
+                    used_from[stems[m.group(1)]] |= set(_WORD.findall(m.group(2) or m.group(3)))
+            for m in _DOTTED.finditer(live):
+                if m.group(1) in stems and stems[m.group(1)] != r:
+                    used_from[stems[m.group(1)]].add(m.group(2))
+        found = set()
+        for r, ds in defs.items():
+            for name, _, _ in ds:
+                if (r, name) in dead or name.startswith(("test", "__")) or name == "main":
+                    continue
+                if words[r][name] <= 1 and name not in used_from[r] and (name.startswith("_") or len(where[name]) > 1):
+                    found.add((r, name))
+        if not found:
+            break
+        dead |= found
+    problems = []
+    for r, ds in defs.items():
+        for name, a, _ in ds:
+            if (r, name) not in dead:
+                continue
+            twins = sorted(o for o in where[name] if o != r and (o, name) not in dead)
+            problems.append(f"{r} line {a}: {name} is never used, so its code never runs"
+                            + (f"; {', '.join(twins)} has the {name} that's used, so remove this copy completely"
+                               if twins else ": remove it, or call it where it's needed"))
+    return problems
 
 
 def _is_main_guard(node: ast.AST) -> bool:
@@ -1194,6 +1960,42 @@ def _is_main_guard(node: ast.AST) -> bool:
     return isinstance(node, ast.If) and isinstance(t, ast.Compare) and isinstance(t.left, ast.Name) \
         and t.left.id == "__name__" and any(isinstance(c, ast.Constant) and c.value == "__main__"
                                              for c in t.comparators)
+
+
+def chdir_problems(rel: str, text: str) -> list[str]:
+    """A test file that moves into a folder (os.chdir) and never moves back to where it was: on Windows a folder in
+    use can't be removed, so every test's temporary folder fails to clean up (Nov 18, task 60: setUp did
+    os.chdir(self.cwd) into its TemporaryDirectory, and all 9 request tests errored in cleanup). Moving back means an
+    os.chdir to a value saved from os.getcwd() / Path.cwd(), or addCleanup(os.chdir, that value)."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
+
+    def is_chdir(f: ast.AST) -> bool:
+        return isinstance(f, ast.Attribute) and f.attr == "chdir"
+
+    def cwd_call(e: ast.AST) -> bool:
+        return isinstance(e, ast.Call) and isinstance(e.func, ast.Attribute) and e.func.attr in ("getcwd", "cwd")
+
+    saved = {ast.unparse(t) for n in ast.walk(tree) if isinstance(n, ast.Assign) and cwd_call(n.value)
+             for t in n.targets}
+    moves, back = [], False
+    for n in ast.walk(tree):
+        if not isinstance(n, ast.Call):
+            continue
+        if is_chdir(n.func) and n.args:
+            if cwd_call(n.args[0]) or ast.unparse(n.args[0]) in saved:
+                back = True
+            else:
+                moves.append(n)
+        elif isinstance(n.func, ast.Attribute) and n.func.attr == "addCleanup" and n.args and is_chdir(n.args[0]):
+            back = True
+    if back or not moves:
+        return []
+    return [f"{rel} line {moves[0].lineno}: it moves into a folder with os.chdir and never moves back, so on Windows "
+            "the temporary folder can't be removed (save os.getcwd() first and add self.addCleanup(os.chdir, it), "
+            "or pass full paths and don't change folder)"]
 
 
 def test_main_problems(rel: str, text: str) -> list[str]:
@@ -1287,7 +2089,8 @@ def stdlib_patch_problems(rel: str, text: str) -> list[str]:
 
 
 # redefined (the later one wins), an unused import or variable: Python runs it all the same
-_RUNS_ANYWAY = re.compile(r"^\S.* line \d+: F(811|401|841) ")
+# (a test that never moves back out of its folder still runs; only its cleanup fails, Nov 18, task 60)
+_RUNS_ANYWAY = re.compile(r"^\S.* line \d+: (?:F(811|401|841) |it moves into a folder with os\.chdir)")
 _DEAD_CODE = re.compile(r"^\S.* line \d+: F(401|841) ")       # unused import or variable
 
 # -- the safety gate (the user's benchmarks, Nov 17): no network unless asked, no deleting outside the build
@@ -1520,11 +2323,24 @@ def fix_files(folder: Path, test: str, out: str, code: list[str], same: set[str]
 
 
 def fix_files_judged(folder: Path, test: str, named: list[str], code: list[str], same: set[str],
-                     wrong_here: bool) -> list[str]:
+                     wrong_here: bool, code_wrong: list[str] | tuple = (), others: bool = False) -> list[str]:
     """`fix_files` after the judging: a test judged wrong puts the test file first; the tests written from the
-    request otherwise send the fix to code files only (never a test file)."""
+    request otherwise send the fix to code files only (never a test file).
+    `code_wrong`: the failing tests judged "the code is wrong" (or "both"): their fix goes first to the code files
+    they call, even one the plan keeps the same, and never to their test file alone; the test file stays on the list
+    only when it's being corrected too (`wrong_here`) or another failing test in it isn't judged so (`others`).
+    Nov 18, task 60: test_personal_glossary_sentence_not_kept was judged "code", its fix went only to the locked test
+    file (academy_mine.py, which it calls, was "kept the same"), both edits were refused and the run ended."""
+    calls = []
+    if code_wrong:
+        calls = [r for r in _called_files(folder, test, list(code_wrong), code) if not _is_test(r)] or \
+            [r for r in _imported_by(folder, test, code) if not _is_test(r)][:4]
     if wrong_here:
-        return [test] + [r for r in named if r != test]
+        return [test] + calls + [r for r in named if r != test and r not in calls]
+    if code_wrong:
+        rest = [r for r in named if r not in calls
+                and (not _is_test(r) or (others and r == test and test != REQUEST_TESTS))]
+        return calls + rest if calls or rest else named
     if test == REQUEST_TESTS:
         return [r for r in named if not _is_test(r)] or \
             [r for r in _imported_by(folder, test, code) if r not in same and not _is_test(r)][:4]
@@ -1617,12 +2433,28 @@ _STDLIB_ONLY = re.compile(r"(?i)\bstandard[ -]library\b[^.\n]{0,20}\bonly\b|\bon
                           r"|\bno (?:third[- ]party|external) (?:packages|libraries|modules)\b")
 _WANTS_TESTS = re.compile(r"(?i)\b(?:tests?|test_\w+\.py|\w+_test\.py)\b[^.\n]{0,40}\bpass(?:es|ing)?\b")
 _ITEM = re.compile(r"(?m)^\s*(\d{1,2})[.)]\s+(\S.*)$")
-_README_ITEM = re.compile(r"(?i)^\s*\d{1,2}[.)]\s+[`*]*README(?:\.md)?\b")
+# "## 1. README: ..." (Nov 18, task 60: the Academy numbered its 4 changes as Markdown headings, none was read as
+# a change, so none was checked off, and the README changes that weren't made were never reported missing)
+_HEAD_ITEM = re.compile(r"(?m)^[ \t]*(#{1,6})[ \t]*(\d{1,2})[.)][ \t]+(\S.*)$")
+_HEADING = re.compile(r"(?m)^[ \t]*(#{1,6})[ \t]+\S")
+_README_ITEM = re.compile(r"(?i)^\s*(?:#{1,6}\s*)?\d{1,2}[.)]\s+[`*]*README(?:\.md)?\b")
 
 
 def numbered_items(change: str) -> dict[int, str]:
-    """The numbered changes in a request ("1. ...", "2) ..."), each with its following lines."""
-    items, marks = {}, list(_ITEM.finditer(change or ""))
+    """The numbered changes in a request ("1. ...", "2) ..."), each with its following lines. A request that numbers
+    its changes as Markdown headings ("## 1. ...") is read by those headings alone (numbered lines inside one stay
+    part of it); each ends at the next heading of the same level or higher."""
+    change = change or ""
+    heads = list(_HEAD_ITEM.finditer(change))
+    if heads:
+        items = {}
+        for m in heads:
+            level = len(m.group(1))
+            end = next((h.start() for h in _HEADING.finditer(change, m.end()) if len(h.group(1)) <= level),
+                       len(change))
+            items.setdefault(int(m.group(2)), change[m.start():end].strip())
+        return items
+    items, marks = {}, list(_ITEM.finditer(change))
     for i, m in enumerate(marks):
         end = marks[i + 1].start() if i + 1 < len(marks) else len(change)
         items[int(m.group(1))] = change[m.start():end].strip()
@@ -1643,8 +2475,54 @@ def sub_points(item: str) -> dict[str, str]:
     ...", seven in item 2; one tick for the whole item let (f) and (g) pass unwritten)."""
     m = _CHECKS_LINE.search(item or "")
     if not m:
-        return {}
+        return _letter_lines(item or "")
     return {k: re.sub(r"\s+", " ", v).strip(" ;.") for k, v in _SUB.findall(" ".join(m.group(1).split()))}
+
+
+_LETTER_START = re.compile(r"^[ \t]*(?:[-*][ \t]*)?\(([a-z])\)[ \t]*(\S.*)$")
+
+
+def _split_letters(item: str) -> list[str]:
+    """The item's lines, a line holding several lettered checks split before each next letter that follows a "."
+    or ";" (Nov 19, task 65: "(d) More than 8 candidates: exactly the first 8 are listed. (e) The same candidate
+    twice appears once." on one line: (e) ran into (d), and (f) and (g) were never read as checks)."""
+    lines: list[str] = []
+    for line in item.splitlines():
+        m = _LETTER_START.match(line)
+        while m:
+            nxt = chr(ord(m.group(1)) + 1)
+            cut = re.search(r"(?<=[.;])[ \t]+(?=\(" + nxt + r"\)[ \t]*\S)", line)
+            if not cut:
+                break
+            lines.append(line[:cut.start()])
+            line = line[cut.end():]
+            m = _LETTER_START.match(line)
+        lines.append(line)
+    return lines
+
+
+def _letter_lines(item: str) -> dict[str, str]:
+    """Lettered checks that each start their own line, "(a) ...", "(b) ...", in an item with no "Checks:" line;
+    from (a) on, in order, at least two (Nov 18, task 60: change 3 listed (a) to (g) that way, the checker answered
+    3a to 3g, and as no check was known the whole change read as "not answered"). A line that runs on (not ended by
+    ";" or ".") takes the next lines until a blank line, a heading or a list mark."""
+    out: dict[str, str] = {}
+    key, open_ = "", False
+    for line in _split_letters(item):
+        m = _LETTER_START.match(line)
+        if m and m.group(1) == chr(ord("a") + len(out)):
+            key, open_ = m.group(1), True
+            out[key] = m.group(2)
+        elif key and open_ and line.strip() and not re.match(r"[ \t]*(?:#|[-*][ \t]|\d{1,2}[.)]\s|\([a-z]\))",
+                                                             line):
+            out[key] += " " + line.strip()
+        else:
+            open_ = False
+            continue
+        open_ = not out[key].rstrip().endswith((";", "."))
+    if len(out) < 2:
+        return {}
+    return {k: re.sub(r"\s+", " ", v).strip(" ;.") for k, v in out.items()}
 
 
 def _is_test(rel: str) -> bool:
@@ -1730,9 +2608,66 @@ def _in_test_by_indent(lines: list[str], i: int) -> bool:
     return False
 
 
+# the checklist's and the judge's answers as answer shapes (worker_shared.answer_shape): where the model is held to
+# them, every answer has one entry per check and a verdict from the three, so there are no "no ticks in the reply;
+# asking again" rounds. Where it isn't, the text lines are read as before (Nov 19, colibri idea: fixed-form answers)
+CHECKLIST_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["checks"],
+                    "properties": {"checks": {"type": "array", "items": {
+                        "type": "object", "additionalProperties": False,
+                        "required": ["key", "state", "file", "quote", "note"],
+                        "properties": {"key": {"type": "string"}, "state": {"type": "string", "enum": ["DONE", "MISSING"]},
+                                       "file": {"type": "string"}, "quote": {"type": "string"},
+                                       "note": {"type": "string"}}}}}}
+JUDGE_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["verdict", "because"],
+                "properties": {"verdict": {"type": "string", "enum": ["TEST", "CODE", "BOTH"]},
+                               "because": {"type": "string"}}}
+CHECKLIST_JSON_HINT = ('If your answer has to be JSON, send {"checks": [{"key": "2f", "state": "DONE" or "MISSING", '
+                       '"file": ..., "quote": the exact line (empty when MISSING), "note": ...}]} with one entry for '
+                       'each line asked for.')
+JUDGE_JSON_HINT = 'If your answer has to be JSON, send {"verdict": "TEST" or "CODE" or "BOTH", "because": ...}.'
+
+
+def _json_reply(reply: str) -> dict | None:
+    """The JSON object a reply holds (bare or inside a code fence), or None."""
+    t = reply or ""
+    i = t.find("{")
+    if i < 0:
+        return None
+    try:
+        data, _ = json.JSONDecoder().raw_decode(t[i:])
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+_PROOF_KEY = re.compile(r"(?i)^\W*(?:item\s*)?(\d{1,2})\s*[.\s]?\(?([a-z])?\)?\W*$")
+
+
+def _json_proofs(reply: str) -> dict[str, tuple[str, str, str, str]]:
+    """The checklist read from {"checks": [...]}: the same tuples _parse_proofs gives for the same lines."""
+    data = _json_reply(reply)
+    got: dict[str, tuple[str, str, str, str]] = {}
+    for c in (data or {}).get("checks") or []:
+        if not isinstance(c, dict):
+            continue
+        m = _PROOF_KEY.match(str(c.get("key", "")))
+        state = str(c.get("state", "")).upper()
+        if not m or state not in ("DONE", "MISSING"):
+            continue
+        quote = str(c.get("quote") or "")
+        f = _PROOF_FILE.search(str(c.get("file") or ""))
+        note = re.sub(r"[`*]+", "", str(c.get("note") or quote))[:200]
+        got.setdefault(m.group(1) + (m.group(2) or "").lower(),
+                       (state, f.group(0).replace("\\", "/") if f else "", quote, note))
+    return got
+
+
 def _parse_proofs(reply: str) -> dict[str, tuple[str, str, str, str]]:
-    """{"2" or "2f": (DONE|MISSING, file, quote, note)} from a checklist reply."""
-    got = {}
+    """{"2" or "2f": (DONE|MISSING, file, quote, note)} from a checklist reply: its JSON when it has the answer
+    shape, else its lines."""
+    got = _json_proofs(reply)
+    if got:
+        return got
     for line in (reply or "").splitlines():
         m = _PROOF.match(line)
         if not m:
@@ -1751,6 +2686,33 @@ def _parse_proofs(reply: str) -> dict[str, tuple[str, str, str, str]]:
     return got
 
 
+# an item that names no file: its changed files read whole only up to about this many tokens for the whole step,
+# the rest as outlines (Nov 19, task 67: 8 changed files and both test files whole made a 36,752-token step that
+# couldn't be made smaller, more than any provider's minute; Cerebras takes 30,000)
+_CHECK_WHOLE = 20_000
+
+
+def whole_within(paths: list[str], written: dict[str, str], text: str, tokens: float) -> set[str]:
+    """Which of `paths` to read whole within about `tokens`: those sharing the most of `text`'s words first, a word
+    counting more the fewer of the files hold it (one only in the confusion detector says more than one in all);
+    at least one, so the item is never checked against outlines only."""
+    words = {w.lower() for w in _WORD.findall(text) if len(w) > 3}
+    has = {rel: words & {w.lower() for w in _WORD.findall(written.get(rel, ""))} for rel in paths}
+    held = collections.Counter(w for ws in has.values() for w in ws)
+
+    def shared(rel: str) -> float:
+        return sum(1 / held[w] for w in has[rel])
+
+    out: set[str] = set()
+    for rel in sorted(paths, key=lambda r: (-shared(r), len(written.get(r, "")))):
+        size = len(written.get(rel, "")) / 3.5
+        if out and size > tokens:
+            continue
+        out.add(rel)
+        tokens -= size
+    return out
+
+
 def _checklist(ctx, p: dict, desc: str, plan: dict, written: dict[str, str], items: dict[int, str],
                cap: int, log_path: Path | None = None, keep_path: Path | None = None) -> dict[int, tuple[str, str]]:
     """{item number: ("DONE" | "MISSING" | "NOT SAID", note)} for the numbered changes, from the files as they are.
@@ -1762,7 +2724,7 @@ def _checklist(ctx, p: dict, desc: str, plan: dict, written: dict[str, str], ite
     `keep_path`: an item that was DONE keeps its quotes there; next time, if the item reads the same and every quote
     is still in the files (looked up, no model), it isn't asked again (Nov 16: asking each of task 56's 4 items
     every round cost about 80,000 tokens a round)."""
-    code = [r for r in written if not r.lower().endswith(".md")]
+    code = stable_start([r for r in written if not r.lower().endswith(".md")], plan)
     files = "\n\n".join(f"--- {path} ---\n{written[path][:cap]}" + ("\n(... cut here)" if len(written[path]) > cap
                                                                     else "") for path in code)
     tests = [r for r in code if _is_test(r)]
@@ -1789,8 +2751,17 @@ def _checklist(ctx, p: dict, desc: str, plan: dict, written: dict[str, str], ite
                       for k in subs[n]]
             lines += [f"{n}{k}: DONE - test file: `the exact line, inside a test_ function, that checks this rule: "
                       f"{r}`   (or {n}{k}: MISSING - no test checks it)" for k, r in rules[n].items()]
-        read = sorted({r for n in part for r in _names(part[n], [{"path": x} for x in code], stems=True)}
-                      | (set(tests) if any(subs[n] for n in part) else set()))
+        named = {r for n in part for r in _names(part[n], [{"path": x} for x in code], stems=True)}
+        test_read = set(tests) if any(subs[n] for n in part) else set()
+        if not named:          # an item that names no file is looked for in the files this version changes, read whole
+            # (Nov 19, task 64: "Rule: what counts as a topic" named none, academy_readme.py reached the checker as an
+            # outline, and it reported "the file contains only an outline", so every round chased a miss that wasn't)
+            changed = [f["path"] for f in plan.get("files", []) if f.get("change") not in ("same", None)
+                       and f["path"] in code and not _is_test(f["path"])]
+            named = whole_within(changed, written, "\n".join(part.values()),
+                                 _CHECK_WHOLE - sum(len(written[t]) for t in test_read) // 3.5
+                                 - len(p["request"]) // 3.5)
+        read = sorted(named | test_read)
         msgs = [{"role": "system", "content": SYSTEM},
                 {"role": "user", "content": f"The project: {redact(p['request'])}\n\nIts files now:\n\n{files}"},
                 {"role": "user", "content":
@@ -1799,17 +2770,18 @@ def _checklist(ctx, p: dict, desc: str, plan: dict, written: dict[str, str], ite
                  + ". Reply with one line for each of these, and no other text:\n" + "\n".join(lines) +
                  "\n\nA DONE must quote one exact line copied from the file, in backticks; the quote is looked up "
                  "in the file, and a DONE whose quote isn't there counts as missing. A lettered check is DONE only "
-                 "when a test really checks it. If you can't quote it, it's MISSING."}]
+                 "when a test really checks it. If you can't quote it, it's MISSING. " + CHECKLIST_JSON_HINT}]
         # room for models that think first (Nov 14, task 38: 1,500 left no ticks for 8 items, so all 8 read as
         # missing); one more ask when none can be read
-        reply = ctx.chat(msgs, 4000)
+        with worker_shared.answer_shape(CHECKLIST_SCHEMA):
+            reply = ctx.chat(msgs, 4000)
         got = _parse_proofs(reply)
         if not got:
             log.info("checklist: no ticks in the reply (%d characters); asking again", len(reply))
             more = ctx.chat(msgs + [{"role": "assistant", "content": reply},
                                     {"role": "user", "content": "I couldn't read that. Reply with only the lines "
                                      "asked for, like \"1: DONE - a.py: `the line`\" or \"2: MISSING - file: what's "
-                                     "missing\"."}],
+                                     "missing\"." + (f" (Read {', '.join(read)} in full.)" if read else "")}],
                             8000 if not reply.strip() else 4000)   # an empty reply: it thought too long (task 42)
             got = _parse_proofs(more)
             reply += "\n\n--- asked again ---\n\n" + more
@@ -1942,13 +2914,67 @@ def _no_change_no_done(ticks: dict[int, tuple[str, str]], written: dict[str, str
     return ticks
 
 
-# -- a person's word on a locked test (Nov 17, the user: "Yes, build both"): `smithy.py decide ID TEST test|code`
+# -- the request's README changes, checked once the README is written (Nov 18, task 60: two README edits were refused
+# for a too-short FIND, and the report said nothing was missing: README changes were never checked at all)
+_SAYS_PHRASE = re.compile(r"(?i)\b(?:contains?|names?|has|says|includes?|shows?)\b(?:\s+the\s+heading)?\s+"
+                          r"((?:\"[^\"\n]{2,80}\"(?:\s*(?:,|\band\b|\bor\b)\s*)?)+)")
+_NEGATED = re.compile(r"(?i)\b(?:no|not|never|none|nothing|unchanged|without)\b")
+
+
+def readme_items(p: dict) -> dict[int, str]:
+    """The request's numbered changes that are for its README."""
+    items = numbered_items(p.get("change", "")) if p.get("parent_id") else numbered_items(p.get("request", ""))
+    return {n: t for n, t in items.items() if _README_ITEM.match(t)}
+
+
+def readme_phrases_missing(item: str, readme: str) -> list[str]:
+    """The quoted words a README change's own checks say it contains ("contains the heading \"X\"", "names \"A\" and
+    \"B\"") that the README doesn't; looked up, no model. A check that says what's absent is left to the checker."""
+    low, gone = readme.lower(), []
+    for text in sub_points(item).values():
+        if _NEGATED.search(text):
+            continue
+        for m in _SAYS_PHRASE.finditer(text):
+            gone += [x for x in re.findall(r'"([^"\n]{2,80})"', m.group(1)) if x.lower() not in low and x not in gone]
+    return gone
+
+
+def readme_check(ctx, items: dict[int, str], readme: str) -> dict[int, tuple[str, str]]:
+    """{item: ("DONE" | "MISSING", why)} for the README changes, against the README as written. A DONE must quote a
+    line of README.md that's really there, and every phrase its checks name must be in it."""
+    lines = [f"{n}: DONE - README.md: `the exact line from README.md that makes this change`   (or {n}: MISSING - "
+             "what's missing)" for n in items]
+    msgs = [{"role": "system", "content": SYSTEM},
+            {"role": "user", "content": f"README.md as written:\n```\n{readme}\n```"},
+            {"role": "user", "content": "These README changes were asked for:\n\n" + redact("\n\n".join(items.values()))
+             + "\n\nCheck README.md above, not the request. Reply with one line for each, and no other text:\n"
+             + "\n".join(lines) + "\n\nA DONE must quote one exact line copied from README.md, in backticks; the quote "
+             "is looked up, and a DONE whose quote isn't there counts as missing. If you can't quote it, it's MISSING."}]
+    got = _parse_proofs(ctx.chat(msgs, 4000))
+    out = {}
+    for n, t in items.items():
+        why = []
+        state, _, quote, note = got.get(str(n), ("", "", "", ""))
+        if not state:
+            why.append("the check gave no answer for it")
+        elif state != "DONE":
+            why.append(note or "said missing")
+        elif len(_norm(quote)) < 12 or _norm(quote) not in _norm(readme):
+            why.append(f"said done, but its quote isn't in README.md: `{quote[:80]}`")
+        gone = readme_phrases_missing(t, readme)
+        if gone:
+            why.append("README.md doesn't contain " + ", ".join(f'"{x}"' for x in gone))
+        out[n] = ("MISSING", "; ".join(why)[:600]) if why else ("DONE", "")
+    return out
+
+
+# -- a person's word on a locked test (Nov 17, the user: "Yes, build both"): `smithy.py decide ID TEST test|code|both`
 def decided_path(job_id: int) -> Path:
     return SMITHY.results_dir / f"{job_id:05d}-decided.json"
 
 
 def decisions(job_id: int) -> dict[str, dict]:
-    """{test name: {"side": "test"|"code", "by": "smithy"|"person", "why": ..., "times": n, "at": history index}}.
+    """{test name: {"side": "test"|"code"|"both", "by": "smithy"|"person", "why": ..., "times": n, "at": history index}}.
     An older file's plain "test"/"code" values read as a person's word."""
     try:
         got = json.loads(decided_path(job_id).read_text(encoding="utf-8"))
@@ -1957,13 +2983,14 @@ def decisions(job_id: int) -> dict[str, dict]:
     out = {}
     for k, v in (got.items() if isinstance(got, dict) else []):
         d = {"side": v, "by": "person"} if isinstance(v, str) else v if isinstance(v, dict) else {}
-        if d.get("side") in ("test", "code"):
+        if d.get("side") in SIDES:
             out[str(k)] = d
     return out
 
 
 def decided(job_id: int) -> dict[str, str]:
-    """{test name: "test" (the test is wrong: correct it) | "code" (the test is right: fix the code)}."""
+    """{test name: "test" (the test is wrong: correct it) | "code" (the test is right: fix the code) | "both"
+    (correct the test to the request, and fix the code to it)}."""
     return {k: d["side"] for k, d in decisions(job_id).items()}
 
 
@@ -1983,8 +3010,8 @@ def record_decision(job_id: int, test: str, side: str, by: str, why: str = "", a
 def decide(job_id: int, test: str, side: str) -> str:
     """An override, never asked of anyone: The Smithy judges a locked test itself (Nov 17, the user: "it's always
     going to be the smithy's problem to solve, not the user's")."""
-    if side not in ("test", "code"):
-        raise ValueError('say "test" (the test is wrong) or "code" (the code is wrong)')
+    if side not in SIDES:
+        raise ValueError('say "test" (the test is wrong), "code" (the code is wrong) or "both"')
     if not re.fullmatch(r"test\w*", test or ""):
         raise ValueError(f"{test!r} isn't a test name (they start with test)")
     if SMITHY.get(job_id) is None:
@@ -1992,11 +3019,14 @@ def decide(job_id: int, test: str, side: str) -> str:
     record_decision(job_id, test, side, "person")
     return (f"Task {job_id}: {test} is wrong, so the next run corrects the test to match the request (the code isn't "
             "changed to fit it)." if side == "test" else
+            f"Task {job_id}: {test} and the code are both wrong, so the next run corrects the test to the request "
+            "and fixes the code to do what the request asks." if side == "both" else
             f"Task {job_id}: {test} is right, so the next run fixes the code for it (the test stays as it is).") \
         + f" Carry on with: smithy.py continue {job_id}"
 
 
-_VERDICT = re.compile(r"(?im)^\W*(TEST|CODE)\b[^\n]*(?:\n+[*_ ]*because[*_ ]*:?[*_ ]*\s*(.+))?")
+SIDES = ("test", "code", "both")
+_VERDICT = re.compile(r"(?im)^\W*(TEST|CODE|BOTH)\b[^\n]*(?:\n+[*_ ]*because[*_ ]*:?[*_ ]*\s*(.+))?")
 
 
 def _judge_messages(request: str, test: str, test_src: str, failure: str, code: dict[str, str]) -> list[dict]:
@@ -2010,24 +3040,70 @@ def _judge_messages(request: str, test: str, test_src: str, failure: str, code: 
              "Which one is wrong, judged only against the request's own words? Answer TEST when the test expects "
              "something the request doesn't ask for, or can't be true here (for example a path written with / where "
              "Windows gives \\, a value the request never names, a setup that doesn't match the request's example). "
-             "Answer CODE when the code doesn't do what the request asks. Reply with exactly two lines:\n"
-             "TEST or CODE\nBecause: one plain sentence that quotes the request's words it rests on"}]
+             "A check's conditions are part of its setup (\"with none of these in the glossary\", \"with X in "
+             "Y\", \"when ...\", \"if ...\"): a test that doesn't set one up, or sets up its opposite, "
+             "expects something the request doesn't ask for, so answer TEST. "
+             "Answer CODE when the code doesn't do what the request asks. Answer BOTH only when each is wrong in its "
+             "own way: the test checks something the request doesn't ask for (or can't be true), AND the code doesn't "
+             "do what the request asks. Reply with exactly two lines:\n"
+             "TEST, CODE or BOTH\nBecause: one plain sentence that quotes the request's words it rests on. "
+             + JUDGE_JSON_HINT}]
+
+
+_STRENGTH = re.compile(r"(?im)^\W*(SAME|WEAKER)\b[^\n]*(?:\n+[*_ ]*(?:because|missing)[*_ ]*:?[*_ ]*\s*(.+))?")
+# what a correction of a test judged wrong is told (Nov 18, task 60: the correction checked one field instead of the
+# saved file, and kept matching "i" inside other words)
+CORRECT_RIGHT = ("Correct only the part found wrong. Keep what each check looks at as wide as the request says (\"the "
+                 "saved file\" means the whole file, not one field of it), and keep every value it checks. Compare "
+                 "words as whole words (split the text into words), never as parts of other words.")
+
+
+def review_test(ctx, request: str, test: str, src: str, old_src: str = "", min_b: float = 70) -> tuple[str, str] | None:
+    """("same" | "weaker", what it no longer checks) for a test judged wrong and corrected, by a strong model against
+    the request: with `old_src`, the corrected test against the one before; without, the test against the request
+    alone. None when no strong model is free or the answer can't be read (Nov 18, task 60)."""
+    shown = (f"The test before it was corrected:\n```python\n{old_src}\n```\n\nThe corrected test:\n```python\n{src}\n```"
+             if old_src else f"The test:\n```python\n{src}\n```")
+    msgs = [{"role": "system", "content": SYSTEM},
+            {"role": "user", "content": "The request (it decides):\n\n" + redact(request) + f"\n\n{test} was judged "
+             "wrong against the request (it checked something the request doesn't ask for) and corrected.\n\n" + shown},
+            {"role": "user", "content":
+             "Apart from the part that was wrong, does " + ("the corrected test still check everything the old one "
+                                                             "checked that the request asks for" if old_src else
+                                                             "this test check everything the request asks of it")
+             + ", as strictly and over as much (the whole file, every word or value the request names)? Answer SAME "
+             "if it does, WEAKER if it checks less. Reply with exactly two lines:\nSAME or WEAKER\nBecause: what it "
+             "no longer checks, quoting the request's words (or \"nothing\")"}]
+    try:
+        with worker_shared.strong_models(min_b):
+            text = ctx.chat(msgs, 2000)
+    except (BudgetOut, TooLongForLocal):
+        raise
+    except (worker_cloud.NoStrongModel, RuntimeError, ValueError):
+        return None
+    m = _STRENGTH.search(text or "")
+    if not m:
+        return None
+    return m.group(1).lower(), " ".join((m.group(2) or "").split())[:400]
 
 
 def judge_test(ctx, request: str, test: str, test_src: str, failure: str, code: dict[str, str],
                min_b: float = 70) -> tuple[str, str] | None:
-    """("test" | "code", why) for a test that keeps failing, by a strong model against the request; None when no
+    """("test" | "code" | "both", why) for a test that keeps failing, by a strong model against the request; None when no
     strong model is free or the answer can't be read. The Smithy judges it itself: a person using Othos can't be
     expected to (Nov 17, the user; task 58's test_query_writes_inside_queries wanted / in a Windows path)."""
     try:
-        with worker_shared.strong_models(min_b):
-            # room to think first: gpt-oss models reason before answering, and 400 tokens gave empty replies from
-            # every provider (Nov 17, task 58's judgments of test_request.py's tests)
+        # room to think first: gpt-oss models reason before answering, and 400 tokens gave empty replies from
+        # every provider (Nov 17, task 58's judgments of test_request.py's tests)
+        with worker_shared.strong_models(min_b), worker_shared.answer_shape(JUDGE_SCHEMA):
             text = ctx.chat(_judge_messages(request, test, test_src, failure, code), 2000)
     except (BudgetOut, TooLongForLocal):
         raise
     except (worker_cloud.NoStrongModel, RuntimeError, ValueError):
         return None
+    data = _json_reply(text)
+    if data and str(data.get("verdict", "")).lower() in SIDES:
+        return str(data["verdict"]).lower(), " ".join(str(data.get("because") or "").split())[:400]
     m = _VERDICT.search(text or "")
     if not m:
         return None
@@ -2050,7 +3126,57 @@ def _request_checks(items: dict[int, str]) -> list[str]:
     return out
 
 
-def _request_tests_messages(items: dict[int, str], written: dict[str, str], checks: list[str]) -> list[dict]:
+def _plain(text: str) -> str:
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", text.lower()).split())
+
+
+def uncovered_checks(checks: list[str], tests_src: str) -> list[str]:
+    """The "2a: text" lines whose text no test in `tests_src` quotes (each request test starts with a comment that
+    quotes its check word for word). A follow-up inherits the earlier version's test_request.py, which holds tests
+    for the earlier request's checks; without this its new checks had no request test at all (Nov 19, task 67:
+    "request tests 9 of 9 passed" were task 63's, and (a) with JSON in the glossary was never tested)."""
+    have = _plain(tests_src)
+    return [c for c in checks if _plain(c.split(": ", 1)[-1])[:60] not in have]
+
+
+def add_request_tests(tests_src: str, new_src: str) -> str:
+    """`tests_src` with the tests of `new_src` (its own imports and class) put before the `if __name__` guard."""
+    guard = re.compile(r'(?m)^if __name__ == [\'"]__main__[\'"]:.*(?:\n[ \t]+.*)*\s*$')
+    have = {ln.strip() for ln in tests_src.splitlines()}
+    # an import the file already has isn't repeated (ruff's F811 stopped task 67's tests running)
+    add = "\n".join(ln for ln in guard.sub("", new_src).splitlines()
+                    if not (re.match(r"(?:import|from)\s", ln) and ln.strip() in have)).strip("\n") + "\n"
+    m = guard.search(tests_src)
+    if not m:
+        return tests_src.rstrip() + "\n\n\n" + add + '\n\nif __name__ == "__main__":\n    unittest.main()\n'
+    return tests_src[:m.start()].rstrip() + "\n\n\n" + add + "\n\n" + tests_src[m.start():].lstrip("\n")
+
+
+def remove_added_tests(tests_src: str, job_id: int) -> str:
+    """`tests_src` without the class add_request_tests put in for this task (RequestTestsT<job>) and the import
+    lines just above it: for tests added earlier that have build problems, so they're written again."""
+    lines = tests_src.split("\n")
+    start = next((i for i, ln in enumerate(lines) if re.match(rf"class RequestTestsT{job_id}\b", ln)), None)
+    if start is None:
+        return tests_src
+    end = next((i for i in range(start + 1, len(lines)) if re.match(r"(?:class |if __name__)", lines[i])), len(lines))
+    while start > 0 and (not lines[start - 1].strip() or re.match(r"(?:import|from)\s", lines[start - 1])):
+        start -= 1
+    return "\n".join(lines[:start] + ["", ""] + lines[end:])
+
+
+def unrequested_changes(request: str, plan: dict) -> list[str]:
+    """The files the plan changes that the request never names (a test file excepted): a follow-up's review says
+    so, so each is looked at (Nov 19, task 67: academy_privacy.py, academy_fit.py and academy_run.py were changed
+    by a request that names none of them)."""
+    files = [f for f in plan.get("files", []) if f.get("change") not in ("same", None)
+             and not _is_test(f["path"]) and not f["path"].lower().endswith(".md")]
+    named = _names(request, files, stems=True)
+    return sorted(f["path"] for f in files if f["path"] not in named)
+
+
+def _request_tests_messages(items: dict[int, str], written: dict[str, str], checks: list[str],
+                            job_id: int = 0) -> list[dict]:
     code = "\n\n".join(f"--- {r} (outline) ---\n{outline(r, written[r])}" for r in sorted(written)
                        if r.lower().endswith(".py") and not smithy_sandbox.is_test(r))
     return [{"role": "system", "content": SYSTEM},
@@ -2060,12 +3186,16 @@ def _request_tests_messages(items: dict[int, str], written: dict[str, str], chec
             {"role": "user", "content":
              f"Write {REQUEST_TESTS}: a Python 3.12 unittest file with ONE test for each of these checks and rules "
              "from the request, and no other tests:\n\n" + "\n".join(f"- {c}" for c in checks) + "\n\n"
-             "Each test is a method named test_<key>_<a few words> (for example test_2a_yes_no_go_ahead) of one "
-             "unittest.TestCase class, and its first line is a comment that quotes the check word for word. "
+             + (f"Each test is a method named test_t{job_id}_<key>_<a few words> (for example test_t{job_id}_2a_yes_no) "
+                f"of one unittest.TestCase class named RequestTestsT{job_id}, "
+                if job_id else "Each test is a method named test_<key>_<a few words> (for example "
+                "test_2a_yes_no_go_ahead) of one unittest.TestCase class, ") +
+             "and its first line is a comment that quotes the check word for word. "
              "Use the request's own example inputs and expected answers wherever it gives them. Test what the "
              "program does (call its functions, read what they write), never how it's written. Only the standard "
              "library and the program's own modules; files only in a tempfile.TemporaryDirectory(); compare paths "
-             "as pathlib.Path objects or with os.path, never as text with / or \\ in it; no network. End with one "
+             "as pathlib.Path objects or with os.path, never as text with / or \\ in it; never os.chdir (on Windows a "
+             "temporary folder in use can't be removed: pass full paths instead); no network. End with one "
              "top-level `if __name__ == \"__main__\":` and unittest.main(). Reply with the file only."}]
 
 
@@ -2080,8 +3210,12 @@ def _test_counts(output: str) -> tuple[int, int] | None:
     ran = re.findall(r"\bRan (\d+) tests?\b", output or "")
     if not ran:
         return None
-    bad = sum(int(n) for n in re.findall(r"\b(?:failures|errors)=(\d+)", output.split(f"Ran {ran[-1]}")[-1]))
-    return int(ran[-1]), bad
+    # each failing test once, by name: a test that fails and then errors in its cleanup is one test (Nov 18, task
+    # 60: "failures=2, errors=9" of 9 tests read as "-2 of 9 passed")
+    names = set(re.findall(r"(?m)^(?:FAIL|ERROR): (\w+)", output))
+    bad = len(names) if names else \
+        sum(int(n) for n in re.findall(r"\b(?:failures|errors)=(\d+)", output.split(f"Ran {ran[-1]}")[-1]))
+    return int(ran[-1]), min(bad, int(ran[-1]))
 
 
 def _benchmarks(job_id: int, hist: Path | None, problems: list[str], sandbox: dict, left: list[str],
@@ -2115,6 +3249,32 @@ def _benchmarks(job_id: int, hist: Path | None, problems: list[str], sandbox: di
             + ("; checks clean." if not left else "; NOT clean yet."))
 
 
+_TOKENS_SO_FAR = re.compile(r"; [\d,]+ cloud tokens for the task so far;")
+
+
+def _final_tokens(job_id: int, notes: list[str]) -> list[str]:
+    """The Benchmarks line's and log row's cloud tokens, counted again once the README is written: the checks
+    end before it, so task 58's line said 36,169 while the result's header said 53,749 (Nov 18)."""
+    tokens = worker_cloud.task_tokens()
+    out = [_TOKENS_SO_FAR.sub(f"; {tokens:,} cloud tokens for the task so far;", n)
+           if n.startswith("**Benchmarks:**") else n for n in notes]
+    log_path = SMITHY.results_dir / BENCHMARKS_LOG
+    if job_id and any(n.startswith("**Benchmarks:**") for n in notes):
+        try:
+            rows = log_path.read_text(encoding="utf-8").splitlines()
+            for i in range(len(rows) - 1, -1, -1):
+                row = json.loads(rows[i])
+                if row.get("task") == job_id:
+                    if row.get("task_tokens") != tokens:
+                        row["task_tokens"] = tokens
+                        rows[i] = json.dumps(row)
+                        log_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+                    break
+        except (OSError, ValueError):
+            pass
+    return out
+
+
 def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path, written: dict[str, str],
                   cap: int, only: dict[int, str] | None = None,
                   rounds: int | None = None) -> tuple[list[str], str, list[str]]:
@@ -2136,6 +3296,16 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
     stdlib_only = bool(_STDLIB_ONLY.search(p.get("request", "")))
     net_ok = net_ok_for(p.get("request", "") + "\n" + p.get("change", ""))    # the safety gate: network only if asked
     wants_tests = only is None and bool(_WANTS_TESTS.search(p.get("request", "") + "\n" + p.get("change", "")))
+    # the version this one was built from, to see what changed since (Nov 19, task 59)
+    earlier = (_parent_build(int(p["parent_id"])) or {}).get("folder") if p.get("parent_id") else None
+
+    def _own_problems(rel: str) -> list[str]:
+        """The build problems in this one file as it is on disk (unused code aside)."""
+        try:
+            found = build_problems(folder, code, stdlib_only, net_ok)[0]
+        except Exception:                                # a checker that can't run says nothing here
+            return []
+        return [x for x in found if x.startswith(f"{rel} line") and not _DEAD_CODE.match(x)]
 
     def _adds_problems(rel: str, old: str, new: str) -> str:
         """The build problems an edit adds to this file ('' when none: the same number or fewer), from the build
@@ -2181,11 +3351,10 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
         # fewer mentions than before (task 57: the planted ".env" went, while assertNotIn(".env", ...) stayed)
         gone = sorted(t for t in asked_tokens if len(t.strip()) >= 3 and old.count(t) > new.count(t))
 
-        def keys(text: str) -> set[str]:
-            return {k.value for n in ast.walk(ast.parse(text)) if isinstance(n, ast.Dict)
-                    for k in n.keys if isinstance(k, ast.Constant) and isinstance(k.value, str)}
         try:
-            added = sorted(k for k in keys(new) - keys(old) if k.lower() not in request_words)
+            added = added_fields(old, new, request_words)
+            if added:                                   # only then is the build check worth running
+                added = added_fields(old, new, request_words, broken_tests(old, rel, _own_problems(rel)))
         except SyntaxError:
             added = []
         why = []
@@ -2208,6 +3377,32 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
         if added:
             why.append("it adds field(s) the request never names: " + ", ".join(f'"{k}"' for k in added[:4])
                        + " (a test checks the request, not what the code happens to want)")
+        why += weakened_tests(old, new)                 # Nov 18, task 60: one field instead of the saved entry
+        why += copied_tests(old, new)                   # Nov 18, task 60: test_rule_a copied an existing test
+        # a test the edit changes may not look for words inside a whole text (task 60: "i" matched "id")
+        try:
+            touched = set(_changed_tests(old, new, {n.name for n in ast.walk(ast.parse(old))
+                                                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}))
+        except SyntaxError:
+            touched = set()
+        why += [w for n, w in part_word_checks(new).items() if n in touched]
+        return "; ".join(why)
+
+    def _weaker_correction(rel: str, old: str, new: str) -> str:
+        """A test judged wrong whose correction a strong model finds weaker than before, against the request ('' when
+        it isn't, or no strong model is free). Asked only once the guards without a model have passed."""
+        if new == old or not _is_test(rel):
+            return ""
+        why = []
+        for n in _changed_tests(old, new, set(wrong_tests)):
+            before, after = (_func_nodes(x).get(n) for x in (old, new))
+            if before is None or after is None:
+                continue
+            got = review_test(ctx, request_text, n, ast.unparse(after), ast.unparse(before),
+                              float(ctx.cfg.get("rewrite_min_model_b", 70) or 0))
+            if got and got[0] == "weaker":
+                why.append(f"its correction of {n} checks less than the request asks"
+                           + (f" ({got[1]})" if got[1] else "") + ". " + CORRECT_RIGHT)
         return "; ".join(why)
 
     def _request_tests_kept(rel: str, old: str, new: str) -> str:
@@ -2220,17 +3415,47 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
             return ""                                  # it didn't parse before: the parse check says so
         changed = [n for n in _changed_tests(old, new, names) if n not in wrong_tests]   # changed or removed
         if changed:
+            # a test that can't run (a build problem on its own lines, such as a call missing arguments) may be
+            # fixed there; the guards against weakening a test still apply (Nov 18, task 60)
+            broken = broken_tests(old, REQUEST_TESTS, _own_problems(REQUEST_TESTS))
+            changed = [n for n in changed if n not in broken]
+        if changed:
             return (f"{REQUEST_TESTS} holds the tests written from the request and a fix doesn't change them "
                     f"({', '.join(changed)}); the code is fixed, or The Smithy judges which side is wrong")
         return ""
 
     def refused(rel: str, old: str, new: str) -> str:
-        return _breaks(rel, old, new) or _adds_problems(rel, old, new) or _request_tests_kept(rel, old, new) \
-            or _bends_test(rel, old, new)
+        return _breaks(rel, old, new) or added_silencers(old, new) or added_skips(old, new) \
+            or _adds_problems(rel, old, new) \
+            or _request_tests_kept(rel, old, new) or _bends_test(rel, old, new) or _weaker_correction(rel, old, new)
 
-    def fix(rel: str, what: str, must: bool = False) -> None:
+    def keep_allowed(rel: str, old: str, new: str) -> tuple[str, list[str]]:
+        """A refused test edit with its changes to locked tests put back, keeping the rest (a test that's broken or
+        judged wrong may change); ('', []) when nothing is left to keep (Nov 18, task 60: an edit fixing test_3a and
+        test_3g was refused whole because test_3g looked locked)."""
+        if not _is_test(rel) or new == old:
+            return "", []
+        try:
+            names = {n.name for n in ast.walk(ast.parse(old)) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        except SyntaxError:
+            return "", []
+        free = set(wrong_tests) | broken_tests(old, rel, _own_problems(rel))
+        held = {n for n in _changed_tests(old, new, names) if n not in free
+                and (n in locked or rel == REQUEST_TESTS)}
+        if not held:
+            return "", []
+        part = restore_tests(old, new, held)
+        return ("", []) if part == old or refused(rel, old, part) else (part, sorted(held))
+
+    def fix(rel: str, what: str, must: bool = False, failing: list[str] | tuple = ()) -> None:
         """`must`: the check named this file for a change it found missing, so "no edits" isn't an answer: the
         file is then written whole (Nov 15, task 56: models answered no edits while the glossary had no ids)."""
+        # what the guards would refuse, said up front, so the first edit can get it right (Nov 18, task 60: the
+        # part-of-word problem in test_3a was only learned from refusals, and the retry still missed it)
+        pw = part_word_checks(written[rel]) if _is_test(rel) else {}
+        if pw:
+            what += ("\n\nIf you change any of these tests, fix this in it too, or the edit is refused:\n- "
+                     + "\n- ".join(pw.values()))
         if len(written[rel].strip()) < 200 and not rel.lower().endswith(".md"):
             # (nearly) empty: there's nothing for an edit to find (task 49), so it's written whole
             steps.info("%s is (nearly) empty, so it's written whole, not edited.", rel)
@@ -2246,10 +3471,14 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
             return
         elsewhere: dict[str, list[tuple[str, str]]] = {}
         movable = {r for r in code if r not in same and r != REQUEST_TESTS and r in written}
+        # the failing tests the fix is for: lines the same in several of them may be changed in each
+        spread = [(n.lineno, n.end_lineno or n.lineno) for name, n in _func_nodes(written[rel]).items()
+                  if name in failing] if failing and _is_test(rel) else None
         try:
             body, note = _edit_file(ctx, job_id, _edit_messages(p, desc, plan, rel, written, written[rel], what, cap),
                                     rel, written[rel], none_ok=not must, others=written,
-                                    movable=movable, elsewhere=elsewhere)
+                                    movable=movable, elsewhere=elsewhere, spread=spread,
+                                    near=[int(n) for n in re.findall(rf"{re.escape(rel)} line (\d+)", what)])
         except ValueError:
             steps.info("%s: the check found a change missing here, but no edits came back.", rel)
             whole = _rewrite_whole(rel, what)
@@ -2257,6 +3486,12 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
                          + (f"; the file was then written whole ({whole})" if whole else "; kept as it was"))
             return
         broke = refused(rel, written[rel], body)
+        if broke:
+            part, held = keep_allowed(rel, written[rel], body)
+            if part:                                    # the good part kept, locked tests put back
+                steps.info("%s: its changes to locked tests (%s) were put back; the rest kept.", rel, ", ".join(held))
+                note += f" (its changes to the locked test(s) {', '.join(held)} were put back; the rest kept)"
+                body, broke = part, ""
         if broke:
             # edits that turn a file that parsed into one that doesn't aren't kept (Nov 16, task 56: the last
             # round's edit replaced unittest.main() with new tests, leaving `if __name__ == ...:` empty, and the
@@ -2272,6 +3507,9 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
             except ValueError:
                 body = written[rel]
             again = refused(rel, written[rel], body)
+            if again and (kept := keep_allowed(rel, written[rel], body))[0]:
+                body, again = kept[0], ""
+                note += f" (its changes to the locked test(s) {', '.join(kept[1])} were put back; the rest kept)"
             if again:
                 steps.info("%s: the edits weren't kept again (%s); not kept.", rel, again[:200])
                 notes.append(f"`{rel}`: its edits were refused twice ({again}), so they weren't kept")
@@ -2394,7 +3632,7 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
                 if len(since) >= 2 and all(t in (e.get("failing") or []) for e in since[-2:]):
                     again.add(t)
         wrong_tests.clear()
-        wrong_tests.update(t for t, s in word.items() if s == "test" and t not in again)
+        wrong_tests.update(t for t, s in word.items() if s in ("test", "both") and t not in again)
         locked.clear()
         locked.update(stuck - wrong_tests)
         to_judge.clear()
@@ -2404,17 +3642,87 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
         who = "You decided" if d.get("by") == "person" else "The Smithy verdicts"
         notes.append(f"**{who} `{t}`:** " + ("the test is wrong, so it's corrected to match the request and the "
                                               "code isn't changed to fit it" if d["side"] == "test" else
+                                              "the test and the code are both wrong, so the test is corrected to the "
+                                              "request and the code is fixed to it" if d["side"] == "both" else
                                               "the test is right, so the code is fixed for it")
                      + (f" ({d['why']})" if d.get("why") else "") + ".")
 
     # the tests written from the request (REQUEST_TESTS): once per build, by a strong model, before the checks;
     # the fix rounds never change them, except a test judged wrong (judge_test)
     if only is None and use_list and wants_tests and ctx.cfg.get("sandbox_tests") \
-            and ctx.cfg.get("request_tests", True) and REQUEST_TESTS not in written:
+            and ctx.cfg.get("request_tests", True):
         target = inside(folder, REQUEST_TESTS)
-        if target.exists():                            # an earlier run of this task wrote it: kept as it is
-            written[REQUEST_TESTS] = target.read_text(encoding="utf-8-sig", errors="replace")
-            code.append(REQUEST_TESTS)
+        # an earlier version or run wrote it (a follow-up's folder holds the earlier version's files, and a
+        # continued run reads them all into `written`): kept as it is, with tests added for new checks. The first
+        # fix of task 67 never ran this branch: `REQUEST_TESTS not in written` skipped it (Nov 19)
+        if REQUEST_TESTS in written or target.exists():
+            written[REQUEST_TESTS] = written.get(REQUEST_TESTS) or target.read_text(encoding="utf-8-sig",
+                                                                                   errors="replace")
+            if REQUEST_TESTS not in code:
+                code.append(REQUEST_TESTS)
+            fake = never_fail(written[REQUEST_TESTS])  # less any test that could never fail (Nov 18, task 60)
+            if fake:
+                written[REQUEST_TESTS] = drop_tests(written[REQUEST_TESTS], fake)
+                target.write_text(written[REQUEST_TESTS], encoding="utf-8")
+                notes.append(f"`{REQUEST_TESTS}`: {len(fake)} test{'s' if len(fake) != 1 else ''} that could never "
+                             f"fail left out ({', '.join(fake)}).")
+            # a follow-up's file holds the earlier request's tests: tests are written for the checks it doesn't quote
+            if re.search(rf"(?m)^class RequestTestsT{job_id}\b", written[REQUEST_TESTS]) and _own_problems(REQUEST_TESTS):
+                # tests added earlier that can't run (a call missing arguments, a repeated import): written again
+                written[REQUEST_TESTS] = remove_added_tests(written[REQUEST_TESTS], job_id)
+                target.write_text(written[REQUEST_TESTS], encoding="utf-8")
+                steps.info("The request tests added earlier had build problems; they're written again.")
+            new_checks = uncovered_checks(_request_checks(items), written[REQUEST_TESTS])
+            if new_checks and not any(f"test_t{job_id}_" in n for n in re.findall(r"def (test_\w+)", written[REQUEST_TESTS])):
+                steps.info("Writing tests in %s for the %d checks no test there quotes.", REQUEST_TESTS, len(new_checks))
+                try:
+                    with worker_shared.strong_models(float(ctx.cfg.get("rewrite_min_model_b", 70) or 0)):
+                        more = _strip_outer_fence(ctx.chat(_request_tests_messages(items, written, new_checks, job_id),
+                                                           8000), False)
+                    ast.parse(more)
+                    if "unittest" not in more or not re.search(r"(?m)^\s+def test_\w+", more):
+                        raise ValueError("it came back with no unittest tests")
+                    merged = add_request_tests(written[REQUEST_TESTS], more)
+                    ast.parse(merged)
+                    before = written[REQUEST_TESTS]
+                    target.write_text(merged, encoding="utf-8")
+                    bad = _own_problems(REQUEST_TESTS)
+                    if bad:                        # called wrongly: written again once, with the problems named
+                        steps.info("The added tests call the code wrongly (%d problem(s)); writing them again once.",
+                                   len(bad))
+                        try:
+                            with worker_shared.strong_models(float(ctx.cfg.get("rewrite_min_model_b", 70) or 0)):
+                                again = _strip_outer_fence(ctx.chat(
+                                    _request_tests_messages(items, written, new_checks, job_id)
+                                    + [{"role": "assistant", "content": more},
+                                       {"role": "user", "content": "The build check found these problems in the whole "
+                                        "file:\n- " + "\n- ".join(bad[:15]) + "\n\nWrite your part again with them "
+                                        "fixed: call each function with the arguments its outline shows. Reply with "
+                                        "the file only."}], 8000), False)
+                            ast.parse(again)
+                            retry = add_request_tests(before, again)
+                            ast.parse(retry)
+                            target.write_text(retry, encoding="utf-8")
+                            if len(_own_problems(REQUEST_TESTS)) < len(bad):
+                                more, merged = again, retry
+                        except (BudgetOut, TooLongForLocal):
+                            raise
+                        except (worker_cloud.NoStrongModel, SyntaxError, ValueError, RuntimeError):
+                            pass
+                    target.write_text(before, encoding="utf-8")
+                except (BudgetOut, TooLongForLocal):
+                    raise
+                except (worker_cloud.NoStrongModel, SyntaxError, ValueError, RuntimeError) as e:
+                    steps.info("The new request tests weren't written: %s.", e)
+                    notes.append(f"**`{REQUEST_TESTS}` has no tests for {len(new_checks)} of this request's checks** "
+                                 f"({e}); they're asked for again on the next run.")
+                else:
+                    target.write_text(merged, encoding="utf-8")
+                    written[REQUEST_TESTS] = merged
+                    notes.append(f"`{REQUEST_TESTS}`: {len(re.findall(r'(?m)^\s+def test_t' + str(job_id) + '_', more))} "
+                                 f"tests added for the {len(new_checks)} checks of this request that no test there "
+                                 "quoted; the earlier tests stay.")
+                    smithy_diagnose.record(hist, "request_tests_added", checks=len(new_checks))
         elif (checks_asked := _request_checks(items)):
             steps.info("Writing %s: one test for each of the request's %d checks and rules.", REQUEST_TESTS,
                        len(checks_asked))
@@ -2434,6 +3742,38 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
                 target.write_text(body, encoding="utf-8")
                 written[REQUEST_TESTS] = body
                 code.append(REQUEST_TESTS)
+                # checked before it's locked: one that calls the code wrongly is written again once (Nov 18, task
+                # 60: test_3a called record(sentence) where record takes four arguments, no fix was allowed, and
+                # the build problem kept every test from running)
+                bad = _own_problems(REQUEST_TESTS)
+                if bad:
+                    steps.info("%s calls the code wrongly (%d problem(s)); writing it again once.", REQUEST_TESTS,
+                               len(bad))
+                    try:
+                        with worker_shared.strong_models(float(ctx.cfg.get("rewrite_min_model_b", 70) or 0)):
+                            again = _strip_outer_fence(ctx.chat(
+                                _request_tests_messages(items, written, checks_asked)
+                                + [{"role": "assistant", "content": body},
+                                   {"role": "user", "content": "The build check found these problems in it:\n- "
+                                    + "\n- ".join(bad[:15]) + "\n\nWrite the whole file again with them fixed: "
+                                    "call each function with the arguments its outline shows. Reply with the file "
+                                    "only."}], 8000), False)
+                        ast.parse(again)
+                        target.write_text(again, encoding="utf-8")
+                        if len(_own_problems(REQUEST_TESTS)) < len(bad):
+                            body = written[REQUEST_TESTS] = again
+                        else:
+                            target.write_text(body, encoding="utf-8")
+                    except (BudgetOut, TooLongForLocal):
+                        raise
+                    except (worker_cloud.NoStrongModel, SyntaxError, ValueError, RuntimeError):
+                        target.write_text(body, encoding="utf-8")
+                fake = never_fail(body)
+                if fake:                                 # a test that checks nothing isn't a test (task 60's 3z)
+                    body = written[REQUEST_TESTS] = drop_tests(body, fake)
+                    target.write_text(body, encoding="utf-8")
+                    notes.append(f"`{REQUEST_TESTS}`: {len(fake)} test{'s' if len(fake) != 1 else ''} that could "
+                                 f"never fail left out ({', '.join(fake)}).")
                 n_tests = len(re.findall(r"(?m)^\s+def test_\w+", body))
                 notes.append(f"`{REQUEST_TESTS}`: {n_tests} tests written from the request's {len(checks_asked)} "
                              "checks and rules; the fix rounds don't change them.")
@@ -2467,6 +3807,9 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
             written[rel] = inside(folder, rel).read_text(encoding="utf-8")
             steps.info("%s: unused imports taken out (no model needed).", rel)
         problems, checked = build_problems(folder, code, stdlib_only, net_ok)
+        if earlier:                            # what changed since the version this one was built from
+            wanted = p.get("request", "") + "\n" + p.get("change", "")
+            problems += misspelt_since(folder, earlier, code, wanted) + paths_off_base(folder, earlier, code, wanted)
         # an unused variable alone never holds a build back or starts a fix round (Nov 17, task 58: one F841 took 3
         # rounds and kept it from checking clean); it's fixed along with a file's other problems, else listed
         dead[:] = [x for x in problems if _DEAD_CODE.match(x) and x.split(" line ")[0] not in same]
@@ -2530,11 +3873,13 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
     ticks: dict[int, tuple[str, str]] = {}
     try:
         ticks, problems, checked = check()
-        for rnd in range(1, rounds + 1):
+        rnd, limit = 0, rounds
+        while rnd < limit:
+            rnd += 1
             missing = [n for n, (state, _) in ticks.items() if state == "MISSING"]   # NOT SAID isn't fixed blind
             if not missing and not problems:
                 break
-            steps.info("Check round %d of %d: %s; asking for fixes.", rnd, rounds, ", ".join(filter(None, [
+            steps.info("Check round %d of %d: %s; asking for fixes.", rnd, limit, ", ".join(filter(None, [
                 f"{len(missing)} change{'s' if len(missing) != 1 else ''} not in the files yet" if missing else "",
                 f"{len(problems)} build problem{'s' if len(problems) != 1 else ''}" if problems else ""])))
             if missing:                                      # each to its own file, a few at a time
@@ -2590,6 +3935,13 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
                 notes.append(f"**Fix rounds stopped early:** the last {stuck + 1} checks found the same things "
                              "missing and the same problems, though the files changed.")
                 break
+            if rnd == limit < rounds + EXTRA_FIX_ROUNDS and smithy_diagnose.progressed(smithy_diagnose.read(hist)):
+                # the last round put right what it was given and something else is left: one more round, up to
+                # EXTRA_FIX_ROUNDS (Nov 18, task 59: the third round's fix brought a one-word error, prompt.ShowDialog()
+                # for Show(), and the build ended NOT clean with no round left to put it right)
+                limit += 1
+                steps.info("The last round put right what it was given and something else is left; "
+                           "one more round (at most %d).", rounds + EXTRA_FIX_ROUNDS)
             # a check that gave no answer for an item keeps the round before's answer, said as such
             again = "(from the check before the last fixes; the last check gave no answer)"
             ticks = {n: (old_ticks[n][0], old_ticks[n][1] if again in old_ticks[n][1]
@@ -2605,6 +3957,42 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
         ticks = {n: (s, note + " (a fix was tried, not checked again)" if s == "MISSING" else note)
                  for n, (s, note) in ticks.items()} if ticks else {n: ("NOT SAID", "") for n in items} if use_list else {}
 
+    # a test judged wrong and corrected (in this run or an earlier one) is reviewed against the request by a strong
+    # model, once per version of it: one that now checks less is put right before the tests run (Nov 18, task 60:
+    # the corrected test checked one field of the saved entry, passed, and the run would have ended there)
+    if only is None and not stopped and any(smithy_sandbox.is_test(r) for r in code):
+        try:
+            for n, d in sorted(verdicts.items()):
+                if d.get("side") not in ("test", "both"):
+                    continue
+                rel = next((r for r in code if _is_test(r) and n in _func_nodes(written.get(r, ""))), "")
+                if not rel:
+                    continue
+                src = ast.unparse(_func_nodes(written[rel])[n])
+                mark = hashlib.sha256(_norm(src).encode("utf-8")).hexdigest()[:16]
+                if d.get("reviewed") == mark:
+                    continue
+                got = review_test(ctx, request_text, n, src, "", float(ctx.cfg.get("rewrite_min_model_b", 70) or 0))
+                if got is None:
+                    continue                             # no strong model free: reviewed on the next run
+                d["reviewed"] = mark
+                if job_id:
+                    keep = decisions(job_id)
+                    keep.setdefault(n, d)["reviewed"] = mark
+                    decided_path(job_id).write_text(json.dumps(keep, indent=1), encoding="utf-8")
+                if got[0] != "weaker":
+                    continue
+                steps.info("%s: its correction checks less than the request asks (%s); putting it right.", n,
+                           got[1][:160])
+                notes.append(f"**`{n}` was corrected earlier but checked less than the request asks** ({got[1]}); "
+                             "it's put right before the tests run.")
+                fix(rel, f"{n} was judged wrong against the request and corrected, but it now checks less than the "
+                         f"request asks: {got[1]}\n\nPut that back: make {n} check everything the request asks of it. "
+                         + CORRECT_RIGHT + "\n\nWhat the request asks:\n\n" + request_text[:6000])
+            problems, checked = all_problems()
+        except (BudgetOut, TooLongForLocal) as e:
+            stopped = str(e)
+
     # the tests, in a throwaway Windows Sandbox (smithy_sandbox; off unless sandbox_tests is on). Only for the
     # whole build, once it builds clean; a failure gets one fix round (sandbox_fix_rounds) and runs again.
     sandbox = {"status": "off", "tests": {}, "output": {}, "why": ""}
@@ -2615,6 +4003,7 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
         try:
             for rnd in range(int(ctx.cfg.get("sandbox_fix_rounds", 1)) + 1):
                 sandbox = smithy_sandbox.run_tests(job_id, folder, code, ctx.cfg, SMITHY.results_dir, stop, rnd + 1)
+                skips_as_failures(sandbox, earlier, p.get("request", "") + "\n" + p.get("change", ""))
                 smithy_diagnose.record(hist, "sandbox", status=sandbox["status"],
                                        failing=sorted({name for t, st in sandbox["tests"].items() if st != "passed"
                                                        for name in (smithy_diagnose.assertions(
@@ -2666,21 +4055,32 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
                         verdicts[n] = record_decision(job_id, n, side, "smithy", why, len(smithy_diagnose.read(hist)),
                                                       verdicts)
                         smithy_diagnose.record(hist, "judged", test=n, side=side)
-                        steps.info("%s: judged against the request: the %s is wrong (%s).", n, side, why[:160])
+                        steps.info("%s: judged against the request: %s wrong (%s).", n,
+                                   "the test and the code are both" if side == "both" else f"the {side} is", why[:160])
                         notes.append(f"**The Smithy judged `{n}`** (it failed in several runs in a row): the "
                                      + ("test is wrong, so it's corrected to match the request" if side == "test"
+                                        else "test and the code are both wrong, so the test is corrected to the "
+                                             "request and the code is fixed to it" if side == "both"
                                         else "code is wrong, so the code is fixed for it")
                                      + (f". {why}" if why else "."))
                     relock()
                     stuck_here = [n for n in failing if n in to_judge]       # not judged: no strong model free
                     wrong_here = [n for n in failing if n in wrong_tests]
-                    named = fix_files_judged(folder, t, named, code, same, bool(wrong_here))
+                    # judged "code" or "both": the fix goes to the code files they call (fix_files_judged)
+                    code_wrong = [n for n in failing if word.get(n) in ("code", "both") and n not in to_judge]
+                    named = fix_files_judged(folder, t, named, code, same, bool(wrong_here), code_wrong,
+                                             any(n not in code_wrong for n in failing))
+                    both_here = [n for n in wrong_here if word.get(n) == "both"]
                     if wrong_here:                     # judged wrong: the test is corrected to the request
                         wanted += ("\n\nThese tests were checked against the request and found wrong: "
                                    + ", ".join(wrong_here) + ". Correct each one so it checks what the request asks "
-                                   "for (the request decides), keeping its checks; the code isn't changed to fit them."
+                                   "for (the request decides), keeping its checks; the code isn't changed to fit them. "
+                                   + CORRECT_RIGHT
                                    + "".join(f"\nWhy {n} is wrong: {verdicts[n].get('why')}" for n in wrong_here
                                              if verdicts.get(n, {}).get("why")))
+                    if both_here:                      # the code is wrong too: fixed to the request, not the test
+                        wanted += ("\n\nThe code is also wrong for " + ", ".join(both_here) + ": in a code file, fix "
+                                   "it so it does what the request asks (not what the test as written expects).")
                     if stuck_here:
                         # not judged yet (no strong model was free): neither the test nor the code is changed for
                         # it this round, and it's judged on the next
@@ -2711,7 +4111,7 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
                                     and not _backed_by_request(funcs_before[n], request_text)
                                     and n not in locked and n not in wrong_tests]   # those have their own way
                             held_or_locked = held + [n for n in failing if (n in to_judge or n in wrong_tests)
-                                                     and n not in held]
+                                                     and n not in held and word.get(n) != "both"]
                             if held:
                                 smithy_diagnose.record(hist, "test_disagrees", test=t, tests=held)
                                 notes.append(f"**`{t}`: {', '.join(held)} may disagree with the request.** A fix "
@@ -2738,7 +4138,7 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
                                "remove the test, and don't bend the code to a test that disagrees with the change.")
                         fix(rel, f"{t} failed when it was run (in a throwaway Sandbox). Its last lines:\n{out}\n\n"
                                  + (f"The failing tests, as written in {t}:\n```python\n{shown}\n```\n\n" if shown else "")
-                                 + how + wanted)
+                                 + how + wanted, failing=failing if rel == t else ())
                         if rel == t:
                             said = " ".join(notes[start:])
                 if all((folder / r).exists() and (folder / r).read_bytes() == b for r, b in before.items()):
@@ -2785,16 +4185,25 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
             truth.append("Its tests were run in a Sandbox and did NOT all pass: " + said + ". Say so plainly.")
     elif sandbox["status"] in ("busy", "unavailable") and tests:
         notes.append(f"**Tests not run in the Sandbox:** {sandbox['why']}.")
+    # why the Sandbox didn't run them, when it's on (Nov 18, task 60: "The Smithy never runs code" was said when a
+    # build problem in test_request.py had stopped them)
+    held = blocks_tests(problems) if ctx.cfg.get("sandbox_tests") and only is None else []
+    why_not = (f"{len(held)} build problem{'s' if len(held) != 1 else ''} stop them running ("
+               + "; ".join(held[:3]) + ")" if held else
+               "the checks stopped early" if stopped and ctx.cfg.get("sandbox_tests") else "")
     if ran:
         pass
     elif wants_tests:
-        left.append("its tests weren't run (The Smithy runs nothing; the request asks for them to pass)")
+        left.append(f"its tests weren't run ({why_not})" if why_not else
+                    "its tests weren't run (The Smithy runs nothing; the request asks for them to pass)")
         notes.append("**Tests not run:** the request asks for "
-                     + (", ".join(f"`{t}`" for t in tests) if tests else "its tests") + " to pass, and The Smithy "
-                     "never runs code, so that isn't shown.")
+                     + (", ".join(f"`{t}`" for t in tests) if tests else "its tests") + " to pass, and "
+                     + (f"{why_not}, so the Sandbox didn't run them." if why_not else
+                        "The Smithy never runs code, so that isn't shown."))
         truth.append("Its tests have NOT been run, so don't say they pass; say \"Tests not run yet\".")
     elif tests:
-        notes.append("**Tests not run:** " + ", ".join(f"`{t}`" for t in tests) + " (The Smithy never runs code).")
+        notes.append("**Tests not run:** " + ", ".join(f"`{t}`" for t in tests)
+                     + (f" ({why_not})." if why_not else " (The Smithy never runs code)."))
         truth.append("Its tests have NOT been run, so don't say they pass.")
     if ticks:
         done = [n for n in ticks if n not in not_done]
@@ -2807,6 +4216,10 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
         notes.append(f"**Changes asked for:** {len(done)} of {len(ticks)} done"
                      + (". **Not done:** " + "; ".join(f"{n} ({ticks[n][1] or ('not checked: the checklist reply had no answer for it' if ticks[n][0] == 'NOT SAID' else ticks[n][0].lower())})" for n in not_done)
                         if not_done else "."))
+        extra = unrequested_changes(str(p.get("request", "")) + "\n" + str(p.get("change", "")), plan)
+        if extra:
+            notes.append("**Changed, but the request doesn't name them:** " + ", ".join(f"`{x}`" for x in extra)
+                         + ". Look at each: it should change only what a named file needs.")
         truth.append("Of the numbered changes asked for, these are DONE: " + (", ".join(map(str, done)) or "none")
                      + (". These are NOT done, so don't describe them as done; list them under \"Not done yet\": "
                         + "; ".join(items[n].split("\n")[0][:160] for n in not_done) if not_done else "."))
@@ -3525,6 +4938,19 @@ def run_build(ctx, p: dict):
     if plan_path.exists():
         saved = json.loads(plan_path.read_text(encoding="utf-8"))
         summary, desc, plan = saved["summary"], saved["desc"], saved["plan"]
+    elif parent and is_self_check(p.get("change", "")):
+        # a self check needs no plan from a model: every file as it is, and The Smithy's own checks (no model) say
+        # what to fix (Nov 19, task 61: "run your own self check for any bad code, bloat" was planned as a new
+        # project, lost 5 of its 14 modules and kept the dead copy it was asked to find)
+        files = [{**f, "change": "check"} for f in earlier_files(parent)]
+        plan = {"name": parent["plan"].get("name", ""), "files": files}
+        summary = (f"A self check of all {len(files)} files: every file is kept as it is, and only what The Smithy's "
+                   "own checks find is fixed.")
+        desc = ("A self check: The Smithy's own checks, with no model, look through every file (unused code and "
+                "copies, lint, types, the tests); only what they find is fixed, and behaviour and the file list stay "
+                "as they are.")
+        plan_path.write_text(json.dumps({"summary": summary, "desc": desc, "plan": plan}, indent=2), encoding="utf-8")
+        steps.info("A self check: all %d files kept as they are; The Smithy's own checks say what to fix.", len(files))
     else:
         ctx.step(0.0, 0.10)
         steps.info("Planning the %s.", "new version" if parent else "build")
@@ -3556,6 +4982,11 @@ def run_build(ctx, p: dict):
         if parent:
             plan["name"] = parent["plan"].get("name") or plan["name"]
             _keep_unasked(plan, parent, p.get("change", ""))
+            if plan.get("kept_unplanned"):
+                steps.info("The plan left out %s; nothing asks for %s to go, so %s kept as %s.",
+                           ", ".join(plan["kept_unplanned"]), "them" if len(plan["kept_unplanned"]) > 1 else "it",
+                           "they're" if len(plan["kept_unplanned"]) > 1 else "it's",
+                           "they were" if len(plan["kept_unplanned"]) > 1 else "it was")
         plan_path.write_text(json.dumps({"summary": summary, "desc": desc, "plan": plan}, indent=2), encoding="utf-8")
         steps.info("Plan ready: %d file%s: %s, and the README.", len(plan["files"]), "" if len(plan["files"]) == 1 else "s",
                    ", ".join(f["path"] for f in plan["files"]))
@@ -3603,8 +5034,8 @@ def run_build(ctx, p: dict):
                 continue
             target.unlink()                                           # (nearly) empty: written again
         target.parent.mkdir(parents=True, exist_ok=True)
-        if f.get("change") == "same" and old_path is not None:
-            steps.info("%s stays the same: copied.", rel)
+        if f.get("change") in ("same", "check") and old_path is not None:
+            steps.info("%s %s: copied.", rel, "stays the same" if f.get("change") == "same" else "is checked as it is")
             shutil.copyfile(old_path, target)
             written[rel] = target.read_text(encoding="utf-8", errors="replace")
             continue
@@ -3742,10 +5173,49 @@ def run_build(ctx, p: dict):
                         + f"\n\n## What's checked\n\n{truth or 'Nothing could be checked.'}\n\n"
                           "Written without a model, because a limit was reached: " + str(e) + ".\n")
         readme.write_text(text, encoding="utf-8")
+    # 5. the request's README changes, checked against the README as written; what's missing gets one round of
+    # edits, then is checked again, and anything still missing keeps the build NOT COMPLETE (Nov 18, task 60)
+    r_items = readme_items(p)
+    if r_items:
+        now = readme.read_text(encoding="utf-8", errors="replace")
+        try:
+            r_ticks = readme_check(ctx, r_items, now)
+            missing = {n: why for n, (s, why) in r_ticks.items() if s != "DONE"}
+            if missing:
+                steps.info("README changes not made yet: %s; one round of edits for them.",
+                           ", ".join(map(str, missing)))
+                body, note = _edit_file(ctx, job_id, _edit_messages(
+                    p, desc, plan, "README.md", written, now,
+                    "Make these README changes the request asks for, which aren't in README.md yet:\n"
+                    + "\n".join(f"- change {n}: {why}" for n, why in missing.items())
+                    + "\n\nThe changes, as asked:\n\n" + "\n\n".join(r_items[n] for n in missing)
+                    + "\n\nStart each FIND with a whole line of README.md's own text (a heading or a sentence), never "
+                      "a ``` fence, a table border or a one-word line: a FIND that short is refused. To add a new "
+                      "section, FIND the heading it goes after (or the last line of that section) and REPLACE it "
+                      "with that same text followed by the new section", cap=budget), "README.md", now)
+                edit_notes.append(note)
+                if body != now:
+                    readme.write_text(body, encoding="utf-8")
+                    r_ticks = readme_check(ctx, r_items, body)
+        except (BudgetOut, TooLongForLocal) as e:
+            r_ticks = {}
+            left = left + ["the README changes weren't checked (" + str(e).split(";")[0] + ")"]
+        if r_ticks:
+            bad = [n for n, (s, _) in r_ticks.items() if s != "DONE"]
+            check_notes = check_notes + [
+                "**README changes asked:** " + "; ".join(f"{n}: {s}" + (f" - {why}" if why else "")
+                                                       for n, (s, why) in r_ticks.items())]
+            if bad:
+                left = left + [f"README change{'s' if len(bad) != 1 else ''} {', '.join(map(str, bad))} not done"]
+    check_notes = _final_tokens(job_id, check_notes)    # the README and its check were the last model calls
 
     files = sorted(written) + ["README.md"]
     if cut_files or refused_files:                    # incomplete files count against "checks clean" too
         left = left + [f"{len(cut_files) + len(refused_files)} file(s) cut off or left out"]
+    if p.get("repaired"):
+        n = int(p["repaired"])
+        desc += (f"\n\n**Request repaired:** {n} lost backslash{'es' if n != 1 else ''} put back (a control "
+                 "character where a path had \\a, \\b, \\f or \\v); the rest of the request was used as written.")
     if edit_notes:
         desc += "\n\n**Edited, not rewritten:**\n" + "\n".join(f"- {n}" for n in edit_notes)
     if stage_notes:
@@ -3775,7 +5245,7 @@ def run_build(ctx, p: dict):
 
 # ---------------------------------------------------------------- params for builds
 def _check_build(p, joomla: bool = False):
-    out = {"request": _text(p, "request", "what to build", 3)}
+    out = {"request": _text(p, "request", "what to build", 3)} | _repaired(p, "request")
     if joomla:
         out["joomla"] = True
     if p.get("path"):                                        # a file to base it on (optional)
@@ -3802,7 +5272,7 @@ def _check_followup_any(p):
     if parent["type"] in ("build", "joomla") or "change" in json.loads(parent["params"] or "{}"):
         pp = json.loads(parent["params"] or "{}")
         out = {"parent_id": out["parent_id"], "change": out["question"], "version": int(pp.get("version", 1)) + 1,
-               "question": out["question"]}
+               "question": out["question"]} | {k: out[k] for k in ("repaired",) if k in out}
     return out
 
 

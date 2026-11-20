@@ -61,7 +61,8 @@ def replay(job_id: int, run: int | None = None) -> str:
     same = {f["path"] for f in plan.get("files", []) if f.get("change") == "same"}
     code = sorted(r.name for r in folder.iterdir() if r.is_file())
     decided = sj.decisions(job_id)
-    wrong = {n for n, v in decided.items() if v.get("side") == "test"}
+    wrong = {n for n, v in decided.items() if v.get("side") in ("test", "both")}
+    code_side = {n for n, v in decided.items() if v.get("side") in ("code", "both")}
     codes = {}
     for line in (d / "out" / "codes.txt").read_text(encoding="utf-8", errors="replace").splitlines():
         name, _, rc = line.rpartition(" ")
@@ -80,15 +81,22 @@ def replay(job_id: int, run: int | None = None) -> str:
             continue
         out.append(f"- `{t}`: failed ({len(failing)} failing: {', '.join(failing) or 'none named'})")
         named = sj.fix_files(folder, t, printed, code, same)
-        named = sj.fix_files_judged(folder, t, named, code, same, any(n in wrong for n in failing))
+        code_wrong = [n for n in failing if n in code_side]
+        named = sj.fix_files_judged(folder, t, named, code, same, any(n in wrong for n in failing), code_wrong,
+                                    any(n not in code_wrong for n in failing))
         sent = named[:4]
         out.append(f"  - the fix would go to: {', '.join(sent) or 'nothing'}"
                    + (f" (and not: {', '.join(named[4:])}, past the 4 a round asks)" if named[4:] else ""))
+        if code_wrong and all(sj._is_test(r) for r in sent):
+            # Nov 18, task 60: a test judged "code is wrong" had its fix sent only to its own locked test file
+            warnings.append(f"{', '.join(f'`{n}`' for n in code_wrong)} judged \"the code is wrong\", but the fix "
+                            f"would go only to test files: {', '.join(sent) or 'nothing'}")
         for n, files in _calls_by_test(folder, t, failing, code).items():
             side = decided.get(n, {}).get("side")
             out.append(f"  - `{n}` calls {', '.join(files) or 'no build file'}"
-                       + (f"; judged: the {side} is wrong" if side else ""))
-            missed = [r for r in files if r not in sent and r not in same]
+                       + (f"; judged: {'the test and the code are both' if side == 'both' else f'the {side} is'} wrong"
+                          if side else ""))
+            missed = [r for r in files if r not in sent and (r not in same or n in code_side)]
             if side != "test" and missed and not any(r in sent for r in files):
                 warnings.append(f"`{n}` calls {', '.join(missed)}, which get no fix (the fix goes to "
                                 f"{', '.join(sent)})")
@@ -96,9 +104,11 @@ def replay(job_id: int, run: int | None = None) -> str:
             bad = [r for r in sent if sj._is_test(r)]
             if bad:
                 warnings.append(f"{t}'s code fix would go to a test file: {', '.join(bad)}")
-        if [r for r in sent if r in same]:
+        # a file a code-judged test calls may be opened for its fix, though the plan keeps it the same
+        opened = {r for n in code_wrong for r in sj._called_files(folder, t, [n], code)}
+        if [r for r in sent if r in same and r not in opened]:
             warnings.append(f"`{t}`'s fix would go to a file the plan keeps the same: "
-                            + ", ".join(r for r in sent if r in same))
+                            + ", ".join(r for r in sent if r in same and r not in opened))
 
     # 2. the build check: what holds it back, and what's only unused code
     stdlib_only = bool(sj._STDLIB_ONLY.search(p.get("request", "")))
