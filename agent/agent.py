@@ -36,6 +36,7 @@ from livekit.agents import (
     get_job_context,
 )
 from livekit.agents.utils.images import EncodeOptions, ResizeOptions, encode as encode_image
+from livekit.agents.types import FlushSentinel
 from livekit.plugins import deepgram, openai, rime, silero
 from tavily import AsyncTavilyClient
 
@@ -132,7 +133,8 @@ _ANSWER_FROM_QA = (
 _SEARCH_ONLINE = re.compile(r"\b(?:search|look|check)\b[^.?!]*\b(?:the web|online|the internet|tavily)\b", re.I)
 # "What is permaculture?", "Who was Nikola Tesla?": the Wikipedia article's opening
 _DEFINITION = re.compile(r"^\W*(?:what(?:'s| is| are| was| were)\s+(?:an?\s+)?|who(?:'s| is| was| were)\s+|"
-                         r"tell me (?:a (?:bit|little) )?about\s+)(?P<x>[^?.!]{2,60}?)\W*$", re.I)
+                         r"tell me (?:a little bit |a little |a bit |something |more |all )?about\s+)"
+                         r"(?P<x>[^?.!]{2,60}?)\W*$", re.I)
 
 
 def _say_title(t: str) -> str:
@@ -606,6 +608,8 @@ def _earlier_question(chat_ctx) -> str | None:
         if q:
             extra = " ".join(re.sub(r"[.?!,]+$", "", f).strip() for f in reversed(fragments))
             return f"{extra} {q}".strip() if extra else q
+        if _ABOUT_OTHOS.search(said) and _QUESTION.search(said):
+            continue   # "What resource did you pull that from?": about Othos, not the topic (Nov 20, 7:52 call)
         if len(said.split()) <= 5:
             fragments.append(said)
             continue
@@ -617,7 +621,8 @@ def _searchable(said: str, chat_ctx) -> str | None:
     """The search query for a turn that asks something ("Any new businesses in X?"), or None for small talk, so a
     promised lookup never searches "It's a sunny morning"."""
     said = _as_othos(said)
-    if not (_QUESTION.search(said) or _SEARCH_WORDS.search(said) or _LOCAL_NEW.search(said)):
+    if not (_QUESTION.search(said) or _SEARCH_WORDS.search(said) or _LOCAL_NEW.search(said) or _DEFINITION.search(said)
+            or _ASKS_SEARCH.search(said)):
         return None
     return _query_from(said, chat_ctx)
 
@@ -627,6 +632,124 @@ def _offered_lookup(chat_ctx) -> bool:
     said = next((i.text_content or "" for i in reversed(chat_ctx.items[:-1])
                  if isinstance(i, llm.ChatMessage) and i.role == "assistant"), "")
     return bool(_OFFERS_LOOKUP.search(said))
+
+
+# what Othos's own offer said it would look up: "Would you like me to search for more specific information on plants
+# for dappled shade?" -> "plants for dappled shade" (Nov 20, 7:52 call: her "Yes." searched nothing)
+_OFFER_TOPIC = re.compile(
+    r"\b(?:search(?:\s+the\s+web)?\s+for|look\s+up|look\s+into|find(?:\s+out)?(?:\s+more)?\s+about|check\s+on|"
+    r"(?:information|info|details|recommendations|suggestions)\s+(?:on|about|for))\s+"
+    r"(?:(?:some|more|specific|detailed|the\s+latest|current)\s+)*(?:(?:information|info|details)\s+(?:on|about)\s+)?"
+    r"(?P<t>[^.?!]{3,90})", re.I)
+_OFFER_TAIL = re.compile(r"\s+(?:for you|if you(?:'d| would) like|if you want|online|on the web|right now|now)\b.*$",
+                         re.I)
+
+
+def _last_said(chat_ctx) -> str:
+    """Othos's last reply before this turn."""
+    return next((i.text_content or "" for i in reversed(chat_ctx.items[:-1])
+                 if isinstance(i, llm.ChatMessage) and i.role == "assistant"), "")
+
+
+def _last_reply_searched(chat_ctx) -> bool:
+    """Did Othos's last reply come from a search (a tool result between her question and that reply)?"""
+    seen_reply = False
+    for i in reversed(chat_ctx.items[:-1]):
+        if isinstance(i, llm.ChatMessage) and i.role == "assistant":
+            seen_reply = True
+        elif isinstance(i, llm.FunctionCallOutput) and seen_reply:
+            return True
+        elif isinstance(i, llm.ChatMessage) and i.role == "user" and seen_reply:
+            return False
+    return False
+
+
+# Othos asked what to search ("I haven't looked anything up yet. What would you like me to search for?")
+_ASKED_WHAT_TO_SEARCH = re.compile(r"\bwhat (?:would you like|do you want|should|shall) (?:me to |i )?(?:search|look up|"
+                                   r"look for|find)\b", re.I)
+_NOTHING_TO_SEARCH = re.compile(r"^\W*(?:no|nope|nothing|never ?mind|forget (?:it|about it)|not now|that's (?:ok|okay|"
+                                r"fine|all)|it's (?:ok|okay|fine)|skip it)\b", re.I)
+# "Can you cite your source on that?", "Where did you get that?" (Nov 20, 8:47 call)
+_ASKS_WHERE_FROM = re.compile(r"\b(?:cite (?:your|the|a|any) sources?|(?:what(?:'s| is| was| are)|which (?:is|was)) (?:your|the) "
+                          r"sources?|where did you (?:get|find|hear|learn|read|pull|see) (?:that|this|it)|what (?:resource|"
+                          r"source|website|site) did you|sources? (?:on|for) that|how do you know (?:that|this))\b", re.I)
+
+
+def _bare_topic(text: str) -> str | None:
+    """A turn that is only a topic ("Broadforks."), as a query; None for anything longer than a few words."""
+    t = re.sub(r"^\W*(?:(?:um|uh|well|okay|ok|so)\W+)*(?:othos\W+)?", "", _as_othos(text or ""), flags=re.I)
+    t = re.sub(r"[\s.!?,]+$", "", t).strip()
+    words = re.findall(r"[\w'-]+", t)
+    if not words or len(words) > 6 or _PERSONAL.search(t) or _REFERS_BACK.fullmatch(t):
+        return None
+    return t
+
+
+def _offer_topic(chat_ctx) -> str | None:
+    """The topic Othos named in its last reply's offer to look something up, or None."""
+    said = next((i.text_content or "" for i in reversed(chat_ctx.items[:-1])
+                 if isinstance(i, llm.ChatMessage) and i.role == "assistant"), "")
+    if not _OFFERS_LOOKUP.search(said):
+        return None
+    found = [m.group("t") for m in _OFFER_TOPIC.finditer(said)]
+    for t in reversed(found):                      # the offer itself usually comes last
+        t = _OFFER_TAIL.sub("", t).strip(" ,;:")
+        if len(re.findall(r"\w+", t)) >= 2 and not re.fullmatch(r"(?i)(?:it|that|this|anything|something|more)\b.*", t):
+            return t
+    return None
+
+
+SELF_CHECK_MEMORY_S = 600  # "Could you expand on that?" is about the self-check for this long after it
+SEARCH_SILENCE_S = 3.0     # a turn that may search says "One moment." after this long with nothing from the model
+_SILENT = object()
+
+
+def _has_words(chunk) -> bool:
+    if isinstance(chunk, str):
+        return bool(chunk.strip())
+    if isinstance(chunk, llm.ChatChunk) and chunk.delta:
+        return bool((chunk.delta.content or "").strip() or chunk.delta.tool_calls)
+    return False
+
+
+async def _say_if_silent(stream, wait: float):
+    """The model's stream, with _SILENT put in once if nothing with words (or a tool call) came within `wait` s."""
+    it = stream.__aiter__()
+    deadline = time.monotonic() + wait
+    waiting = True                  # no words yet, and the filler not said yet
+    nxt = None
+    try:
+        while True:
+            nxt = asyncio.ensure_future(it.__anext__())
+            if waiting:
+                done, _ = await asyncio.wait({nxt}, timeout=max(0.0, deadline - time.monotonic()))
+                if not done:
+                    waiting = False
+                    yield _SILENT
+            try:
+                chunk = await nxt
+            except StopAsyncIteration:
+                return
+            nxt = None
+            if waiting and _has_words(chunk):
+                waiting = False
+            yield chunk
+    finally:
+        if nxt is not None and not nxt.done():
+            nxt.cancel()
+
+
+_ASKS_OPENER = re.compile(r"^\W*(?:(?:hey|hi|ok|okay|so|and|but|also|well)\W+)*(?:othos\W+)?(?:(?:can|could|would|will|"
+                          r"do|does|did|is|are|should|tell|show|find|give)\b)", re.I)
+
+
+def _whole_question(text: str) -> bool:
+    """A turn that asks something complete by itself ("Othos, what's the best soil mix for raised beds?"), so a cut-off
+    start just before it was abandoned, not continued ("What are its" + "last two task results?" stays joined)."""
+    t = _as_othos(text or "").strip()
+    if len(re.findall(r"\w+", t)) < 4 or _dangling(t):
+        return False
+    return bool(_QUESTION_OPENER.match(t) or _ASKS_OPENER.match(t))
 
 
 def _unanswered(chat_ctx) -> list[str]:
@@ -780,7 +903,9 @@ _ASKS_SEARCH = re.compile(
     r"google (it|that|this|for)|find out|news|headlines?|latest|current|price|prices|cost|"
     r"how much|weather|forecast|what (is|are|was|were|does|do)|what's (a|an|the)|"
     r"who (is|was|are|were|won|wins|made|makes|invented|owns|plays)|who's|winner|score|results of|where (is|are|was|can|do)|when (is|was|did|does|do|will)|"
-    r"how (do|does|did|to|can|many|long|far|old)|why (is|are|do|does|did)|tell me about|explain)\b",
+    r"how (do|does|did|to|can|many|long|far|old)|why (is|are|do|does|did)|"
+    # "Well, tell me a little bit about hairless cats." didn't search (Nov 20, 8:47 call)
+    r"tell me (?:a little bit |a little |a bit |something |more |all )?about|explain)\b",
     re.IGNORECASE,
 )
 _ASKS_WEATHER = re.compile(
@@ -987,7 +1112,11 @@ def _spoken_headline(r: dict, words: int = 10) -> str:
 
 
 _READOUT_SMALL = {"a", "an", "the", "and", "or", "of", "in", "on", "to", "for", "with", "by", "at", "as", "from", "-", "&"}
-READOUT_COUNT = 3   # results read per page (was 4): about 20 s of speech, and less for the model to re-read each turn
+# a search answer that retells one page instead of answering ("The speaker says...", "In this video...")
+_ABOUT_A_PAGE = re.compile(r"\b(?:the|this|that)\s+(?:speaker|narrator|video|author|writer|host|presenter|creator|"
+                           r"youtuber|vlogger|article|post|blog post|episode|podcast|transcript|clip|channel|thread|poster)"
+                           r"\b|\bin this (?:video|article|episode|post)\b", re.I)
+READOUT_COUNT = 3  # results read per page (was 4): about 20 s of speech, and less for the model to re-read each turn
 
 # "Where can I get a broadfork?": the user wants places that sell it, near home (the user, Nov 20), not pages about
 # the product, forum threads, or stores in another state
@@ -1095,10 +1224,67 @@ _REQUEST_PART = re.compile(
     r"can you|could you|search|look up|research|find out)\b[^,;:]*)$", re.I)
 
 
+# "Where could I get a broadfork near me?" -> "where to buy a broadfork near me" (searchctx puts the town in): the buying
+# words stay, or the search finds farms named Broadfork (Nov 20, 7:52 call), and code writes it so the model doesn't
+# spend ~15 s reading the search tool's instructions and writing the call
+_BUY_ITEM = re.compile(
+    r"\bwhere\s+(?:(?:can|could|do|should|would|might)\s+(?:i|we)\s+|to\s+)(?:go\s+to\s+)?"
+    r"(?:get|buy|find|purchase|pick\s+up|order)\s+(?P<item>[^?.!,]+?)"
+    r"(?:\s+(?:near\s+me|near\s+here|nearby|around\s+here|around\s+me|locally|in\s+my\s+area|in\s+town|close\s+by|"
+    r"close\s+to\s+me|from\s+here))?\s*[?.!]*$", re.I)
+# "Can you suggest any in my area?": "any" is the breeders from two turns before, about hairless cats (Nov 20)
+_IN_MY_AREA = re.compile(r"\b(?:in\s+my\s+area|near\s+me|nearby|around\s+here|around\s+me|close\s+by|locally|"
+                         r"close\s+to\s+me|in\s+town)\b", re.I)
+# what "any" means in "Can you suggest any in my area?": places and people, not "health" or "food" (Nov 20)
+_PLACE_NOUN = re.compile(r"\b(?:breeders?|vets?|veterinarians?|veterinary clinics?|shelters?|rescues?|stores?|shops?|"
+                         r"nurser(?:y|ies)|trainers?|groomers?|classes|clubs?|groups?|kennels?|cattery|catteries|farms?|"
+                         r"dealers?|sellers?|suppliers?|markets?|clinics?|doctors?|dentists?|mechanics?|restaurants?)\b",
+                         re.I)
+_ASKS_FOR_PLACES = re.compile(r"\b(?:suggest|recommend|find|know\s+(?:of|any)|are\s+there|is\s+there|any|some|"
+                              r"good\s+ones?|options)\b", re.I)
+
+
+_POINTS_BACK = re.compile(r"(?i)(?:(?:a|an|the|some|one\s+of)\s+)?(?:it|that|this|them|those|these|one|ones|some|any)"
+                          r"(?:\s+(?:of\s+)?(?:them|those|these))?")
+# what a search was about, without what it asked of it: "broadfork uses" -> "broadfork", "Sphynx cat prices" -> "Sphynx cat"
+_SUBJECT_TAIL = re.compile(r"(?i)(?:\s+(?:uses?|benefits?|prices?|costs?|reviews?|history|facts|meaning|definition|"
+                           r"info(?:rmation)?|guide|tips|explained|for sale|near\s+.*|in\s+[A-Z].*|"
+                           r"(?:how|what|where|why|when)\b.*))+$")
+
+
+def _subject_core(subject: str) -> str:
+    s = re.sub(r"(?i)^(?:where to (?:buy|get|find)|what (?:is|are)|tell me about|about)\s+", "", (subject or "").strip())
+    s = re.sub(r"(?i)^(?:an?|the|some)\s+", "", s)
+    return _SUBJECT_TAIL.sub("", s).strip(" ,.?!")
+
+
+def _local_query(text: str, recent: list[str], subject: str) -> str | None:
+    """A where-to-buy or in-my-area question as a search query, or None (then _query_from or the model writes it)."""
+    t = re.sub(r"^\W*(?:(?:hey|hi|ok|okay|so|and|but|also|well)\W+)*(?:othos\W+)?", "", _as_othos(text).strip(),
+               flags=re.I)
+    t = re.sub(r"^(?:othos\W+)", "", t, flags=re.I)
+    m = _BUY_ITEM.search(t)
+    if m:
+        item = re.sub(r"\s+", " ", m.group("item")).strip()
+        if _POINTS_BACK.fullmatch(item):
+            # "Where could I buy one locally?" after a search about broadforks (Nov 20, 8:20 call: "Don't know")
+            item = _subject_core(subject)
+        if item and len(re.findall(r"\w+", item)) <= 6 and not _PERSONAL.search(item):
+            return f"where to buy {item} near me"     # stores near home first (the user, Nov 20)
+    if _IN_MY_AREA.search(t) and _ASKS_FOR_PLACES.search(t) and subject:
+        own = _PLACE_NOUN.search(t)
+        noun = own.group(0) if own else next(
+            (mm.group(0) for r in reversed(recent) for mm in [_PLACE_NOUN.search(r)] if mm), "")
+        if noun:
+            return f"{subject} {noun} near me"
+    return None
+
+
 def _query_from(text: str, chat_ctx) -> str | None:
     """The user's request cut down to a search query, or None when the model should
     write it. 'Othos, what are the main islands in the US Virgin Islands? Please
     look it up as well.' -> 'what are the main islands in the US Virgin Islands?'"""
+    asked_about = bool(_DEFINITION.search(text))   # "Tell me more about broadforks.": one word is a whole topic
     text = _without_small_talk(text) or text  # "Good morning, Othos. What's..." -> "What's..."
     # "Nicely done. Let's see. Othos can you tell me about..." was searched whole (Nov 10
     # call): with several sentences, search with the last one that asks something
@@ -1136,8 +1322,16 @@ def _query_from(text: str, chat_ctx) -> str | None:
     q = re.sub(r"^[\s,.!?]+|[\s,.!]+$|([.?!])[\s,.!?]*$", r"\1", q).strip()
     # "But what's the forecast?", "So can you tell me of any new..." -> "any new..."
     q = re.sub(r"^(?:(?:but|and|so|also|okay|ok|well|then|now|about|of|actually)\b[\s,]*)+", "", q, flags=re.I)
+    # what "tell me" and "look up" leave behind (Nov 20, 8:47 call): "a little bit about hairless cats" -> "hairless
+    # cats", "Why don't you Broad Forks then?" -> "Broad Forks"
+    q = re.sub(r"^(?:(?:a little bit|a little|a bit|something|more|all|everything)\s+)?about\s+", "", q, flags=re.I)
+    q = re.sub(r"^(?:why (?:don't|do not) you|how about you|maybe you (?:could|can|should)|you (?:could|should|can))"
+               r"\b[\s,]*", "", q, flags=re.I)
+    if _SEARCH_WORDS.search(text) or re.search(r"\bwhy (?:don't|do not) you\b", text, re.I):
+        q = re.sub(r"[\s,]+(?:then|instead|now|already|real quick)\s*([?.!]?)$", r"\1", q, flags=re.I).strip()
     name = _user_name()
-    if len(re.findall(r"\w+", q)) < 2 or _PERSONAL.search(q) or (
+    one_ok = asked_about and len(re.findall(r"\w+", q)) == 1 and not _REFERS_BACK.fullmatch(q.strip(" .?!,"))
+    if (len(re.findall(r"\w+", q)) < 2 and not one_ok) or _PERSONAL.search(q) or (
             name and re.search(rf"\b{re.escape(name)}\b", q, re.I)):
         return None
     # weather's "it" ("Will it rain tomorrow?") doesn't refer back to anything
@@ -2053,6 +2247,45 @@ class _NameFilter:
         return self._clean(out) if out else ""
 
 
+class _ClaimFilter:
+    """On a turn with no search, a reply that says it found something ("Hairless cats are a breed... I found that they
+    often require grooming") is reworded to what it is: "From what I know, they often require grooming." (Nov 20,
+    8:47 call). One sentence at a time, like _NameFilter; the opening "Let me check..." is _claim_state's job."""
+
+    _RX = re.compile(
+        r"\b(?:i(?:'ve| have)? (?:found|discovered|learned|read|saw)(?: out)?(?: online)? that|"
+        r"i (?:looked (?:it|that|this) up|did (?:some|a little|a bit of) research|did a (?:quick )?(?:web )?search|"
+        r"searched (?:online|the web)?) and (?:found|learned|saw|read)(?: that)?|"
+        r"(?:according to|based on) (?:my|a|the|some) (?:quick )?(?:search|research|sources?|look-?up|results?)|"
+        r"my (?:search|research|look-?up) (?:shows|showed|found|says|said)(?: that)?|"
+        r"(?:the )?(?:search )?results (?:show|showed|say|said)(?: that)?)\s*,?\s*", re.I)
+
+    def __init__(self):
+        self._buf = ""
+
+    @classmethod
+    def _clean(cls, s: str) -> str:
+        def rep(m):
+            before = s[:m.start()].rstrip()
+            start = not before or before[-1] in ".!?"
+            return "From what I know, " if start else "from what I know, "
+        out = cls._RX.sub(rep, s)
+        return out
+
+    def feed(self, text: str) -> str:
+        self._buf += text
+        ends = list(_SENTENCE_END.finditer(self._buf))
+        if not ends:
+            return ""
+        cut = ends[-1].end()
+        out, self._buf = self._buf[:cut], self._buf[cut:]
+        return self._clean(out)
+
+    def flush(self) -> str:
+        out, self._buf = self._buf, ""
+        return self._clean(out) if out else ""
+
+
 # ---------------------------------------------------------------- pronunciation
 # Words the voice says wrong, respelled just before the text goes to Rime
 # (place names, acronyms). Settings: pronunciations.json, plus the place names in
@@ -2721,6 +2954,27 @@ class Assistant(Agent):
         return bool(asked and _YES.search(text))
 
     # ---- decide in code which tools the model may use this turn ------------
+    def _source_reply(self, chat_ctx) -> str:
+        """For an answer that didn't come from a search: "my own general knowledge", with an offer to look the topic
+        up, worded so a yes searches it (_offer_topic). A searched answer's sites are named further on."""
+        topic = _earlier_question(chat_ctx)
+        topic = re.sub(r"[?.!]+$", "", topic or "").strip()
+        if topic:
+            return (f"That came from my own general knowledge, not a search, so there's no source I can point to. "
+                    f"Want me to look up {topic}?")
+        return ("That came from my own general knowledge, not a search, so there's no source I can point to. "
+                "Want me to look it up?")
+
+    def _earlier_local(self, chat_ctx) -> str | None:
+        """The where-to-buy / in-my-area search for her last real question before a yes ("Where could I buy one
+        locally?" -> "Don't know. Would you like me to look it up?" -> "Yes, please": Nov 20, 8:20 call)."""
+        for i in reversed(chat_ctx.items[:-1]):
+            if isinstance(i, llm.ChatMessage) and i.role == "user":
+                said = (i.text_content or "").strip()
+                if said and not _YES_ONLY.match(said) and not _FILLER_ONLY.match(said):
+                    return _local_query(said, self._recent_user, getattr(self, "_last_subject", ""))
+        return None
+
     def _recent_pic(self) -> str:
         """The last picture if it's still fresh enough for follow-ups; else drop it."""
         pic, when = self._last_pic
@@ -2746,13 +3000,21 @@ class Assistant(Agent):
         self._user_text = _as_othos(last.text_content or "")  # the chosen name reads as "Othos" here
         before = _unanswered(chat_ctx)
         if before and _dangling(before[-1]):
-            # "What are its" + "last two task results?": answered as one question
-            self._user_text = _as_othos(before[-1]).strip().rstrip(",") + " " + self._user_text
+            if _whole_question(self._user_text):
+                # "What was what was" + "Othos, what's the best soil mix for raised beds?": she started over, so the
+                # cut-off start is dropped (Nov 20, 7:52 call: it was glued onto the search)
+                log.info("cut-off start dropped; the next turn is a whole question: %r", before[-1])
+            else:
+                # "What are its" + "last two task results?": answered as one question
+                self._user_text = _as_othos(before[-1]).strip().rstrip(",") + " " + self._user_text
         if _dangling(self._user_text):
             self._wait_rest = True   # still talking: no tools, no reply (llm_node)
             self._allowed = set()
             return []
         allowed = _tool_names_for(self._user_text, has_results=bool(self._results))
+        if "web_search" not in allowed and _local_query(self._user_text, self._recent_user,
+                                                         getattr(self, "_last_subject", "")):
+            allowed = allowed | {"web_search"}   # "Where could I buy one locally?" after broadforks (Nov 20, 8:20 call)
         if self._recent_pic() and _LOOK_FOLLOWUP.search(self._user_text) \
                 and not _ASKS_NOTES.search(self._user_text):
             allowed = {"look"}  # "Am I holding anything?" just after a look: ask that picture
@@ -2855,13 +3117,37 @@ class Assistant(Agent):
                                 "working": q.read_status().get("state") == "working"})
             except Exception:
                 pass
-        g = self._gaming
-        facts = await asyncio.to_thread(
-            selfcheck.gather, _OLLAMA_ROOT, os.getenv("OLLAMA_MODEL", "llama3.2:3b"),
-            health=llm_server.root() + "/health" if llm_server.enabled() else "",
-            workers=workers, gaming=bool(g and g.mode.on), camera=bool(_camera_publication()))
+        facts = await self._check_facts(workers)
         reply = selfcheck.describe(facts, user_text)
+        self._last_check = (facts, time.monotonic(), reply)
         log.info("self-check: %s -> %r", {k: v for k, v in facts.items() if k != "workers"}, reply)
+        return reply
+
+    async def _check_facts(self, workers: list | None = None) -> dict:
+        g = self._gaming
+
+        def read():
+            return selfcheck.gather(
+                _OLLAMA_ROOT, os.getenv("OLLAMA_MODEL", "llama3.2:3b"),
+                health=llm_server.root() + "/health" if llm_server.enabled() else "",
+                workers=workers or [], gaming=bool(g and g.mode.on), camera=bool(_camera_publication()),
+                starting=llm_server.starting())
+        return await asyncio.to_thread(read)
+
+    def _asks_check_more(self, chat_ctx) -> bool:
+        check = getattr(self, "_last_check", None)
+        if not check or time.monotonic() - check[1] > SELF_CHECK_MEMORY_S:
+            return False
+        said = next((i.text_content or "" for i in reversed(chat_ctx.items[:-1])
+                     if isinstance(i, llm.ChatMessage) and i.role == "assistant"), "")
+        return selfcheck.asks_more(self._user_text, right_after=said.strip() == check[2].strip())
+
+    async def _self_check_more(self) -> str:
+        """ "Could you expand on that?" after the self-check: what it saw then and sees now, in plain words."""
+        then = self._last_check[0]
+        now = await self._check_facts()
+        reply = selfcheck.explain(then, now)
+        log.info("self-check explained: then %s, now %s -> %r", then.get("ollama"), now.get("ollama"), reply)
         return reply
 
     # ---- keep leaked tool-call text out of speech --------------------------
@@ -2998,7 +3284,8 @@ class Assistant(Agent):
                 )
                 return
         if (isinstance(last, llm.ChatMessage) and last.role == "user" and _YES_ONLY.match(self._user_text.strip())
-                and _offered_lookup(chat_ctx) and (q := _earlier_question(chat_ctx))):
+                and _offered_lookup(chat_ctx)
+                and (q := _offer_topic(chat_ctx) or self._earlier_local(chat_ctx) or _earlier_question(chat_ctx))):
             # "Please do." to the model's own "Can I look that up for you?": search the question it offered to look
             # up (Nov 19 call: two yeses never searched, then the model said "Let me check..." without searching)
             log.info("search after a yes to Othos's offer: %r", q)
@@ -3011,10 +3298,36 @@ class Assistant(Agent):
                 )]),
             )
             return
+        if (isinstance(last, llm.ChatMessage) and last.role == "user"
+                and _ASKED_WHAT_TO_SEARCH.search(_last_said(chat_ctx))
+                and not _YES_ONLY.match(self._user_text.strip()) and not _NOTHING_TO_SEARCH.match(self._user_text)
+                and (q := _local_query(self._user_text, self._recent_user, getattr(self, "_last_subject", ""))
+                     or _query_from(self._user_text, chat_ctx) or _bare_topic(self._user_text))):
+            # "What would you like me to search for?" -> "Broadforks.": search it (Nov 20, 8:47 call: "I don't know
+            # what broadforks are")
+            log.info("search for what she named after Othos asked: %r", q)
+            yield _lookup_lead(q)
+            yield llm.ChatChunk(
+                id="othos-search",
+                delta=llm.ChoiceDelta(role="assistant", tool_calls=[llm.FunctionToolCall(
+                    name="web_search", arguments=json.dumps({"query": q, "count": 4}),
+                    call_id=f"search_{uuid.uuid4().hex[:12]}",
+                )]),
+            )
+            return
+        if (isinstance(last, llm.ChatMessage) and last.role == "user" and not _last_reply_searched(chat_ctx)
+                and (_ASKS_SOURCE.search(self._user_text) or _ASKS_WHERE_FROM.search(self._user_text))):
+            # "Can you cite your source on that?": said by code, honestly (Nov 20, 8:47 call: "I don't know. Want me to
+            # look it up?", and the yes then searched nothing)
+            reply = self._source_reply(chat_ctx)
+            log.info("source asked: %r", reply)
+            yield reply
+            return
         if isinstance(last, llm.ChatMessage) and last.role == "user":
             self._offered_web = "" if not _YES.match(self._user_text) else self._offered_web
         if (isinstance(last, llm.ChatMessage) and last.role == "user" and self._results and not self._news
-                and _ASKS_SOURCE.search(self._user_text) and not _SEARCH_WORDS.search(self._user_text)):
+                and (_ASKS_SOURCE.search(self._user_text) or _ASKS_WHERE_FROM.search(self._user_text))
+                and not _SEARCH_WORDS.search(self._user_text)):
             # "Can you reference the source?" after a search answer: the real sites, said by
             # code (the model made up "The Spruce, Gardeners.com" on the Nov 10 call)
             sites = list(dict.fromkeys(_source_name(r.get("url", "")) for r in self._results[:4] if r.get("url")))
@@ -3076,10 +3389,16 @@ class Assistant(Agent):
             reply = await self._twitch_channel_reply(channel, self._user_text)
             yield reply[:1].upper() + reply[1:]  # "shroud isn't live" starts a sentence
             return
+        if isinstance(last, llm.ChatMessage) and last.role == "user" and self._asks_check_more(chat_ctx):
+            # "You mentioned you couldn't reach your local model. Could you expand on that?": from the check's readings,
+            # before any search (Nov 20, 8:20 call: the model made up "trouble accessing the local data center")
+            yield await self._self_check_more()
+            return
         if (isinstance(last, llm.ChatMessage) and last.role == "user" and self._allowed == {"web_search"}
                 and (q := (_news_query(self._user_text) or [None])[0]
                      # "Please verify that" / "double-check it": search the last topic again, deeper
                      or (self._last_query if _RESEARCH_ONLY.search(self._user_text) else None)
+                     or _local_query(self._user_text, self._recent_user, getattr(self, "_last_subject", ""))
                      or _query_from(self._user_text, chat_ctx))):
             # Search with the user's own words, so the model doesn't spend 5-11 s
             # writing the call. Falls back to the model for follow-ups and anything personal.
@@ -3196,14 +3515,20 @@ class Assistant(Agent):
               and not _ASKS_TIME.search(self._user_text)):
             timef = _TimeFilter(greeting=False)
 
+        # a reply to her own words, not to a search result: "I found that..." can't be true (no search has run)
+        claimf = _ClaimFilter() if isinstance(last, llm.ChatMessage) and last.role == "user" else None
+
         def speak(text: str) -> str:
             if greeting:
                 text = _fix_greeting(text)
             text = namef.feed(text) if namef else text
+            text = claimf.feed(text) if claimf and text else text
             return timef.feed(text) if timef and text else text
 
         def speak_rest() -> str:
             rest = namef.flush() if namef else ""
+            if claimf:
+                rest = (claimf.feed(rest) if rest else "") + claimf.flush()
             rest = timef.feed(rest) if timef and rest else rest
             return rest + (timef.flush() if timef else "")
 
@@ -3212,7 +3537,18 @@ class Assistant(Agent):
         chunk_id = "othos"
         called = False  # the model made a real tool call this turn
         claimed = False  # the model began "Let me check..." on a turn with no search
-        async for chunk in self._model_stream(chat_ctx, tools, model_settings):
+        stream = self._model_stream(chat_ctx, tools, model_settings)
+        if isinstance(last, llm.ChatMessage) and last.role == "user" and "web_search" in self._allowed:
+            # a turn that may search: the model reads the search tool's instructions first (~10 s on this laptop), so
+            # say something if it's still silent after a few seconds (Nov 20, 7:52 call: 15-19 s of silence)
+            stream = _say_if_silent(stream, SEARCH_SILENCE_S)
+        async for chunk in stream:
+            if chunk is _SILENT:
+                yield "One moment. "
+                # the voice holds a last sentence until the next one starts: send it now, or it waits for the whole
+                # reply (Nov 20, 8:20 call: said at 3 s, heard at 47 s)
+                yield FlushSentinel()
+                continue
             if isinstance(chunk, llm.ChatChunk):
                 chunk_id = chunk.id
                 text = chunk.delta.content if chunk.delta else None
@@ -3254,7 +3590,9 @@ class Assistant(Agent):
             # the model said it was searching, but no search was offered or run (Nov 19 call: "Let me check... Ah, it
             # looks like I don't have the latest information"): run the search it promised, or say none was run
             q = _searchable(self._user_text, chat_ctx) if not _YES_ONLY.match(self._user_text.strip()) else None
-            q = q or _earlier_question(chat_ctx)
+            q = q or (_offer_topic(chat_ctx) or self._earlier_local(chat_ctx)
+                      if _YES_ONLY.match(self._user_text.strip()) else None) \
+                or _earlier_question(chat_ctx)
             if not q:
                 log.info("model claimed a lookup with nothing to search; said so instead")
                 yield "I haven't looked anything up yet. What would you like me to search for?"
@@ -3506,6 +3844,10 @@ class Assistant(Agent):
         if spoken and topic and not searchctx.answer_fits(topic, spoken):
             log.info("search answer doesn't mention %r; not spoken: %s", topic, spoken[:120])
             spoken = ""      # (Nov 20: hairless cat breeders, answered with the Kennel Club's advice for dogs)
+        if spoken and _ABOUT_A_PAGE.search(spoken):
+            # "The speaker says they don't use a broadfork...": a summary of one video, not an answer (Nov 20, 8:47 call)
+            log.info("search answer describes a page or video; not spoken: %s", spoken[:120])
+            spoken = ""
         if spoken and _backed_by(spoken, self._results):
             self._cursor = len(self._results)  # nothing left to page through
             self._verbatim = True

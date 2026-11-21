@@ -46,6 +46,21 @@ def answer_shape(schema: dict | None):
 MIN_MODEL_B: ContextVar = ContextVar("min_model_b", default=0)
 
 
+# Inside `with no_local_after_limit():` a task whose own cloud-token limit runs out stops (BudgetOut) instead of going
+# on with this PC's model (Nov 20, The Smithy's task 68: its limit ran out 37 minutes in and the fix rounds went on with
+# the 3B model, which made no progress, as in task 67). Off by default: other workers keep their fallback.
+NO_LOCAL_AFTER_LIMIT: ContextVar = ContextVar("no_local_after_limit", default=False)
+
+
+@contextmanager
+def no_local_after_limit(on: bool = True):
+    token = NO_LOCAL_AFTER_LIMIT.set(bool(on))
+    try:
+        yield
+    finally:
+        NO_LOCAL_AFTER_LIMIT.reset(token)
+
+
 @contextmanager
 def strong_models(min_b: float):
     token = MIN_MODEL_B.set(float(min_b or 0))
@@ -74,19 +89,70 @@ _NO = re.compile(r"\b(?:no|nope|don't|do not|cancel|never mind|wait|stop)\b", re
 _SAYS = {"kept": re.compile(r"^\W*(?:(?:othos|osos)\W+)?(?:(?:yes|yeah|yep|ok(?:ay)?)\W+)?keep (?:it|that|them)\b", re.I),
          "discarded": re.compile(r"^\W*(?:(?:othos|osos)\W+)?(?:(?:yes|yeah|yep|ok(?:ay)?)\W+)?(?:discard|delete|bin|scrap) (?:it|that|them)\b", re.I)}
 _OTHER = {"kept": re.compile(r"\b(?:discard|delete|bin|scrap|throw\w* (?:it )?away|get rid)", re.I),
-          "discarded": re.compile(r"\b(?:keep|kept|save)\b", re.I)}
+          "discarded": re.compile(r"\b(?:keep|kept|save|accept)\b", re.I)}
+# "keep task 69" / "accept task 69" / "discard task 69": a yes only when the number is the task being decided
+# (Nov 20: "Keep task 68" and "Accept task 68" were refused; a different number, "keep task 12", is asked again)
+_TASK_N = r"\W+(?:smithy\W+|firestarter\W+)?task\W+(?:number\W+)?(\d+)\W*$"
+_SAYS_TASK = {"kept": re.compile(r"^\W*(?:(?:othos|osos)\W+)?(?:(?:yes|yeah|yep|ok(?:ay)?)\W+)?(?:keep|accept)"
+                                 + _TASK_N, re.I),
+              "discarded": re.compile(r"^\W*(?:(?:othos|osos)\W+)?(?:(?:yes|yeah|yep|ok(?:ay)?)\W+)?"
+                                      r"(?:discard|delete|bin|scrap)" + _TASK_N, re.I)}
+# a task number spoken in words, 0-999 ("sixty eight", "sixty-eight", "a hundred and five", "one oh five"), as
+# speech-to-text may write it (Nov 21, Othos main's note: only digits counted, so she was asked again)
+_UNITS = {w: i for i, w in enumerate("zero one two three four five six seven eight nine".split())} | {"oh": 0}
+_TEENS = {w: 10 + i for i, w in enumerate("ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen "
+                                          "nineteen".split())}
+_TENS = {w: 20 + 10 * i for i, w in enumerate("twenty thirty forty fifty sixty seventy eighty ninety".split())}
+_NUM_WORD = "|".join(sorted([*_UNITS, *_TEENS, *_TENS, "hundred", "a"], key=len, reverse=True))
+_SPOKEN_TASK = re.compile(rf"(\btask\W+(?:number\W+)?)((?:{_NUM_WORD})(?:[\s-]+(?:{_NUM_WORD}|and))*)\b", re.I)
 
 
-def answer(transcript: str, verdict: str | None = None) -> str | None:
+def _spoken_number(words: str) -> int | None:
+    """0-999 from number words; None when they aren't one number ("twenty thirty", "five and")."""
+    toks = [t for t in re.split(r"[\s-]+", words.lower()) if t]
+    if len(toks) >= 2 and all(t in _UNITS for t in toks):          # "one oh five", digit by digit
+        return int("".join(str(_UNITS[t]) for t in toks)) if len(toks) <= 3 else None
+    total, i = 0, 0
+    if len(toks) >= 2 and toks[1] == "hundred" and (toks[0] == "a" or toks[0] in _UNITS):
+        total, i = 100 * (1 if toks[0] == "a" else _UNITS[toks[0]]), 2
+        if total == 0:
+            return None
+        if i < len(toks) and toks[i] == "and":
+            i += 1
+            if i == len(toks):
+                return None
+    rest = toks[i:]
+    if not rest:
+        return total if total else None
+    if len(rest) == 1 and (rest[0] in _UNITS or rest[0] in _TEENS or rest[0] in _TENS):
+        return total + {**_UNITS, **_TEENS, **_TENS}[rest[0]]
+    if len(rest) == 2 and rest[0] in _TENS and rest[1] in _UNITS and _UNITS[rest[1]] and rest[1] != "oh":
+        return total + _TENS[rest[0]] + _UNITS[rest[1]]
+    return None
+
+
+def _task_digits(text: str) -> str:
+    """The number after "task" (or "task number") written in digits when it was spoken in words; the rest unchanged."""
+    def one(m: re.Match) -> str:
+        n = _spoken_number(m.group(2))
+        return m.group(1) + str(n) if n is not None else m.group(0)
+    return _SPOKEN_TASK.sub(one, text)
+
+
+def answer(transcript: str, verdict: str | None = None, task: int | None = None) -> str | None:
     """'yes', 'no', or None for the user's reply to a yes/no question. Any 'no' word wins.
     verdict ('kept' or 'discarded') is what a keep/discard question asked: its own words ("keep it" to a keep
     question) are a yes, and a reply naming the other action ("yes, discard it" to "Keep task 12?") is None,
-    so it's asked again. Without a verdict, "keep it" and "discard it" are None."""
+    so it's asked again. Without a verdict, "keep it" and "discard it" are None.
+    task: the number of the task being decided; then "keep task N" / "accept task N" (or "discard task N") is a
+    yes when N is that task, and None (asked again) when it's another one or no task is given."""
     text = (transcript or "").strip()
     if _NO.search(text):
         return "no"
     if verdict in _OTHER and _OTHER[verdict].search(text):
         return None
+    if verdict in _SAYS_TASK and (m := _SAYS_TASK[verdict].search(_task_digits(text))):
+        return "yes" if task is not None and int(m.group(1)) == int(task) else None
     if verdict in _SAYS and _SAYS[verdict].search(text):
         return "yes"
     return "yes" if _YES.search(text) else None

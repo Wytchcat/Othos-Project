@@ -504,7 +504,7 @@ class WorkersVoice:
         pending, self.pending = self.pending, None
         if pending:
             q, job_id, verdict = pending
-            ans = worker_shared.answer(text, verdict)        # "keep it" is a yes only to a keep question
+            ans = worker_shared.answer(text, verdict, job_id)   # "keep it" / "keep task N" only to a keep question
             if ans == "yes":
                 done = q.decide(job_id, text, verdict)
                 return (f"Okay, {_name(q, job_id)} is marked {verdict}." if done else

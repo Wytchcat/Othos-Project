@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -107,12 +108,6 @@ class OllamaBackend:
         if not _wait_http(f"{self.url}/api/version", 30):
             raise RuntimeError(f"Ollama isn't answering at {self.url}")
 
-    def list_models(self) -> list[str]:
-        try:
-            return sorted(m["name"] for m in httpx.get(f"{self.url}/api/tags", timeout=10).json().get("models", []))
-        except Exception:
-            return []
-
     def set_low_priority(self, low: bool) -> None:
         _set_priority(self.own, low)   # only its own Ollama: the shared one also serves voice Othos
 
@@ -145,13 +140,31 @@ class OllamaBackend:
             self.own.terminate()
 
 
+LLAMA_CPP_DIR = Path.home() / "Documents" / "llama.cpp"
+
+
+def find_llama_server(setting: str = "", root: Path | None = None) -> Path | None:
+    """The llama-server.exe to run. A path is used as it is (pinned). "" or "newest" = the newest build under
+    Documents\\llama.cpp: the highest bNNNNN folder number, then the newest file (a folder without a number)."""
+    setting = os.path.expandvars(str(setting or "")).strip()
+    if setting and setting.lower() != "newest":
+        p = Path(setting)
+        return p if p.is_file() else None
+    found = list((root or LLAMA_CPP_DIR).glob("*/llama-server.exe"))
+
+    def rank(p: Path) -> tuple[int, float]:
+        m = re.fullmatch(r"(?i)b(\d+)", p.parent.name)
+        return (int(m.group(1)) if m else -1, p.stat().st_mtime)
+    return max(found, key=rank) if found else None
+
+
 class LlamaServerBackend:
     name = "llama-server"
 
     def __init__(self, cfg: dict, log_dir: Path, prefix: str = "worker"):
         s = cfg.get("llama_server", {})
         self.cfg, self.log_dir, self.prefix = cfg, log_dir, prefix
-        self.exe = s.get("exe", "")
+        self.exe = str(find_llama_server(s.get("exe", "")) or s.get("exe", ""))
         self.models_dir = Path(s.get("models_dir", "") or ".")
         self.port = int(s.get("port", 11436))
         self.extra = [str(a) for a in s.get("extra_args", [])]
@@ -159,16 +172,15 @@ class LlamaServerBackend:
         self.proc: subprocess.Popen | None = None
         self.loaded: tuple[str, int] | None = None
         if not self.exe or not Path(self.exe).exists():
-            raise RuntimeError(f"llama-server.exe not found: '{self.exe}' (set llama_server.exe in the settings)")
-
-    def list_models(self) -> list[str]:
-        return sorted(p.stem for p in self.models_dir.glob("*.gguf"))
+            raise RuntimeError(f"llama-server.exe not found: '{self.exe or 'newest'}' (set llama_server.exe in the "
+                               f"settings, or \"newest\" with a build in {LLAMA_CPP_DIR})")
 
     def _ensure(self, model: str, threads: int) -> None:
         if self.loaded == (model, threads) and self.proc and self.proc.poll() is None:
             return
         self.close()
         path = self.models_dir / f"{model}.gguf"
+        swapped = _swap_waiting(path)
         if not path.exists():
             raise RuntimeError(f"model file not found: {path}")
         cmd = [self.exe, "-m", str(path), "-t", str(threads), "-ngl", "0",
@@ -179,8 +191,18 @@ class LlamaServerBackend:
                                      creationflags=subprocess.CREATE_NO_WINDOW)
         log.info("started llama-server: %s, %d threads (pid %d)", model, threads, self.proc.pid)
         if not _wait_http(f"{self.url}/health", 600):
+            if swapped:
+                self.close()
+                _swap_back(path)
             raise RuntimeError("llama-server didn't become ready")
         self.loaded = (model, threads)
+        old = path.with_name(path.name + ".old")
+        if old.exists():                 # the updated file has loaded once: the old copy can go
+            try:
+                old.unlink()
+                log.info("updated model %s loaded; removed the old copy", path.name)
+            except OSError as e:
+                log.warning("couldn't remove %s: %s", old.name, e)
 
     def set_low_priority(self, low: bool) -> None:
         _set_priority(self.proc, low)
@@ -215,6 +237,36 @@ class LlamaServerBackend:
             except Exception:
                 self.proc.kill()
         self.proc, self.loaded = None, None
+
+
+def _swap_waiting(path: Path) -> bool:
+    """An updated model file downloaded while the old one was in use waits as NAME.new (model_fetch.py): put it
+    in now, before llama-server opens the file. True if it went in (the old copy is kept as NAME.old)."""
+    if not path.with_name(path.name + ".new").exists():
+        return False
+    try:
+        import model_fetch
+        ok = model_fetch.swap_in([path])
+    except Exception as e:
+        log.warning("couldn't put the updated %s in: %s", path.name, e)
+        return False
+    log.info("updated model %s put in (the old copy is kept until it loads)" if ok
+             else "updated model %s still waiting: the file is in use", path.name)
+    return ok
+
+
+def _swap_back(path: Path) -> None:
+    """The updated file didn't load: put the old one back and keep the new one aside as NAME.failed."""
+    old = path.with_name(path.name + ".old")
+    if not old.exists():
+        return
+    try:
+        path.replace(path.with_name(path.name + ".failed"))
+        old.replace(path)
+        log.warning("updated model %s didn't load; the old copy is back, the new one is %s.failed",
+                    path.name, path.name)
+    except OSError as e:
+        log.warning("couldn't put the old %s back: %s", path.name, e)
 
 
 def available_models(cfg: dict) -> list[str]:

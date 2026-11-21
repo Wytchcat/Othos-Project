@@ -12,7 +12,10 @@ Where models go depends on the worker's settings "backend" (worker.json for Fire
 - llama-server: .gguf files are saved into llama_server.models_dir.
 
 Downloads resume from a .part file, and Hugging Face files are checked against
-the SHA-256 that Hugging Face publishes. Progress is printed as JSON lines:
+the SHA-256 that Hugging Face publishes. With llama-server, a file that's already there
+is replaced only when Hugging Face's differs: the checked download waits as NAME.new while
+a llama-server has the old one open, and goes in at the worker's next start; the old
+file is kept as NAME.old until the new one has loaded once (worker_backend.py). Progress is printed as JSON lines:
   {"event": "progress", "done": N, "total": N, "status": "..."}
   {"event": "done", "model": "..."}     {"event": "error", "message": "..."}
 
@@ -172,16 +175,77 @@ def _download(url: str, dest: Path, size: int = 0, sha256: str = "", label: str 
                             emit(event="progress", done=done, total=total, status=f"Downloading {label}")
     if sha256:
         emit(event="progress", done=done, total=total, status=f"Checking {label}")
-        h = hashlib.sha256()
-        with open(part, "rb") as fh:
-            for block in iter(lambda: fh.read(1 << 22), b""):
-                h.update(block)
-        if h.hexdigest() != sha256:
+        if _sha(part) != sha256:
             part.unlink()
             raise RuntimeError(f"{label}: checksum doesn't match Hugging Face's, so the file was deleted. "
                                "Try again to download it fresh.")
     _vet(part, label)
     part.replace(dest)
+
+
+def _sha(p: Path) -> str:
+    h = hashlib.sha256()
+    with open(p, "rb") as fh:
+        for block in iter(lambda: fh.read(1 << 22), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+# ---------------------------------------------------------------- replacing a model file that's already there
+# (Nov 20, The Smithy: an updated GGUF with the same name as the one it has. Windows locks a file a running
+# llama-server has open, so the checked download waits as <name>.new and goes in at the worker's next start;
+# the old file stays as <name>.old until the new one has loaded once.)
+def _new(p: Path) -> Path:
+    return p.with_name(p.name + ".new")
+
+
+def _old(p: Path) -> Path:
+    return p.with_name(p.name + ".old")
+
+
+def in_use(path: Path) -> bool:
+    """Is a llama-server running with this model file (-m / --model)?"""
+    try:
+        import psutil
+    except ImportError:
+        return False
+    want = os.path.normcase(os.path.abspath(path))
+    for proc in psutil.process_iter(["name"]):
+        try:
+            if "llama-server" not in (proc.info["name"] or "").lower():
+                continue
+            args = proc.cmdline()
+        except Exception:
+            continue
+        for i, a in enumerate(args[:-1]):
+            if a in ("-m", "--model") and os.path.normcase(os.path.abspath(args[i + 1])) == want:
+                return True
+    return False
+
+
+def swap_in(dests: list[Path]) -> bool:
+    """Put checked downloads (<name>.new) in place of the files they update, each old file kept as <name>.old.
+    False, with nothing moved, while a llama-server has the model open (the worker swaps at its next start)."""
+    dests = [d for d in dests if _new(d).exists()]
+    if not dests:
+        return True
+    if in_use(dests[0]):
+        return False
+    moved: list[Path] = []
+    try:
+        for d in dests:
+            moved.append(d)
+            if d.exists():
+                d.replace(_old(d))
+            _new(d).replace(d)
+    except OSError:          # locked after all (opened just now): put back what moved, keep the .new files
+        for d in reversed(moved):
+            if d.exists() and not _new(d).exists():
+                d.replace(_new(d))
+            if _old(d).exists() and not d.exists():
+                _old(d).replace(d)
+        return False
+    return True
 
 
 def _vet(part: Path, label: str) -> None:
@@ -214,15 +278,30 @@ def get_hf(repo: str, name: str) -> None:
         pull_ollama(f"hf.co/{repo}:{tag}", allow_hf=True)
         return
     folder = models_dir(c)
+    llama = c.get("backend", "ollama") != "ollama"
+    updating: list[Path] = []
     for i, (path, size, sha) in enumerate(zip(entry["files"], entry["sizes"], entry["sha256"]), 1):
         dest = folder / Path(path).name
-        if dest.exists():
-            continue
         label = Path(path).name + (f" (part {i} of {len(entry['files'])})" if len(entry["files"]) > 1 else "")
+        if dest.exists():
+            if not llama:
+                continue
+            # llama-server: a file of that name is there; replace it only if Hugging Face's is different
+            emit(event="progress", done=0, total=0, status=f"Comparing yours with Hugging Face's: {label}")
+            if (_sha(dest) == sha) if sha else dest.stat().st_size == size:
+                continue                               # the same file: nothing to do
+            if not (_new(dest).exists() and sha and _sha(_new(dest)) == sha):
+                _download(f"{HF}/{repo}/resolve/main/{quote(path)}", _new(dest), size, sha, label + " (update)")
+            updating.append(dest)
+            continue
         _download(f"{HF}/{repo}/resolve/main/{quote(path)}", dest, size, sha, label)
     first = folder / Path(entry["files"][0]).name
-    if c.get("backend", "ollama") == "ollama":
+    if not llama:
         _ollama_create(first, c)
+    elif updating and not swap_in(updating):
+        emit(event="done", model=first.stem, waiting=True,
+             note=f"{first.name} is downloaded and checked. A running model is using the old copy, so the new "
+                  "one goes in when that worker next starts (the old copy is kept until the new one loads).")
     else:
         emit(event="done", model=first.stem)
 

@@ -93,7 +93,7 @@ def user_state(text: str) -> str:
 
 # ---------------------------------------------------------------- the check
 def gather(ollama_root: str, model: str = "", *, workers: list[dict] | None = None, gaming: bool = False,
-           camera: bool = False, health: str = "") -> dict:
+           camera: bool = False, health: str = "", starting: bool = False) -> dict:
     """Blocking (about 1 s at most); call it with asyncio.to_thread. Every part is optional: a part that
     can't be read is left out, never guessed. `health`: the conversation model's own server to ask instead of
     Ollama (llama-server's /health, llm_server.py)."""
@@ -101,10 +101,15 @@ def gather(ollama_root: str, model: str = "", *, workers: list[dict] | None = No
                    "gaming": gaming, "camera": camera, "workers": workers or []}
     try:
         r = httpx.get(health or f"{ollama_root}/api/ps", timeout=1.5)
-        r.raise_for_status()
-        facts["ollama"] = True    # (a model that isn't loaded right now is normal: Ollama loads it on demand)
+        if r.status_code == 503 and health:
+            facts["ollama"] = "starting"   # llama-server is up and still loading its model
+        else:
+            r.raise_for_status()
+            facts["ollama"] = True    # (a model that isn't loaded right now is normal: Ollama loads it on demand)
     except Exception:
-        facts["ollama"] = False
+        # its program is running but not answering yet: still starting (Nov 20, 8:20 call: a call 10 s after Othos
+        # started heard "I can't reach my local model", and the model later made up a "data center" problem)
+        facts["ollama"] = "starting" if starting else False
     try:
         facts["memory"] = psutil.virtual_memory().percent
         facts["cpu"] = psutil.cpu_percent(interval=0.2)
@@ -124,7 +129,8 @@ def mood(f: dict) -> str:
     """'trouble', 'slow' or 'good'."""
     if f.get("ollama") is False or f.get("errors", 0) >= 3:
         return "trouble"
-    slow = (f.get("last_reply") or 0) > SLOW_REPLY_SECONDS or (f.get("memory") or 0) > 90 or (f.get("cpu") or 0) > 90 \
+    slow = f.get("ollama") == "starting" or (f.get("last_reply") or 0) > SLOW_REPLY_SECONDS \
+        or (f.get("memory") or 0) > 90 or (f.get("cpu") or 0) > 90 \
         or (f.get("disk_free_gb") if f.get("disk_free_gb") is not None else 99) < 5
     return "slow" if slow else "good"
 
@@ -149,6 +155,51 @@ def _busy(f: dict) -> str:
     return f"{' and '.join(names)} are busy in the background."
 
 
+# "Could you expand on that?" right after the self-check: answered from what the check saw, never by the model, which
+# filled the gap with a made-up "trouble accessing the local data center" (Nov 20, 8:20 call)
+_EXPAND = re.compile(r"\b(?:expand on|elaborate|explain|what do you mean|what did you mean|tell me more|more about|"
+                     r"what(?:'s| is| was) (?:wrong|going on|the (?:problem|issue|matter))|why (?:is|was|are|were|did|"
+                     r"can't|couldn't)|how come|what happened)\b", re.I)
+_ABOUT_CHECK = re.compile(r"\b(?:local model|your model|language model|memory|slow|sluggish|reach(?:ing)?|"
+                          r"not at your best|a bit off|processor|cpu|errors?|starting up|thinking)\b", re.I)
+_POINTS_BACK = re.compile(r"\b(?:that|it|this)\b", re.I)
+
+
+def asks_more(text: str, right_after: bool = False) -> bool:
+    """A follow-up asking what the self-check meant: "You mentioned you couldn't reach your local model. Could you
+    expand on that?" any time; a bare "What do you mean?" / "Can you explain that?" only as the reply to it."""
+    t = text or ""
+    if not _EXPAND.search(t):
+        return False
+    return bool(_ABOUT_CHECK.search(t) or (right_after and (_POINTS_BACK.search(t) or len(t.split()) <= 5)))
+
+
+def explain(then: dict, now: dict) -> str:
+    """The self-check's findings in plain words, from what it saw then and sees now (nothing guessed)."""
+    out = []
+    if then.get("ollama") == "starting" or (then.get("ollama") is False and now.get("ollama") is True):
+        out.append("When you called, the program that runs my language model on this laptop was still starting up. "
+                   "It takes about twenty seconds after Othos starts, longer when the computer is busy.")
+    elif then.get("ollama") is False:
+        out.append("The program that runs my language model on this laptop wasn't answering.")
+    if now.get("ollama") is True:
+        out.append("It's answering now.")
+    elif now.get("ollama") == "starting":
+        out.append("It's still starting.")
+    elif now.get("ollama") is False:
+        out.append("It still isn't answering. Restarting Othos with its button usually fixes that.")
+    mem, cpu = now.get("memory"), now.get("cpu")
+    if mem is not None and mem > 90:
+        out.append(f"This computer's memory is {int(round(mem))} percent full, which slows everything down.")
+    if cpu is not None and cpu > 60:
+        out.append(f"Other programs have the processor at {int(round(cpu))} percent, so I think more slowly.")
+    if (then.get("errors") or 0) >= 3:
+        out.append(f"I'd also hit {then['errors']} speech or model errors on this call.")
+    if not out:
+        out.append("Everything I can check looks fine now.")
+    return " ".join(out)
+
+
 def describe(f: dict, user_said: str = "", rng: random.Random | None = None) -> str:
     """A short, spoken answer. Only things the check actually saw are mentioned."""
     rng = rng or random
@@ -162,6 +213,8 @@ def describe(f: dict, user_said: str = "", rng: random.Random | None = None) -> 
     elif m == "slow":
         parts.append(rng.choice(_SLOW))
         why = []
+        if f.get("ollama") == "starting":
+            why.append("my local model is still starting up, so give me a few seconds")
         if (f.get("last_reply") or 0) > SLOW_REPLY_SECONDS:
             why.append(f"my last answer took about {int(round(f['last_reply']))} seconds")
         if (f.get("memory") or 0) > 90:

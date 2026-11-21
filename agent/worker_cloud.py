@@ -1166,6 +1166,12 @@ class Chain:
                         # of the test file went to the 3B model when the task's limit ran out, and ran 80 minutes)
                         log.warning("switching: %s; a strong-only step isn't sent to this PC's model", e)
                         raise NoStrongModel(f"{e}, and this step needs a strong model") from None
+                    if worker_shared.NO_LOCAL_AFTER_LIMIT.get():
+                        # the worker asked to stop here rather than go on with this PC's model (The Smithy's builds)
+                        log.warning("switching: %s; stopping here, not going to this PC's model", e)
+                        steps.info("%s. Stopping here, not going on with this PC's model.",
+                                   str(e)[:1].upper() + str(e)[1:])
+                        raise
                     log.warning("switching: %s; going to this PC's model", e)
                     steps.info("%s. Going to this PC's model.", str(e)[:1].upper() + str(e)[1:])
                     return self._local(e, messages, threads, max_tokens, should_stop)
@@ -1302,7 +1308,8 @@ class _Base:
 
 
 _NO_SCHEMA: set[str] = set()                           # providers that refused an answer shape (this run)
-_SCHEMA_WORDS = re.compile(r"response_format|json_schema|schema|structured|grammar", re.I)
+# "additionalProperties": Cerebras names the rule, not the word schema (Nov 20, task 68)
+_SCHEMA_WORDS = re.compile(r"response_format|json_schema|schema|structured|grammar|additionalProperties", re.I)
 
 
 class OpenAICompatible(_Base):

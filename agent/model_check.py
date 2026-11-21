@@ -16,7 +16,10 @@ graphics-card figures (state\\system-specs.json); a model that won't fit gets no
 What it compares:
 - models-tested.json: the models tested with this version of Othos, per job (voice
   conversation, camera, notes search, coding / The Smithy).
-- what's installed: Ollama's list (127.0.0.1) and The Smithy's model in smithy.json.
+- what's installed: Ollama's list (127.0.0.1) and The Smithy's model in smithy.json; when
+  The Smithy runs on llama-server, the .gguf files in its models folder (dated, and
+  compared with the file on Hugging Face named in models-tested.json's "gguf").
+- the llama.cpp build voice Othos and The Smithy run (the build folder's name, b12138).
 - newer releases in the same model families: the Ollama library (ollama.com), GGUF
   files on Hugging Face (trusted publishers only), and new Ollama / llama.cpp
   versions (GitHub releases).
@@ -309,20 +312,28 @@ def hf_new(author: str, search: str, since: dt.date) -> list[dict]:
 
 def hf_q4(rid: str) -> tuple[float, str]:
     """(size in GB, file name as Get models names it) of the repo's Q4_K_M file (the usual choice)."""
+    gb, name, _ = hf_q4_info(rid)
+    return gb, name
+
+
+def hf_q4_info(rid: str) -> tuple[float, str, str]:
+    """hf_q4 plus the file's last change on Hugging Face ("2024-11-10"), to compare with a file this PC has."""
     try:
-        files = _get(f"{HF}/api/models/{rid}/tree/main", {"recursive": "true"}, as_json=True)
+        files = _get(f"{HF}/api/models/{rid}/tree/main", {"recursive": "true", "expand": "true"}, as_json=True)
     except Offline:
-        return 0.0, ""
+        return 0.0, "", ""
     groups: dict[str, int] = {}     # one model may be split into parts (-00001-of-00003.gguf)
+    dates: dict[str, str] = {}
     for f in files:
         p = f.get("path", "")
         if p.lower().endswith(".gguf") and "q4_k_m" in p.lower() and "mmproj" not in p.lower():
             key = re.sub(r"-\d{5}-of-\d{5}(?=\.gguf$)", "", p)
             groups[key] = groups.get(key, 0) + int((f.get("lfs") or {}).get("size") or f.get("size") or 0)
+            dates[key] = max(dates.get(key, ""), str((f.get("lastCommit") or {}).get("date") or "")[:10])
     if not groups:
-        return 0.0, ""
+        return 0.0, "", ""
     best = min(groups, key=lambda k: ("ud-" in k.lower(), len(k)))   # the plain Q4_K_M first
-    return round(groups[best] / 1e9, 1), best
+    return round(groups[best] / 1e9, 1), best, dates.get(best, "")
 
 
 def github_latest(repo: str) -> str:
@@ -338,6 +349,84 @@ def _need(gb: float) -> float:
     return round(gb * 1.2 + 0.5, 1)   # the download, plus room for a short context
 
 
+# ---------------------------------------------------------------- llama-server: GGUF files and llama.cpp builds
+# (Nov 20, The Smithy's note: since Nov 19 The Smithy runs on llama-server with its model as a .gguf file, so
+# Ollama's list no longer says what it has or uses; voice Othos runs on llama-server too, from voice-llm.json)
+_TAIL = re.compile(r"(?i)[-_.](?:instruct|q\d(?:_k)?(?:_[msl])?|q\d_\d|f16|bf16)$")
+
+
+def _norm(name: str) -> str:
+    """One spelling for one model: "qwen2.5-coder:3b", "qwen2.5-coder-3b" and
+    "Qwen2.5-Coder-3B-Instruct-Q4_K_M.gguf" are all "qwen2.5-coder-3b"."""
+    n = name.replace("\\", "/").rsplit("/", 1)[-1].lower().removesuffix(".gguf").replace(":", "-")
+    prev = ""
+    while prev != n:
+        prev, n = n, _TAIL.sub("", n)
+    return n
+
+
+def _same(in_use: str, tag: str) -> bool:
+    """Is `tag` (a tested model) the model a setting names ("qwen2.5-coder-3b", "llama3.2:3b", "llama3.2")?"""
+    if not in_use:
+        return False
+    base = tag.split(":")[0]
+    return _norm(in_use) == _norm(tag) or (in_use.split(":")[0] == base and (in_use == tag or ":" not in in_use))
+
+
+def smithy_ggufs(smithy: dict) -> dict[str, Path]:
+    """{"qwen2.5-coder-3b": Path(...qwen2.5-coder-3b.gguf)}: The Smithy's model files, when it runs on llama-server."""
+    if smithy.get("backend") != "llama-server":
+        return {}
+    d = (smithy.get("llama_server") or {}).get("models_dir") or ""
+    if not d or not Path(d).is_dir():
+        return {}
+    out = {}
+    for p in sorted(Path(d).glob("*.gguf")):
+        if "mmproj" in p.name.lower() or re.search(r"-000(?:0[2-9]|[1-9]\d)-of-\d{5}\.gguf$", p.name):
+            continue     # a vision add-on, or a later part of a split model
+        out.setdefault(_norm(re.sub(r"-\d{5}-of-\d{5}(?=\.gguf$)", "", p.name)), p)
+    return out
+
+
+def _build(exe: str | Path | None) -> str:
+    """"b12138" from ...\\llama.cpp\\b12138\\llama-server.exe (the build is the folder's name), else ""."""
+    for part in reversed(Path(str(exe or "")).parts[:-1]):
+        if re.fullmatch(r"(?i)b\d+", part):
+            return part.lower()
+    return ""
+
+
+def _bnum(b: str) -> int:
+    return int(re.sub(r"\D", "", b) or 0)
+
+
+def llama_builds(smithy: dict) -> dict[str, str]:
+    """{"voice Othos": "b12138", "The Smithy": "b12138"}: who runs on llama-server, and which build ("" = unknown)."""
+    out = {}
+    try:
+        import llm_server
+        s = llm_server.settings()
+        if s.get("backend") == "llama-server":
+            out["voice Othos"] = _build(llm_server.find_exe(s.get("llama_server_exe", "")))
+    except Exception:
+        pass
+    if smithy.get("backend") == "llama-server":
+        setting = (smithy.get("llama_server") or {}).get("exe", "")
+        try:     # "newest" / empty = the newest Documents\llama.cpp build (The Smithy, Nov 20)
+            import worker_backend
+            exe = worker_backend.find_llama_server(setting)
+        except Exception:
+            exe = setting
+        out["The Smithy"] = _build(exe)
+    return out
+
+
+def smithy_pinned(smithy: dict) -> bool:
+    """True when smithy.json names a llama-server.exe path (a new build needs that setting changed)."""
+    s = str((smithy.get("llama_server") or {}).get("exe", "") or "").strip()
+    return bool(s) and s.lower() != "newest"
+
+
 def check() -> list[dict]:
     """[{"fit", "area", "text", "kind", "key"}]: kind = tested / update / new (since the tested
     list's date) / family (older, not tested) / program / cloud / note; key = the model (for "new since
@@ -347,6 +436,7 @@ def check() -> list[dict]:
     have = installed()
     smithy = _smithy()
     code_model = (smithy.get("models") or {}).get("code", "")
+    ggufs = smithy_ggufs(smithy)
     specs, pc_note = pc()
     rows: list[dict] = []
     errors: list[str] = []
@@ -386,10 +476,34 @@ def check() -> list[dict]:
             base = tag.split(":")[0]
             need = float(m.get("memory_gb") or 0)
             f = cpu_fit(need, space, specs, job, where)
+            using = " (in use)" if _same(in_use, tag) else ""
+            label = "Tested with your version" if m.get("tested", True) else "Planned (not tested here yet)"
+            repo = (m.get("gguf") or {}).get("repo", "") if key == "coding" else ""
+            gguf = ggufs.get(_norm(tag)) if key == "coding" else None
+            if gguf:      # The Smithy on llama-server: its own .gguf file, compared with the file on Hugging Face
+                yours = dt.date.fromtimestamp(gguf.stat().st_mtime).isoformat()
+                gb, fname, changed = hf_q4_info(repo) if repo else (0.0, "", "")
+                if fname and changed and changed > yours:
+                    same = Path(fname).name.lower() == gguf.name.lower()
+                    add(f, area, f"{tag}{using}: an updated GGUF file is out on Hugging Face ({repo}, changed "
+                        f"{changed}, about {gb:g} GB); yours, {gguf.name}, is from {yours}. "
+                        + ("Update replaces yours once it's downloaded and checked (if The Smithy is using it, at "
+                           "its next start); your old copy is kept until the new one loads." if same else
+                           "Get puts it next to yours; then pick it in The Smithy's Coding model switcher."),
+                        "update", f"{repo}@{changed}", f"hf|{repo}|{fname}|{gb:g}")
+                else:
+                    add(f, area, f"{tag}{using}: installed for The Smithy as {gguf.name} (from {yours})"
+                        + (", up to date" if fname and changed else "") + f". {label}.", "tested")
+                continue
+            if key == "coding" and repo and smithy.get("backend") == "llama-server" and not have.get(tag):
+                gb, fname, _ = hf_q4_info(repo)
+                if fname:      # not installed: The Smithy needs the .gguf file, not Ollama's copy
+                    add(f, area, f"{tag}: not installed for The Smithy. {label}; needs about {need:g} GB {where}, "
+                        f"a {gb:g} GB GGUF file from Hugging Face ({repo})." + slow(need, job, where), "tested", "",
+                        f"hf|{repo}|{fname}|{gb:g}")
+                    continue
             mine = have.get(tag, "")
             lib = tags(base).get(tag if ":" in tag else tag + ":latest", {})
-            using = " (in use)" if in_use and in_use.split(":")[0] == base and (in_use == tag or ":" not in in_use) else ""
-            label = "Tested with your version" if m.get("tested", True) else "Planned (not tested here yet)"
             if mine and lib.get("digest") and not mine.startswith(lib["digest"]):
                 gb = lib.get("gb") or m.get("download_gb")
                 add(f, area, f"{tag}{using}: an update is out in the Ollama library (about {gb:g} GB).",
@@ -468,10 +582,26 @@ def check() -> list[dict]:
                 "update", "ollama@" + latest, "open|https://ollama.com/download/windows")
         elif latest and mine:
             add("info", "Ollama", f"Ollama {mine} is the newest.", "program")
-        if smithy.get("backend") == "llama-server" or (smithy.get("llama_server") or {}).get("exe"):
+        builds = llama_builds(smithy)
+        if builds:
             lc = github_latest("ggml-org/llama.cpp")
-            if lc:
-                add("info", "llama.cpp", f"The newest llama.cpp is {lc} (github.com/ggml-org/llama.cpp/releases).", "program")
+            by: dict[str, list[str]] = {}
+            for who, b in builds.items():
+                by.setdefault(b, []).append(who)
+            known = sorted((b for b in by if b), key=_bnum)
+            has = "; ".join(f"{' and '.join(w)} {b or 'a build without a number in its folder name'}"
+                            for b, w in by.items())
+            if lc and known and _bnum(lc) > _bnum(known[0]):
+                add("info", "llama.cpp", f"llama.cpp {lc} is out (this PC: {has}). Its releases page opens in a "
+                    f"private window; the Windows CPU zip (win-cpu-x64) unzipped to Documents\\llama.cpp\\{lc} is "
+                    "picked up on the next start" + ("; The Smithy's llama-server.exe is set to a path in its "
+                                                     "settings, so change that for The Smithy."
+                                                     if "The Smithy" in builds and smithy_pinned(smithy) else "."),
+                    "update", "llama.cpp@" + lc, "open|https://github.com/ggml-org/llama.cpp/releases/latest")
+            elif lc and known:
+                add("info", "llama.cpp", f"llama.cpp {known[0]} is the newest ({has}).", "program")
+            elif lc:
+                add("info", "llama.cpp", f"The newest llama.cpp is {lc} (this PC: {has}).", "program")
     except Offline as e:
         errors.append(str(e))
 

@@ -41,7 +41,10 @@ def settings() -> dict:
         raw = {}
     return {"backend": str(raw.get("backend") or "ollama").lower(), "llama_server_exe": raw.get("llama_server_exe") or "",
             "port": int(raw.get("port") or 11440), "threads": int(raw.get("threads") or 0),
-            "context_per_slot": int(raw.get("context_per_slot") or 6144)}
+            "context_per_slot": int(raw.get("context_per_slot") or 6144),
+            # tokens read per step: llama-server notices a cancelled request only between steps, so a smaller step
+            # lets the next turn start sooner (Nov 20, 8:20 call: a cancelled request held the slot 23 s)
+            "batch": max(32, int(raw.get("batch") or 128))}
 
 
 def enabled() -> bool:
@@ -96,9 +99,15 @@ def command(exe: Path, gguf: Path, s: dict) -> list[str]:
             "-c", str(s["context_per_slot"] * slots), "--parallel", str(slots), "-t", str(threads(s["threads"])),
             "--jinja", "--chat-template-file", str(TEMPLATE),
             "--cache-reuse", "256",                       # after a mid-call change, re-read only what changed
+            "-b", str(s.get("batch", 128)), "-ub", str(s.get("batch", 128)),   # a cancelled turn lets go within a step
             "--slot-save-path", str(SLOT_DIR),
             "-fa", "on", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0",   # half the memory for what's read
             "--no-webui"]
+
+
+def starting() -> bool:
+    """Its program is running for our port but not answering yet (still loading the model)."""
+    return enabled() and _on_port(settings()["port"]) and not running()
 
 
 def running(base: str | None = None, timeout: float = 1.5) -> bool:

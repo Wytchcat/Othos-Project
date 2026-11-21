@@ -20,7 +20,6 @@ import worker_cloud
 
 MAX_STEP_TOKENS = 30_000             # Cerebras takes 30,000 new tokens a minute
 
-_README = "# Sample\nThis explains the file words. Run `pip install` then open setup.ps1.\nUses JSON and find_terms.\n"
 _CODE = ("def find_terms(text):\n    return [w for w in text.split() if w.isupper()]\n\n\n"
          "def readme_lesson(path):\n    return 'Not in my glossary yet: ' + ', '.join(find_terms(path))\n")
 _TEST = ("import unittest\n\nfrom lesson import find_terms\n\n\nclass T(unittest.TestCase):\n"

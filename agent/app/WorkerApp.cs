@@ -941,7 +941,17 @@ class FirestarterForm : Form
     string runningTask = "";   // the task the worker is on now ("" = none), for the Close button's question
     string askedOut = "";      // the task already asked about free tokens (worker_cloud.Chain)
     string seenSeeMe = "";     // the last "See me" check-in shown (its ts), so each one shows once
+    string stuckAsked = "";    // the frozen heartbeat already asked about (its updated_ts), so each freeze asks once
     ProgressForm progress;     // the live steps window (one at a time)
+
+    Control cur;                                   // the group the next rows and buttons go into
+
+    Label Heading(string text)
+    {
+        var h = new Label(); h.Text = text; h.ForeColor = Ember; h.Font = new Font("Segoe UI Semibold", 10f);
+        h.SetBounds(22, 2, 370, 22);
+        return h;
+    }
 
     public FirestarterForm()
     {
@@ -950,35 +960,56 @@ class FirestarterForm : Form
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-#if SMITHY
-        ClientSize = new Size(420, 176 + 36 * FirestarterApp.Tiers.Length + 128 + 62 + 38 + 38 + 38);
-#else
-        ClientSize = new Size(420, 176 + 36 * FirestarterApp.Tiers.Length + 116 + 166 + 114);
-#endif
+        ClientSize = new Size(860, 440);                // the two groups side by side (they need about 820), not the whole screen's width (WindowFit keeps it on the screen)
         BackColor = Bg; ForeColor = Ink;
         Font = new Font("Segoe UI", 10f);
         AutoAnchor.Fit(this, false);                    // the main window: sizable and can maximize
+        // AutoAnchor.Fit makes the opening size the smallest size; this window may shrink to one narrow, scrolling column
+        Load += (s, e) => MinimumSize = new Size(450 + Width - ClientSize.Width, 300 + Height - ClientSize.Height);
 
+        // the title and the four status lines on top, left-justified; under them two groups in a wrapping, scrolling
+        // area: wide enough for both, they sit side by side (landscape); narrower, the second drops under the first
+        // the header is a strip across the top: the title and its sub-line on the left, the status lines spread out
+        // to the right of them in a row (they wrap under the title only when the window is narrow)
+        var head = new FlowLayoutPanel(); head.Dock = DockStyle.Top; head.AutoSize = true;
+        head.AutoSizeMode = AutoSizeMode.GrowAndShrink; head.WrapContents = true; head.FlowDirection = FlowDirection.LeftToRight;
+        head.Padding = new Padding(10, 6, 10, 6); head.BackColor = Bg;
+        var titleBlock = new Panel(); titleBlock.Size = new Size(400, 58); titleBlock.Margin = new Padding(0); titleBlock.BackColor = Bg;
+        var flow = new FlowLayoutPanel(); flow.Dock = DockStyle.Fill; flow.AutoScroll = true; flow.WrapContents = true;
+        flow.FlowDirection = FlowDirection.LeftToRight; flow.BackColor = Bg; flow.Padding = new Padding(4, 2, 4, 4);
+        var g1 = new Panel(); g1.Width = 400; g1.Margin = new Padding(2); g1.BackColor = Bg;
+        var g2 = new Panel(); g2.Width = 400; g2.Margin = new Padding(2); g2.BackColor = Bg;
         title.Text = FirestarterApp.Title;
         title.Font = new Font("Segoe UI Semibold", 14f);
         title.ForeColor = Ember;
-        title.SetBounds(20, 14, 380, 30);
+        title.SetBounds(10, 4, 380, 30);
         Label sub = new Label();
         sub.Text = FirestarterApp.Sub;
-        sub.ForeColor = Dim; sub.SetBounds(22, 42, 380, 20);
-        Controls.Add(title); Controls.Add(sub);
+        sub.ForeColor = Dim; sub.SetBounds(12, 32, 380, 20);
+        titleBlock.Controls.Add(title); titleBlock.Controls.Add(sub);
+        head.Controls.Add(titleBlock);
 
-        int y = 70;
-        foreach (var l in new[] { state, task, queue, game }) { l.SetBounds(22, y, 380, 22); Controls.Add(l); y += 24; }
+        // the four status lines in a 2 x 2 grid to the right of the title (one strip about as tall as the title)
+        var stat = new TableLayoutPanel(); stat.AutoSize = true; stat.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+        stat.ColumnCount = 2; stat.RowCount = 2; stat.Margin = new Padding(14, 4, 0, 0); stat.BackColor = Bg;
+        var cells = new[] { state, task, queue, game };
+        for (int i = 0; i < 4; i++)
+        {
+            cells[i].AutoSize = true; cells[i].MaximumSize = new Size(300, 0); cells[i].Margin = new Padding(0, 0, 18, 6);
+            stat.Controls.Add(cells[i], i % 2, i / 2);
+        }
+        head.Controls.Add(stat);
 
-        int y2 = 176;
+        cur = g1;
+        g1.Controls.Add(Heading("Models and site"));
+        int y2 = 28;
         foreach (var t in FirestarterApp.Tiers) { var box = new ComboBox(); boxes.Add(box); AddModelRow(t[0], box, t[1], y2); y2 += 36; }
 #if SMITHY
         // which model provider the next tasks use (smithy.json cloud.default; worker_cloud.py).
         // Only providers already turned on (in Providers..., with a key) are offered here.
         AddProviderRow(y2); y2 += 36;
         cloudLine = new Label(); cloudLine.ForeColor = Dim; cloudLine.SetBounds(150, y2, 250, 22);
-        Controls.Add(cloudLine); y2 += 26;
+        cur.Controls.Add(cloudLine); y2 += 26;
         var providersButton = MakeButton("Providers…", 150, y2, 250);
         providersButton.Click += (s, e) => { using (var d = new ProvidersForm()) d.ShowDialog(this); LoadCloud(); };
         y2 += 38;
@@ -987,7 +1018,7 @@ class FirestarterForm : Form
         // which kind of website the next tasks are written for (worker.json "site"); Site setup...
         // holds that site's answers and extensions (worker.json "sites", site_profiles.json)
         var siteLabel = new Label(); siteLabel.Text = "Site"; siteLabel.ForeColor = Dim; siteLabel.SetBounds(22, y2 + 6, 120, 22);
-        Controls.Add(siteLabel);
+        cur.Controls.Add(siteLabel);
         siteJoomla = MakeButton("Joomla", 150, y2, 122);
         siteWp = MakeButton("WordPress", 278, y2, 122);
         siteJoomla.Click += (s, e) => SetSite("joomla");
@@ -998,16 +1029,21 @@ class FirestarterForm : Form
         y2 += 36;
         siteSummary = new Label();
         siteSummary.ForeColor = Dim; siteSummary.SetBounds(150, y2, 250, 40);
-        Controls.Add(siteSummary);
+        cur.Controls.Add(siteSummary);
         y2 += 44;
 #endif
 
-        var get = MakeButton("Get models…", 150, y2 + 6, 250);
+        g1.Height = y2 + 8;
+        cur = g2;
+        g2.Controls.Add(Heading("Tools"));
+        int gy = 28;
+
+        var get = MakeButton("Get models…", 22, gy + 6, 378);
         get.Click += (s, e) => { using (var d = new DownloaderForm()) d.ShowDialog(this); LoadModels(); };
-        var logButton = MakeButton("Work log", 150, y2 + 44, 122);
+        var logButton = MakeButton("Work log", 22, gy + 44, 184);
         logButton.Click += (s, e) => OpenWorkLog();
         // each step of the running task, live, in a small window to keep in a corner
-        var progressButton = MakeButton("Progress", 278, y2 + 44, 122);
+        var progressButton = MakeButton("Progress", 216, gy + 44, 184);
         progressButton.Click += (s, e) =>
         {
             if (progress == null || progress.IsDisposed) { progress = new ProgressForm(); progress.Show(this); }
@@ -1015,14 +1051,14 @@ class FirestarterForm : Form
         };
 #if SMITHY
         // Othos's code chat: needs Othos's page server (port 3000), so it's off until Othos runs
-        codeChat = MakeButton("Code chat", 150, y2 + 82, 250);
+        codeChat = MakeButton("Code chat", 22, gy + 82, 378);
         codeChat.Enabled = false;
         codeChat.Click += (s, e) => FirestarterApp.OpenPage("http://127.0.0.1:3000/code");
         // a build's plan, for her yes, no, or answers (PlanForm)
-        plansButton = MakeButton("Plans…", 150, y2 + 120, 250);
+        plansButton = MakeButton("Plans…", 22, gy + 120, 378);
         plansButton.Click += (s, e) => LoadPlans(true);
         // close The Smithy and its worker, the same as the window's X (Nov 16, the user: there was no Close button)
-        var closeButton = MakeButton("Close The Smithy", 150, y2 + 158, 250);
+        var closeButton = MakeButton("Close The Smithy", 22, gy + 158, 378);
         closeButton.Click += (s, e) =>
         {
             if (runningTask != "" && ThemedBox.Show(this, "Task " + runningTask + " is running. Close The Smithy? " +
@@ -1032,20 +1068,42 @@ class FirestarterForm : Form
             Close();
         };
 #else
-        var wpButton = MakeButton("WordPress drafts\u2026", 150, y2 + 82, 250);
+        var wpButton = MakeButton("WordPress drafts\u2026", 22, gy + 82, 378);
         wpButton.Click += (s, e) => { using (var d = new WordPressForm()) d.ShowDialog(this); };
-        var zooButton = MakeButton("ZOO items\u2026", 150, y2 + 120, 250);
+        var zooButton = MakeButton("ZOO items\u2026", 22, gy + 120, 378);
         zooButton.Click += (s, e) => { using (var d = new ZooForm()) d.ShowDialog(this); };
-        var pcButton = MakeButton("Check my PC\u2026", 150, y2 + 158, 250);
+        var pcButton = MakeButton("Check my PC\u2026", 22, gy + 158, 378);
         pcButton.Click += (s, e) => CheckPc();
         // other model providers (shared window; worker.json "cloud"; off until one is turned on).
         // No restart needed: the worker reads its settings and keys again at each task.
-        var provButton = MakeButton("Providers…", 150, y2 + 196, 250);
+        var provButton = MakeButton("Providers…", 22, gy + 196, 378);
         provButton.Click += (s, e) => { using (var d = new ProvidersForm()) d.ShowDialog(this); };
         // a new site, built on this PC after a plan and a yes (site_builds.py; the user, Nov 16)
-        var buildButton = MakeButton("New site build…", 150, y2 + 234, 250);
+        var buildButton = MakeButton("New site build…", 22, gy + 234, 378);
         buildButton.Click += (s, e) => { using (var d = new SiteBuildForm()) d.ShowDialog(this); };
 #endif
+
+#if SMITHY
+        g2.Height = gy + 158 + 40;
+#else
+        g2.Height = gy + 234 + 40;
+#endif
+        flow.Controls.Add(g1); flow.Controls.Add(g2);
+        // the app minimizes itself on start (it lives on the taskbar), so the area is first measured while it is tiny and
+        // the groups look stacked; after the window is restored the scroll bar can stay, though everything fits. After each
+        // resize: measure again, and if everything fits but the scroll bar shows, turn the scrolling off and on to reset it.
+        SizeChanged += (s, e) =>
+        {
+            if (WindowState == FormWindowState.Minimized || !IsHandleCreated) return;
+            BeginInvoke((Action)(() =>
+            {
+                flow.PerformLayout();
+                int need = 0;
+                foreach (Control g in flow.Controls) need = Math.Max(need, g.Bottom + g.Margin.Bottom + flow.Padding.Bottom);
+                if (flow.VerticalScroll.Visible && need <= flow.ClientSize.Height) { flow.AutoScroll = false; flow.AutoScroll = true; }
+            }));
+        };
+        Controls.Add(flow); Controls.Add(head);   // the top part is added last, so it docks first
 
         timer.Interval = 2000;
         timer.Tick += (s, e) => RefreshStatus();
@@ -1059,7 +1117,7 @@ class FirestarterForm : Form
         b.FlatAppearance.BorderColor = PurpleLine;
         b.FlatAppearance.MouseOverBackColor = Color.FromArgb(25, 24, 43);
         b.BackColor = PurpleFill; b.ForeColor = Ink;
-        Controls.Add(b);
+        cur.Controls.Add(b);
         return b;
     }
 
@@ -1077,7 +1135,7 @@ class FirestarterForm : Form
 
     void AddModelRow(string label, ComboBox box, string tier, int y)
     {
-        var l = new Label(); l.Text = label; l.ForeColor = Dim; l.SetBounds(22, y + 4, 120, 22); Controls.Add(l);
+        var l = new Label(); l.Text = label; l.ForeColor = Dim; l.SetBounds(22, y + 4, 120, 22); cur.Controls.Add(l);
         box.SetBounds(150, y, 250, 28);
         box.DropDownStyle = ComboBoxStyle.DropDownList;
         box.FlatStyle = FlatStyle.Flat;
@@ -1100,13 +1158,13 @@ class FirestarterForm : Form
             string name = box.SelectedItem.ToString();
             ThreadPool.QueueUserWorkItem(_ => FirestarterApp.Run("set-model " + tier + " \"" + name + "\""));
         };
-        Controls.Add(box);
+        cur.Controls.Add(box);
     }
 
 #if SMITHY
     void AddProviderRow(int y)
     {
-        var l = new Label(); l.Text = "Provider"; l.ForeColor = Dim; l.SetBounds(22, y + 4, 120, 22); Controls.Add(l);
+        var l = new Label(); l.Text = "Provider"; l.ForeColor = Dim; l.SetBounds(22, y + 4, 120, 22); cur.Controls.Add(l);
         provider.SetBounds(150, y, 250, 28);
         provider.DropDownStyle = ComboBoxStyle.DropDownList;
         provider.FlatStyle = FlatStyle.Flat;
@@ -1128,7 +1186,7 @@ class FirestarterForm : Form
             string name = providerNames[provider.SelectedIndex];
             ThreadPool.QueueUserWorkItem(_ => { FirestarterApp.Run("set-provider " + name); LoadCloud(); });
         };
-        Controls.Add(provider);
+        cur.Controls.Add(provider);
     }
 
     // a build's plan waiting for her answer (smithy_jobs.run_proposal): opened by itself once per plan,
@@ -1385,7 +1443,8 @@ class FirestarterForm : Form
             string current = m != null && m.ContainsKey(tier) ? Convert.ToString(m[tier]) : "";
             if (m != null && m.ContainsKey("available"))
                 foreach (var name in (System.Collections.ArrayList)m["available"]) box.Items.Add(Convert.ToString(name));
-            if (current != "" && !box.Items.Contains(current)) box.Items.Insert(0, current);
+            // the chosen model sits at the top of its list (the rest keep their order)
+            if (current != "") { box.Items.Remove(current); box.Items.Insert(0, current); }
             box.SelectedItem = current;
         }
         loadingModels = false;
@@ -1440,6 +1499,38 @@ class FirestarterForm : Form
         if (summary != "") siteSummary.Text = summary;
     }
 #endif
+
+    // matches worker_engine FREEZE_MINUTES: the heartbeat comes every few seconds while a task runs
+    const int FrozenMinutes = 20;
+
+    void AskStuck(string tid, string title, int mins, string upd)
+    {
+        var a = ThemedBox.Show(this, FirestarterApp.Name + " has gone quiet: task " + tid +
+            (title != "" ? " (" + title + ")" : "") + " hasn't moved for " + mins + " minutes, and no check-in came. " +
+            "Something is stuck.\n\nRestart " + FirestarterApp.Name + "? The task goes back in the queue and carries on " +
+            "from the files it had already written. Where it was stuck is kept in the log: after the restart, the newest " +
+            FirestarterApp.LogName + " file in logs\\old (the lines after \"Timeout\").\n\nNo: leave it as it is.",
+            FirestarterApp.Name + ": gone quiet", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+        if (a != DialogResult.Yes) return;
+        // it may have come back while the question was open: then nothing is restarted
+        try
+        {
+            var s = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(File.ReadAllText(FirestarterApp.StatusFile));
+            if (Get(s, "updated_ts") != upd) return;
+        }
+        catch { }
+        try
+        {
+            if (worker != null && !worker.HasExited)
+            {
+                var k = new ProcessStartInfo("taskkill", "/PID " + worker.Id + " /T /F");
+                k.CreateNoWindow = true; k.UseShellExecute = false;
+                Process.Start(k).WaitForExit(15000);
+            }
+        }
+        catch { }
+        StartWorker();
+    }
 
     // every provider in the switch order is out of free tokens: her choice, asked once per task
     void AskOut(string tid, string title, string back)
@@ -1525,6 +1616,18 @@ class FirestarterForm : Form
             seenSeeMe = ts;
             if (fresh && text != "")
                 BeginInvoke((Action)(() => ThemedBox.Show(this, text, FirestarterApp.Name + ": See me")));
+        }
+        // a frozen worker (Nov 20, task 68: no heartbeat and no check-in for 3 hours, and nothing said so): its program
+        // is still there, a task was running, and the heartbeat stopped FrozenMinutes ago (the worker's own watchdog has
+        // written where it's stuck to the log by then). Asked once per freeze.
+        string upd = Get(s, "updated_ts");
+        if (worker != null && !worker.HasExited && tid != "" && (st == "working" || st == "held back") &&
+            age >= FrozenMinutes * 60 && upd != "" && upd != stuckAsked)
+        {
+            stuckAsked = upd;
+            string title = Get(s, "task_title");
+            int mins = (int)(age / 60);
+            BeginInvoke((Action)(() => AskStuck(tid, title, mins, upd)));
         }
         queue.Text = "Queued: " + (alive ? Get(s, "queued") : "-") + "     Waiting for review: " + (alive ? Get(s, "review") : "-");
         string g = Get(s, "game");

@@ -150,16 +150,26 @@ def _tools() -> dict:
     def found(*paths) -> bool:
         return any(p and Path(p).exists() for p in paths)
 
-    llama_exe = ""
-    try:
-        llama_exe = (json.loads((HERE / "worker.json").read_text(encoding="utf-8"))
-                     .get("llama_server") or {}).get("exe") or ""
-    except Exception:
-        pass
+    def llama_server() -> bool:
+        """llama-server.exe on this PC: on the PATH, or what a worker's setting resolves to (a path, or "newest" /
+        empty = the newest Documents\\llama.cpp\\bNNNNN build, Nov 20)."""
+        if shutil.which("llama-server"):
+            return True
+        for name in ("worker.json", "smithy.json"):
+            try:
+                setting = (json.loads((HERE / name).read_text(encoding="utf-8-sig"))
+                           .get("llama_server") or {}).get("exe") or ""
+                import worker_backend
+                if worker_backend.find_llama_server(setting):
+                    return True
+            except Exception:
+                continue
+        return False
+
     ghidra = os.getenv("GHIDRA_INSTALL_DIR", "")
     return {
         "ollama": bool(shutil.which("ollama")) or found(Path(la) / "Programs/Ollama/ollama.exe"),
-        "llama_server": bool(shutil.which("llama-server")) or found(llama_exe),
+        "llama_server": llama_server(),
         "lm_studio": bool(shutil.which("lms")) or found(Path(la) / "Programs/LM Studio",
                                                          Path(la) / "Programs/lm-studio"),
         "node": bool(shutil.which("node")),

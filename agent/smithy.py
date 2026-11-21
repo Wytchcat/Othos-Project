@@ -18,7 +18,8 @@ worker_engine.py.
                                            is answers or changes and gets a revised plan
     smithy.py plans | plan ID              plans waiting for an answer (JSON, for the app)
     smithy.py continue ID [--force]        a stopped or failed build carries on from the files it wrote
-                                           (refused after 25 kept fixes with no better result; --force overrides)
+                                           (refused after 25 kept fixes, or 4 test runs in a row, with no better
+                                           result; --force overrides)
     smithy.py replay ID [RUN]              The Smithy's own decisions on a task's last test run, no model,
                                            nothing run: where each fix would go, and what would hold it back
     smithy.py decide ID TEST test|code|both  an override only: The Smithy judges a test that keeps failing

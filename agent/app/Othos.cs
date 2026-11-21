@@ -743,6 +743,7 @@ class MainForm : Form
                         p.EnableRaisingEvents = true;
                         string error = "";
                         bool done = false;
+                        string doneNote = "";      // model_fetch.py: an update waiting for a model in use to stop
                         long lastDone = 0;
                         DateTime lastAt = DateTime.Now;
                         double rate = 0;
@@ -751,7 +752,7 @@ class MainForm : Form
                             if (e2.Data == null) return;
                             string ev = JsonField(e2.Data, "event");
                             if (ev == "error") error = JsonField(e2.Data, "message");
-                            else if (ev == "done") done = true;
+                            else if (ev == "done") { done = true; doneNote = JsonField(e2.Data, "note"); }
                             else if (ev == "progress")
                             {
                                 long d = JsonNumber(e2.Data, "done"), t = JsonNumber(e2.Data, "total");
@@ -781,11 +782,12 @@ class MainForm : Form
                                         btn.ForeColor = Green;
                                         btn.Enabled = false;
                                         btn.Tag = null;
-                                        sub.Text = name + " is downloaded. To use it: Check my PC... (Apply), or The Smithy's model switcher for coding.";
+                                        sub.Text = doneNote.Length > 0 ? doneNote
+                                            : name + " is downloaded. To use it: Check my PC... (Apply), or The Smithy's model switcher for coding.";
                                     }
                                     else
                                     {
-                                        btn.Text = a[0] == "pull" && btn.Tag is string && (string)btn.Tag == "update" ? "Update" : "Get";
+                                        btn.Text = btn.Tag is string && (string)btn.Tag == "update" ? "Update" : "Get";
                                         btn.Enabled = true;
                                         sub.Text = stopped ? "Stopped. What was downloaded is kept, so Get carries on where it left off."
                                                            : "The download didn't finish" + (error.Length > 0 ? ": " + error : ".");
@@ -909,7 +911,8 @@ class MainForm : Form
                         if ((act[0] == "pull" && act.Length == 3) || (act[0] == "hf" && act.Length == 4) || (act[0] == "open" && act.Length == 2))
                         {
                             var b = new Button();
-                            bool upd = act[0] == "pull" && text.Contains("an update is out");
+                            bool upd = (act[0] == "pull" && text.Contains("an update is out"))
+                                       || (act[0] == "hf" && text.Contains("an updated GGUF file is out"));
                             b.Text = act[0] == "open" ? "Open page" : upd ? "Update" : "Get";
                             b.Tag = upd ? "update" : "get";
                             b.Size = new Size(96, 28);

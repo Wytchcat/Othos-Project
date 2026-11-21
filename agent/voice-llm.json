@@ -4,5 +4,6 @@
   "llama_server_exe": "",
   "port": 11440,
   "threads": 0,
-  "context_per_slot": 6144
+  "context_per_slot": 6144,
+  "batch": 128
 }

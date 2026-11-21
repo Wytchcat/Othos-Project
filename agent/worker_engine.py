@@ -18,10 +18,12 @@ A task type is one model call (build -> messages), or several (run -> the Smithy
 """
 from __future__ import annotations
 
+import faulthandler
 import json
 import logging
 import os
 import re
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -266,8 +268,28 @@ class Worker:
         # utf-8-sig: Notepad++ (and PowerShell) can save with a BOM at the start
         return worker_shared.load_json(self.profile.config_path)
 
+    # -- a frozen worker leaves a trace (Nov 20, task 68: silent for 3 hours from 5:07 PM, not even a check-in; the
+    # restart left no clue where it was stuck). While a task runs, every heartbeat re-arms Python's own watchdog,
+    # which runs outside Python, so it still fires when Python itself is stuck; FREEZE_MINUTES without a heartbeat
+    # writes every thread's place to the log ("Timeout (0:20:00)!"). Nothing is stopped; the app asks about a restart.
+    FREEZE_MINUTES = 20
+
+    def _arm_freeze_trace(self, state: str) -> None:
+        try:
+            if state in ("working", "held back"):
+                now = time.monotonic()
+                if now - getattr(self, "_freeze_armed", 0.0) >= 60:      # re-armed once a minute, not every second
+                    self._freeze_armed = now
+                    faulthandler.dump_traceback_later(self.FREEZE_MINUTES * 60, repeat=False, file=sys.stderr)
+            elif getattr(self, "_freeze_armed", 0.0):
+                self._freeze_armed = 0.0
+                faulthandler.cancel_dump_traceback_later()
+        except Exception:                                  # no usable stderr (a test): no trace, nothing else changes
+            pass
+
     # -- heartbeat for the apps, voice Othos and the board
     def write_status(self, state: str, waiting_for: str = "") -> None:
+        self._arm_freeze_trace(state)
         cur = self.current or {}
         try:
             c = self.q.counts()

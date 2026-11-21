@@ -211,7 +211,7 @@ class Queue:
     # -- the review gate (the user's own words, checked in code)
     def decide(self, job_id: int, transcript: str, verdict: str) -> str | None:
         """Apply verdict ('kept' or 'discarded') only if the user's reply is a clear yes."""
-        if verdict not in ("kept", "discarded") or worker_shared.answer(transcript, verdict) != "yes":
+        if verdict not in ("kept", "discarded") or worker_shared.answer(transcript, verdict, job_id) != "yes":
             return None
         n = self._change("UPDATE jobs SET status=?, decided=?, decision_text=? WHERE id=? AND status='review'",
                          (verdict, time.time(), (transcript or "")[:300], job_id))

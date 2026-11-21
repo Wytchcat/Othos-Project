@@ -137,6 +137,25 @@ def progressed(events: list[dict]) -> bool:
 NO_GAIN_LIMIT = 25      # kept fixes, over the whole task, with no better check or test result
 
 
+STALL_ROUNDS = 4         # Sandbox runs in a row that don't beat the best one (stall_rounds in smithy.json)
+
+
+def rounds_without_gain(events: list[dict]) -> int:
+    """How many Sandbox runs in a row haven't beaten the best one, over every run of the task since the last
+    "continue --force" (a "forced" line). Nov 20, task 68: 22, 22, 23, 22, 23, 23 failing over 6 runs; the judges
+    named the cause each time, but no fix reached it, and every run spent tokens on the same tests."""
+    start = max((i for i, e in enumerate(events) if e.get("kind") == "forced"), default=-1) + 1
+    best, since = None, 0
+    for e in events[start:]:
+        if e.get("kind") == "sandbox" and e.get("status") in ("passed", "failed"):
+            n = len(e.get("failing") or [])
+            if best is None or n < best:
+                best, since = n, 0
+            else:
+                since += 1
+    return since
+
+
 def kept_without_gain(events: list[dict]) -> int:
     """How many fixes were kept since the task last got better: fewer failing tests in a Sandbox run, or fewer
     missing items plus build problems in a check round. Over the whole task, every run of it (Nov 20, task 67:
