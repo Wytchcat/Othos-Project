@@ -80,6 +80,21 @@ if ((Test-Path $venvPy) -and (Test-Path (Join-Path $A "system_specs.py"))) {
     }
 }
 if (Test-Path (Join-Path $A "profile.md")) { Ok "profile.md there" } else { Info "profile.md missing (optional): copy profile.example.md" }
+# which engine runs the conversation (voice-llm.json; llm_server.py reads it the same way)
+$vl = @{ backend = "ollama"; exe = ""; port = 11440 }
+try {
+    $j = Get-Content (Join-Path $A "voice-llm.json") -Raw -Encoding utf8 | ConvertFrom-Json
+    if ($j.backend) { $vl.backend = ([string]$j.backend).ToLower() }
+    if ($j.llama_server_exe) { $vl.exe = [Environment]::ExpandEnvironmentVariables([string]$j.llama_server_exe) }
+    if ($j.port) { $vl.port = [int]$j.port }
+} catch { }
+if ($vl.backend -eq "llama-server") {
+    $exe = if ($vl.exe) { if (Test-Path $vl.exe) { $vl.exe } } else {
+        Get-ChildItem (Join-Path ([Environment]::GetFolderPath("MyDocuments")) "llama.cpp") -Recurse -Filter llama-server.exe -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName }
+    if ($exe) { Ok "conversation on llama-server ($exe)" }
+    else { Bad "voice-llm.json says llama-server, but no llama-server.exe was found: set its backend to ollama, or set llama_server_exe" }
+} else { Info "conversation on Ollama (voice-llm.json)" }
 
 Head "127.0.0.1, not localhost"
 $uiEnv = Read-Env (Join-Path $Ui ".env.local")
@@ -95,8 +110,11 @@ if ($uiEnv["LIVEKIT_URL"] -and $e["LIVEKIT_URL"] -and $uiEnv["LIVEKIT_URL"] -ne 
 }
 
 Head "Ports"
-$ports = [ordered]@{ "7880" = "LiveKit server"; "8081" = "agent"; "3000" = "call page"; "11434" = "Ollama"; "11436" = "The Smithy's Ollama (new build)" }
+$ports = [ordered]@{ "7880" = "LiveKit server"; "8081" = "agent"; "3000" = "call page"; "11434" = "Ollama"; "11436" = "The Smithy's own Ollama" }
 if ($speech -eq "local") { $ports["8000"] = "local speech-to-text"; $ports["8880"] = "Kokoro voice" }
+if ($vl.backend -eq "llama-server") { $ports["$($vl.port)"] = "the conversation's llama-server" }
+# Othos's own servers: in use is how it should be (The Smithy's Ollama is only there when smithy.json starts it)
+$ownPorts = @(11436, $(if ($vl.backend -eq "llama-server") { $vl.port }))
 $othosUp = Test-Path (Join-Path $A "logs\pids.txt")
 foreach ($key in @($ports.Keys)) {
     $port = [int]$key
@@ -104,12 +122,13 @@ foreach ($key in @($ports.Keys)) {
     if ($c) {
         $proc = (Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue).ProcessName
         $msg = "$port ($($ports[$key])) in use by $proc"
-        if ($port -eq 11434 -or ($speech -eq "local" -and $port -in 8000, 8880)) { Ok $msg }
+        if ($port -eq 11434 -or $port -in $ownPorts -or ($speech -eq "local" -and $port -in 8000, 8880)) { Ok $msg }
         elseif ($othosUp) { Info "$msg (Othos is running)" }
         else { Bad "$msg, and Othos isn't running: close that program, or Othos can't start" }
     } else {
         if ($port -eq 11434) { Bad "nothing on 11434: start Ollama" }
         elseif ($speech -eq "local" -and $port -in 8000, 8880) { Bad "nothing on $port ($($ports[$key])): start it" }
+        elseif ($port -eq $vl.port -and $vl.backend -eq "llama-server") { Info "$port free ($($ports[$key]); the agent starts it with Othos)" }
         else { Ok "$port free ($($ports[$key]))" }
     }
 }

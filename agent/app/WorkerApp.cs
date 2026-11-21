@@ -1268,6 +1268,88 @@ class FirestarterForm : Form
     }
 #endif
 
+    // The worker's own notes, written while it's idle (smithy_jobs / worker.py on_idle, Nov 20):
+    //  - state\<name>-restart-needed.txt: its code changed since it started, so it's restarted here, only while
+    //    it has nothing running or queued, and at most once for each change of the file
+    //  - state\<name>-finished.txt: the runs that ended in the last day; each new line is said once, in the
+    //    app's own colours, with the result one click away
+#if SMITHY
+    const string NotesName = "smithy";
+#else
+    const string NotesName = "firestarter";
+#endif
+    int noteTicks;                                 // the status ticks (every 2 seconds)
+    DateTime restartedFor = DateTime.MinValue;     // the restart file's time last acted on
+    HashSet<string> shownFinished;                 // the finished lines already said (null: not read yet)
+    DateTime restartedAt = DateTime.MinValue;      // shown under the task line for a minute after
+
+    void CheckWorkerNotes(string st, string tid, string queued)
+    {
+        string dir = Path.Combine(FirestarterApp.AgentDir, "state");
+        string restartFile = Path.Combine(dir, NotesName + "-restart-needed.txt");
+        try
+        {
+            if (st == "idle" && tid == "" && (queued == "" || queued == "0") && File.Exists(restartFile)
+                && File.GetLastWriteTimeUtc(restartFile) > restartedFor)
+            {
+                restartedFor = File.GetLastWriteTimeUtc(restartFile);
+                try
+                {
+                    if (worker != null && !worker.HasExited)
+                    {
+                        var k = new ProcessStartInfo("taskkill", "/PID " + worker.Id + " /T /F");
+                        k.CreateNoWindow = true; k.UseShellExecute = false;
+                        Process.Start(k).WaitForExit(15000);
+                    }
+                }
+                catch { }
+                StartWorker();
+                restartedAt = DateTime.Now;
+                return;
+            }
+        }
+        catch { }
+        string[] lines = new string[0];
+        try
+        {
+            string finishedFile = Path.Combine(dir, NotesName + "-finished.txt");
+            if (File.Exists(finishedFile)) lines = File.ReadAllLines(finishedFile);
+        }
+        catch { return; }
+        if (shownFinished == null)
+        {
+            // the first read after the app starts only remembers them: a run that ended before is in the list already
+            shownFinished = new HashSet<string>(lines);
+            return;
+        }
+        foreach (string line in lines)
+        {
+            if (line.Trim() == "" || shownFinished.Contains(line)) continue;
+            shownFinished.Add(line);
+            string id = "";
+            if (line.StartsWith("Task "))
+                foreach (char c in line.Substring(5)) { if (char.IsDigit(c)) id += c; else break; }
+            string text = line + (id != "" ? "\n\nOpen its result?" : "");
+            BeginInvoke((Action)(() =>
+            {
+                var a = ThemedBox.Show(this, text, FirestarterApp.Name + ": a run ended",
+                                       id != "" ? MessageBoxButtons.YesNo : MessageBoxButtons.OK, MessageBoxIcon.Information);
+                if (a == DialogResult.Yes && id != "") OpenResult(id);
+            }));
+        }
+    }
+
+    void OpenResult(string id)
+    {
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            string path = FirestarterApp.Run("result " + id).Trim();
+            if (!File.Exists(path)) return;
+            string npp = @"C:\Program Files\Notepad++\notepad++.exe";
+            try { Process.Start(File.Exists(npp) ? npp : "explorer.exe", "\"" + path + "\""); } catch { }
+        });
+    }
+
     void StartWorker()
     {
         FirestarterApp.SaveOldLog();
@@ -1453,6 +1535,9 @@ class FirestarterForm : Form
         if (++cloudTicks % 15 == 0) LoadCloud();        // today's cloud use, every 30 seconds
         if (alive && cloudTicks % 15 == 2) LoadPlans(false);   // a plan waiting for her answer
 #endif
+        if (alive && ++noteTicks % 15 == 7) CheckWorkerNotes(st, tid, Get(s, "queued"));   // restart; a run ended
+        if (tid == "" && (DateTime.Now - restartedAt).TotalSeconds < 60)
+            task.Text = FirestarterApp.Name + " restarted to use its updated code.";
         if (codeChat != null && !checkingPage)
         {
             checkingPage = true;

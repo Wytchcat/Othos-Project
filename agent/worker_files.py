@@ -13,7 +13,6 @@ checks again before reading). Enforced in code, for local models too:
 from __future__ import annotations
 
 import difflib
-import json
 import os
 import re
 from pathlib import Path

@@ -41,7 +41,6 @@ internet address); no cookies, no account, a generic program name.
 from __future__ import annotations
 
 import datetime as dt
-import html
 import json
 import os
 import re

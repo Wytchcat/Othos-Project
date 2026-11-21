@@ -42,19 +42,6 @@ function Make-Icon($path, [scriptblock]$drawSymbol) {
 $green = [Drawing.Color]::FromArgb(255, 61, 220, 132)
 $gold  = [Drawing.Color]::FromArgb(255, 231, 195, 104)
 
-Make-Icon "$IconDir\start-othos.ico" {
-    param($g, $s)
-    $pts = [Drawing.PointF[]]@(
-        (New-Object Drawing.PointF ($s * 0.38), ($s * 0.28)),
-        (New-Object Drawing.PointF ($s * 0.38), ($s * 0.72)),
-        (New-Object Drawing.PointF ($s * 0.74), ($s * 0.50)))
-    $g.FillPolygon((New-Object Drawing.SolidBrush $green), $pts)
-}
-Make-Icon "$IconDir\stop-othos.ico" {
-    param($g, $s)
-    $g.FillRectangle((New-Object Drawing.SolidBrush $gold), [float]($s * 0.31), [float]($s * 0.31), [float]($s * 0.38), [float]($s * 0.38))
-}
-
 # Tray icons: a ring "O" on the chip, green when everything is up, gold when part of Othos is down
 foreach ($t in @(@{f = "othos-tray"; c = $green}, @{f = "othos-tray-warn"; c = $gold})) {
     $col = $t.c
@@ -66,4 +53,4 @@ foreach ($t in @(@{f = "othos-tray"; c = $green}, @{f = "othos-tray-warn"; c = $
 }
 
 # Shortcuts: build-othos-app.ps1 makes the one "Othos" shortcut (Othos.exe).
-# The separate Start Othos / Stop Othos shortcuts were retired on 2026-11-08.
+# The separate Start Othos / Stop Othos shortcuts and their icons were retired on 2026-11-08.

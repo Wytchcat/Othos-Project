@@ -77,13 +77,60 @@ def topic_from(texts: list[str]) -> str:
     return ""
 
 
-def resolve(q: str, user: str, earlier: list[str], home: str) -> tuple[str, str]:
+# words that only make sense about something: "options for breeders" is about cats or dogs or horses, and which one
+# comes from the conversation (Nov 20: "I'm considering options for breeders" after hairless cats was searched with no
+# word about cats, and the answer was the American Kennel Club, which is for dogs)
+_DEPENDENT = re.compile(r"\b(?:breeders?|vets?|veterinar\w+|shelters?|rescues?|stores?|shops?|prices?|costs?|adopt\w*|"
+                        r"buy|sell\w*|supplies|food|health|care|training|trainers?|classes|clubs?|groups?|registr\w+|"
+                        r"kennels?|cattery|catteries)\b", re.I)
+
+
+_FILLER = set("""considering interested thinking wondering looking getting hoping planning trying maybe really sure not
+still also well okay about getting i'm i'd i've i'll im ive id we're they're you're lets let's""".split())
+
+
+def _only_dependent(q: str) -> bool:
+    """The query's only content words are ones that need a subject ("options for breeders", "what about vets"); any
+    other noun ("where can I buy a broadfork") means it has a subject of its own."""
+    rest = [w for w in _words(q) if len(w) > 2 and w not in _GENERIC and w not in _FILLER]
+    return bool(rest) and all(_DEPENDENT.fullmatch(w) for w in rest)
+
+
+def _stems(text: str) -> list[str]:
+    """Word starts to look for ("hairless cats" -> hairl, cat): plural endings dropped, generic words left out."""
+    out = []
+    for w in _words(text):
+        if w in _GENERIC or len(w) < 3:
+            continue
+        out.append(w[:-1] if w.endswith("s") and len(w) > 3 else w)
+    return [x[:5] for x in out]
+
+
+def mentions(text: str, subject: str) -> bool:
+    """True if `text` has any content word of `subject` (matched at the start of a word)."""
+    t = (text or "").lower()
+    return any(re.search(r"\b" + re.escape(st), t) for st in _stems(subject))
+
+
+def answer_fits(topic: str, answer: str) -> bool:
+    """False for a spoken answer that never mentions what was asked about (Nov 20: hairless cat breeders, answered
+    with the American Kennel Club's advice for dogs)."""
+    stems = _stems(topic)
+    if not stems or not answer:
+        return True
+    return mentions(answer, topic)
+
+
+def resolve(q: str, user: str, earlier: list[str], home: str, subject: str = "") -> tuple[str, str]:
     """(query, topic). `topic` is set only when this module changed the query, so the relevance check applies.
 
-    `user` is the whole turn, `earlier` the previous user turns (oldest first)."""
+    `user` is the whole turn, `earlier` the previous user turns (oldest first), `subject` what the last search was
+    about ("hairless cats"): a follow-up about breeders, vets or stores that never says what for takes it."""
     loc = city_state(home)
     local = wants_local(user, q)
     topic = ""
+    if subject and _only_dependent(q) and not mentions(q, subject) and not mentions(user, subject):
+        q, topic = f"{subject} {q}", subject
     if is_generic(q):
         topic = topic_from([user, *reversed(earlier)])
         if not topic:

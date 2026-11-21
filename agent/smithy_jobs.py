@@ -3110,6 +3110,40 @@ def judge_test(ctx, request: str, test: str, test_src: str, failure: str, code: 
     return m.group(1).lower(), " ".join((m.group(2) or "").split())[:400]
 
 
+CONFLICTS_SCHEMA = {"type": "object", "properties": {"conflicts": {"type": "array", "items": {"type": "string"}}},
+                    "required": ["conflicts"]}
+
+
+def request_conflicts(ctx, job_id: int, request: str) -> list[str]:
+    """Things in a request that can't both be true, found once per task, before tests are written from it (Nov 20,
+    task 67: tests lock in one side of a contradiction, and every fix round fights the other). A plan already lists
+    these; a follow-up has no plan, so it's asked here. [] when there are none or no model can say."""
+    saved = SMITHY.results_dir / f"{job_id:05d}-conflicts.json"
+    try:
+        return list(json.loads(saved.read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        pass
+    msgs = [{"role": "system", "content": RULES + " You check a request for a program before it is built."},
+            {"role": "user", "content": "List the things in this request that can't both be true, or that contradict "
+                                        "an example the request itself gives (a rule saying one thing and a sample "
+                                        "showing another). Quote both sides briefly. Only real contradictions, not "
+                                        "missing details. An empty list if there are none. Answer as JSON: "
+                                        '{"conflicts": ["..."]}\n\nThe request:\n' + request[:12000]}]
+    try:
+        with worker_shared.answer_shape(CONFLICTS_SCHEMA):
+            data = _json_reply(ctx.chat(msgs, 1500)) or {}
+    except (BudgetOut, TooLongForLocal):
+        raise
+    except Exception:
+        return []
+    found = [" ".join(str(c).split())[:300] for c in data.get("conflicts") or [] if str(c).strip()][:6]
+    try:
+        saved.write_text(json.dumps(found), encoding="utf-8")
+    except OSError:
+        pass
+    return found
+
+
 # -- tests written from the request itself, which the fix rounds don't change (Nov 17, task 58: every test passed
 # while 7 of the request's rules had no test, so "syntax error" and "Python" were "not in my glossary" and nobody knew)
 REQUEST_TESTS = "test_request.py"
@@ -3647,6 +3681,14 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
                                               "the test is right, so the code is fixed for it")
                      + (f" ({d['why']})" if d.get("why") else "") + ".")
 
+    # things in the change that can't both be true: said at the start, before tests lock one side in (Nov 20)
+    if only is None and use_list and job_id and ctx.cfg.get("conflict_check"):
+        clash = request_conflicts(ctx, job_id, "\n".join(items.values()))
+        if clash:
+            steps.info("The request has %d thing(s) that don't fit together; they're noted in the result.", len(clash))
+            notes.append("**Things in the request that don't fit together** (a fix can't satisfy both sides; say "
+                         "which one is meant in a follow-up):\n- " + "\n- ".join(clash))
+            smithy_diagnose.record(hist, "conflicts", items=clash)
     # the tests written from the request (REQUEST_TESTS): once per build, by a strong model, before the checks;
     # the fix rounds never change them, except a test judged wrong (judge_test)
     if only is None and use_list and wants_tests and ctx.cfg.get("sandbox_tests") \
@@ -3866,7 +3908,7 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
         return [max(pick, key=lambda r: len(written[r]))] if pick else []
 
     if use_list:
-        steps.info("Checking the %d changes asked for against the files.", len(items))
+        steps.info("Checking the %d changes asked for%s against the files.", len(items), smithy_sandbox.about())
     # a limit reached part way (the task's cloud tokens, a step too long for this PC) ends the checks,
     # not the task: what's true so far is reported, NOT COMPLETE (Nov 14, task 38 failed instead)
     stopped = ""
@@ -3879,7 +3921,7 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
             missing = [n for n, (state, _) in ticks.items() if state == "MISSING"]   # NOT SAID isn't fixed blind
             if not missing and not problems:
                 break
-            steps.info("Check round %d of %d: %s; asking for fixes.", rnd, limit, ", ".join(filter(None, [
+            steps.info("Check round %d of %d%s: %s; asking for fixes.", rnd, limit, smithy_sandbox.about(), ", ".join(filter(None, [
                 f"{len(missing)} change{'s' if len(missing) != 1 else ''} not in the files yet" if missing else "",
                 f"{len(problems)} build problem{'s' if len(problems) != 1 else ''}" if problems else ""])))
             if missing:                                      # each to its own file, a few at a time
@@ -3926,6 +3968,9 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
                                if asked else ""), must=True)
             old_ticks = ticks
             ticks, problems, checked = check()
+            if (late := over_time(hist, ctx.cfg)):
+                stopped = late
+                break
             stuck = smithy_diagnose.no_progress(smithy_diagnose.read(hist))
             if stuck and stuck >= int(ctx.cfg.get("diagnose_stop_after", 2)) > 0:
                 # the same things missing and the same problems after fixes that changed the files: more rounds
@@ -4000,20 +4045,86 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
     # still leaves the build NOT COMPLETE (Nov 17, task 58: one repeated import meant its tests never ran)
     if only is None and not stopped and not blocks_tests(problems) and any(smithy_sandbox.is_test(r) for r in code):
         stop = getattr(ctx, "_should_stop", None)
+        escalated, strong = False, None
         try:
             for rnd in range(int(ctx.cfg.get("sandbox_fix_rounds", 1)) + 1):
+                if rnd and (late := over_time(hist, ctx.cfg)):
+                    stopped = late
+                    break
                 sandbox = smithy_sandbox.run_tests(job_id, folder, code, ctx.cfg, SMITHY.results_dir, stop, rnd + 1)
                 skips_as_failures(sandbox, earlier, p.get("request", "") + "\n" + p.get("change", ""))
-                smithy_diagnose.record(hist, "sandbox", status=sandbox["status"],
-                                       failing=sorted({name for t, st in sandbox["tests"].items() if st != "passed"
-                                                       for name in (smithy_diagnose.assertions(
-                                                           sandbox.get("full", {}).get(t, sandbox["output"].get(t, "")))
-                                                           or {t: ""})}),
+                fails = failing_names(sandbox)
+                smithy_diagnose.record(hist, "sandbox", status=sandbox["status"], failing=sorted(fails),
                                        asserts={k: v for t in sandbox["tests"] for k, v in smithy_diagnose.assertions(
                                            sandbox.get("full", {}).get(t, sandbox["output"].get(t, ""))).items()})
                 # a test that has failed in several runs in a row is locked: a test fix may not change it (Nov 16,
                 # task 57: one that failed 4 times was narrowed until it passed)
                 relock()
+                # the round with the fewest failing tests is kept; a worse one goes back to it and the fixing stops
+                # for now (Nov 20, task 67)
+                if job_id and sandbox["status"] in ("passed", "failed"):
+                    best = load_best(SMITHY.results_dir, job_id)
+                    if best is None or len(fails) < best[0]:
+                        save_best(SMITHY.results_dir, job_id, folder, code, len(fails))
+                    elif len(fails) > best[0]:
+                        back = restore_best(best[1], folder, code)
+                        for r in back:
+                            written[r] = (folder / r).read_text(encoding="utf-8-sig", errors="replace")
+                        if back:
+                            steps.info("The tests went backwards (%d failing, the best was %d); the best round's "
+                                       "files are put back.", len(fails), best[0])
+                            notes.append(f"**The tests went backwards ({len(fails)} failing; the best round had "
+                                         f"{best[0]}), so the best round's files were put back** "
+                                         f"({', '.join(f'`{r}`' for r in back[:8])}). Run it again to continue from there.")
+                            smithy_diagnose.record(hist, "best_restored", failing=len(fails), best=best[0], files=back)
+                            if not escalated and rnd < int(ctx.cfg.get("sandbox_fix_rounds", 1)):
+                                # once per run: the next round, from the best files, goes to the stronger models
+                                # only (Nov 20, task 67: a weak round broke more than it fixed, and the run ended)
+                                escalated = True
+                                least = float(ctx.cfg.get("escalate_min_b", 70))
+                                strong = worker_shared.MIN_MODEL_B.set(least)
+                                steps.info("Trying once more from the best round, on stronger models only.")
+                                notes.append("**The next round, from the best round's files, goes to stronger models "
+                                             "only.**")
+                                smithy_diagnose.record(hist, "escalated", min_b=least)
+                                continue
+                            break
+                # tests of the earlier version that passed there and fail now: the files this version changed that the
+                # request doesn't name go back to the earlier version's
+                if sandbox["status"] == "failed" and p.get("parent_id") and earlier is not None:
+                    keep = protected_tests(earlier, parent_failing(SMITHY.results_dir, int(p["parent_id"])))
+                    broke = sorted(fails & keep)
+                    # needed by the request: files it names, and files its own tests import (the request names
+                    # the confusion detector in words, and its tests import academy_confusion.py; Nov 20, task 67)
+                    named_req = _names(p.get("request", "") + "\n" + p.get("change", ""),
+                                       [{"path": r} for r in code], stems=True)
+                    if REQUEST_TESTS in code:
+                        named_req |= set(_imported_by(folder, REQUEST_TESTS, code))
+                    back = regression_files(folder, Path(earlier), code, named_req) if broke else []
+                    if back:
+                        for r in back:
+                            shutil.copyfile(Path(earlier) / r, folder / r)
+                            written[r] = (folder / r).read_text(encoding="utf-8-sig", errors="replace")
+                        steps.info("%d test(s) of the earlier version broke; %d file(s) the request doesn't name "
+                                   "are put back as they were.", len(broke), len(back))
+                        notes.append(f"**{len(broke)} test{'s' if len(broke) != 1 else ''} of the earlier version "
+                                     f"passed there and failed now ({', '.join(broke[:6])}), so "
+                                     f"{', '.join(f'`{r}`' for r in back)} (not named by the request) "
+                                     "went back to the earlier version's.**")
+                        smithy_diagnose.record(hist, "unrequested_reverted", tests=broke, files=back)
+                        # the result must be of the files as they are now: run the tests again (Nov 20, task 67: the
+                        # run ended after the put-back, so the draft's state was never tested)
+                        sandbox = smithy_sandbox.run_tests(job_id, folder, code, ctx.cfg, SMITHY.results_dir, stop,
+                                                           rnd + 1)
+                        skips_as_failures(sandbox, earlier, p.get("request", "") + "\n" + p.get("change", ""))
+                        fails = failing_names(sandbox)
+                        smithy_diagnose.record(hist, "sandbox", status=sandbox["status"], failing=sorted(fails),
+                                               after="put back")
+                        relock()
+                        if job_id and sandbox["status"] in ("passed", "failed"):
+                            again_best = load_best(SMITHY.results_dir, job_id)
+                            if again_best is None or len(fails) < again_best[0]:
+                                save_best(SMITHY.results_dir, job_id, folder, code, len(fails))
                 if sandbox["status"] != "failed" or rnd >= int(ctx.cfg.get("sandbox_fix_rounds", 1)):
                     break
                 before = {r: (folder / r).read_bytes() for r in code if (folder / r).exists()}
@@ -4149,6 +4260,9 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
                     break
         except (BudgetOut, TooLongForLocal) as e:
             stopped = str(e)
+        finally:
+            if strong is not None:
+                worker_shared.MIN_MODEL_B.reset(strong)
 
     # what's true now, for the result and the README
     left, truth = [], []
@@ -4294,6 +4408,81 @@ def first_params(parent_id: int) -> dict:
             return pp
         pid = pp.get("parent_id")
     return {}
+
+
+def _root_of(job_id: int) -> int:
+    """The first task of a project's chain of versions (a follow-up's params hold its parent)."""
+    seen, cur = set(), int(job_id)
+    while cur not in seen:
+        seen.add(cur)
+        row = SMITHY.get(cur)
+        pid = json.loads(row["params"] or "{}").get("parent_id") if row is not None else None
+        if not pid:
+            break
+        cur = int(pid)
+    return cur
+
+
+def _project_key(job_id: int) -> str:
+    """One key for a project: its first task's request text, so separate builds of the same request (Nov 14:
+    tasks 37 and 39 to 42, all the Academy tool) count as one project, not five."""
+    root = SMITHY.get(_root_of(job_id))
+    request = json.loads(root["params"] or "{}").get("request", "") if root is not None else ""
+    return " ".join(request.split()).lower()[:2000] or f"task {_root_of(job_id)}"
+
+
+def open_work() -> dict:
+    """What is waiting and what has gone stale, for a person who doesn't know to look (Nov 20 tidy): versions
+    waiting for review that a later kept version of the same project replaced ("superseded"), and tasks that kept
+    many fixes and never got better ("stuck"). Nothing is changed here."""
+    rows = [r for r in SMITHY.by_status("review", "kept", limit=500) if r["type"] in ("build", "joomla", "followup")]
+    kept_by_root: dict[str, int] = {}
+    for r in rows:
+        if r["status"] == "kept":
+            root = _project_key(r["id"])
+            kept_by_root[root] = max(kept_by_root.get(root, 0), r["id"])
+    out: dict = {"waiting": [], "superseded": [], "stuck": []}
+    for r in rows:
+        if r["status"] != "review":
+            continue
+        later = kept_by_root.get(_project_key(r["id"]), 0)
+        item = {"id": r["id"], "title": r["title"]}
+        if later > r["id"]:
+            out["superseded"].append({**item, "replaced_by": later})
+            continue
+        out["waiting"].append(item)
+        stale = smithy_diagnose.kept_without_gain(smithy_diagnose.read(SMITHY.results_dir / f"{r['id']:05d}-history.jsonl"))
+        if stale >= smithy_diagnose.NO_GAIN_LIMIT:
+            out["stuck"].append({**item, "kept_fixes": stale})
+    return out
+
+
+def tidy_text(work: dict) -> str:
+    lines = []
+    for w in work["waiting"]:
+        lines.append(f"Waiting for your review: task {w['id']}, {w['title']}")
+    for s in work["superseded"]:
+        lines.append(f"Replaced: task {s['id']} ({s['title']}) was replaced by kept task {s['replaced_by']}; "
+                     "safe to discard")
+    for s in work["stuck"]:
+        lines.append(f"Stuck: task {s['id']} kept {s['kept_fixes']} fixes without getting better; a smaller "
+                     "follow-up with just the failing parts will do better than another run")
+    lines[:0] = finished_lately()
+    if (again := restart_needed()):
+        lines.insert(0, again)
+    return chr(10).join(lines) or "Nothing is waiting."
+
+
+def discard_superseded() -> list[int]:
+    """Discards the replaced versions (their drafts too). Only on her say-so: smithy.py tidy --discard."""
+    import shutil
+    gone = []
+    for s in open_work()["superseded"]:
+        _mark(s["id"], "discarded", f"replaced by kept task {s['replaced_by']}")
+        for p in SMITHY.results_dir.glob(f"{s['id']:05d}-*"):
+            shutil.rmtree(p) if p.is_dir() else p.unlink(missing_ok=True)
+        gone.append(s["id"])
+    return gone
 
 
 # ---------------------------------------------------------------- builds: read, ask, propose (Nov 14)
@@ -4547,6 +4736,21 @@ def _past_builds(n_files: int) -> list[tuple[int, int]]:
     return out
 
 
+BIG_FILES, BIG_RULES = 8, 6         # a plan with this many files, or a request with this many numbered rules, is big
+
+
+def size_advice(plan: dict, request: str) -> str:
+    """A plain warning when one request is more than a model of this size holds at once (Nov 20, task 67: seven
+    rules over six modules; every fix broke another rule, 76 fixes over 28 hours). '' when it's a normal size."""
+    files = len([f for f in plan.get("files", []) if not str(f.get("path", "")).startswith("test_")])
+    rules = len(numbered_items(request))
+    if files < BIG_FILES and rules < BIG_RULES:
+        return ""
+    return (f"This is a big one ({files} files, {rules} numbered rule{"" if rules == 1 else "s"}). A small model does better with about three "
+            "files at a time, and each fix on a big build tends to break another part. Build the core first, then "
+            "add the rest as follow-ups of it.")
+
+
 def cost_line(plan: dict, p: dict, cfg: dict, budget: int) -> str:
     n = len(plan.get("files", []))
     cc = cfg.get("cloud") or {}
@@ -4566,6 +4770,8 @@ def cost_line(plan: dict, p: dict, cfg: dict, budget: int) -> str:
     else:
         line += " There's no earlier build of about this size to compare with yet"
     line = line.rstrip(".") + "."
+    if (big := size_advice(plan, p.get("request", ""))):
+        line += " " + big
     if (now := cloud_note(cfg)):
         line += " " + now
     return line
@@ -4788,7 +4994,7 @@ def reply_to_proposal(job_id: int, text: str, build_now: bool = False) -> str:
     return f"Revising the plan with your answers: Smithy task {new}."
 
 
-def carry_on(job_id: int) -> str:
+def carry_on(job_id: int, force: bool = False) -> str:
     """A stopped or failed build back in the queue, as the same task: it keeps its plan, every file already
     written (an empty one is written again) and its cloud-token count, and carries on from there (suggestion 2,
     Nov 14: task 51 was stopped when the day's free tokens ran out)."""
@@ -4806,6 +5012,13 @@ def carry_on(job_id: int) -> str:
         raise ValueError(f"Smithy task {job_id} is {row['status']}, not stopped or waiting for review")
     if not (SMITHY.results_dir / f"{job_id:05d}-plan.json").exists():
         raise ValueError(f"Smithy task {job_id} stopped before it had a plan, so there's nothing to carry on")
+    # a task that kept many fixes and never got better is stopped here, in plain words, not run for another day
+    # (Nov 20, task 67); "continue ID --force" overrides
+    stale = smithy_diagnose.kept_without_gain(smithy_diagnose.read(SMITHY.results_dir / f"{job_id:05d}-history.jsonl"))
+    if stale >= smithy_diagnose.NO_GAIN_LIMIT and not force:
+        raise ValueError(f"Smithy task {job_id} has kept {stale} fixes since it last got better, so more of the same "
+                         "won't help. Start a smaller follow-up with just the parts still failing, or add --force "
+                         "to run it again anyway")
     # its old result and check are made again at the end; the files and the plan are kept
     for old in (f"{job_id:05d}-check.json",):
         (SMITHY.results_dir / old).unlink(missing_ok=True)
@@ -4821,11 +5034,90 @@ def carry_on(job_id: int) -> str:
                else "it carries on from the files it had already written."))
 
 
-def _result_head(row) -> str:
-    try:
-        return Path(row["result_path"]).read_text(encoding="utf-8", errors="replace")[:2000] if row["result_path"] else ""
-    except OSError:
+_CODE_DIR = Path(__file__).resolve().parent
+
+
+def over_time(hist: Path | None, cfg: dict, now: float | None = None) -> str:
+    """'' while this run of the task is within run_hours_max (default 4; 0 = off), else why it stops, in plain
+    words. The run starts at the history's last "run" line (Nov 20, task 67: one local-model round took about 80
+    minutes, and runs went on for hours with nothing to show for it)."""
+    hours = float(cfg.get("run_hours_max", 4) or 0)
+    if hours <= 0:
         return ""
+    starts = [e.get("ts", 0) for e in smithy_diagnose.read(hist) if e.get("kind") == "run"]
+    if not starts:
+        return ""
+    spent = ((now or time.time()) - starts[-1]) / 3600
+    if spent < hours:
+        return ""
+    return (f"this run went over its time limit of {hours:g} hours (run_hours_max); the files so far are kept, "
+            "and a smaller follow-up will do better than more of the same")
+
+
+def _code_changed_at() -> float:
+    """The newest change among the worker's own code files (what a restart would load)."""
+    stamps = [p.stat().st_mtime for pat in ("smithy*.py", "worker_*.py") for p in _CODE_DIR.glob(pat)]
+    return max(stamps, default=0.0)
+
+
+_LOADED_AT = _code_changed_at()          # the code this worker started with
+
+
+def restart_needed() -> str:
+    """'' while the worker runs the code on disk; else a plain sentence, so nobody has to remember to restart
+    after a fix (Nov 20: every fix needed a restart that had to be asked for, and each wait added hours)."""
+    now = _code_changed_at()
+    if now <= _LOADED_AT + 1:
+        return ""
+    when = time.strftime("%I:%M %p", time.localtime(now)).lstrip("0")
+    return f"The Smithy's code changed at {when}; restart it to use the new version."
+
+
+def note_restart(cfg: dict) -> None:
+    """While idle: write (or remove) smithy-restart-needed.txt in the state folder, which `smithy.py tidy` and the app can show."""
+    flag = _CODE_DIR / "state" / "smithy-restart-needed.txt"
+    text = restart_needed()
+    try:
+        if text:
+            flag.write_text(text + chr(10), encoding="utf-8")
+        else:
+            flag.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def finished_lately(hours: float = 24, now: float | None = None) -> list[str]:
+    """A plain line for each task that finished in the last `hours` and waits for review, newest first: the run
+    ended, and how it stands (Nov 20: nobody was told when task 67 stopped; a watcher had to be written)."""
+    since = (now or time.time()) - hours * 3600
+    out = []
+    for r in SMITHY.by_status("review", limit=50):
+        if not r["finished"] or r["finished"] < since:
+            continue
+        when = time.strftime("%I:%M %p", time.localtime(r["finished"])).lstrip("0")
+        head = " ".join((r["summary"] or "").split())[:160]
+        out.append(f"Task {r['id']} ({r['title']}) finished at {when}: {head}")
+    return out
+
+
+def note_finished(cfg: dict) -> None:
+    """While idle: smithy-finished.txt in the state folder says which runs ended lately, for the app to show."""
+    flag = _CODE_DIR / "state" / "smithy-finished.txt"
+    lines = finished_lately()
+    try:
+        if lines:
+            flag.write_text(chr(10).join(lines) + chr(10), encoding="utf-8")
+        else:
+            flag.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def on_idle(cfg: dict) -> None:
+    """Everything The Smithy does while it has nothing queued."""
+    note_restart(cfg)
+    note_finished(cfg)
+    answer_waiting_plans(cfg)
 
 
 def answer_waiting_plans(cfg: dict) -> None:
@@ -4999,6 +5291,7 @@ def run_build(ctx, p: dict):
         plan_path.write_text(json.dumps({"summary": summary, "desc": desc, "plan": plan}, indent=2), encoding="utf-8")
     if not plan["files"]:
         raise ValueError("the plan has no files of the build left (" + "; ".join(left_out) + ")")
+    smithy_sandbox.ABOUT.set(project_words(plan.get("name") or p.get("project") or ""))
     _set_own_limit(ctx, job_id, plan, p, budget, parent)     # set again after a pause: begin_task clears it
     version = int(p.get("version", 1))
     name = plan["name"] or slug(p["request"])
@@ -5262,6 +5555,108 @@ def _check_build(p, joomla: bool = False):
     return out
 
 
+# -- the best round, and the earlier version's passing tests (Nov 20, task 67: a run on this PC's model went from 5
+# failing tests to a worse draft, and broke 7 of the earlier version's own tests in files the request doesn't name)
+def failing_names(sandbox: dict) -> set[str]:
+    """The tests that failed in a Sandbox run, by name (the test file's name when no name could be read)."""
+    return {name for t, st in sandbox.get("tests", {}).items() if st != "passed"
+            for name in (smithy_diagnose.assertions(sandbox.get("full", {}).get(t, sandbox.get("output", {}).get(t, "")))
+                         or {t: ""})}
+
+
+def save_best(base: Path, job_id: int, folder: Path, rels: list[str], failing: int) -> None:
+    """The files of the round with the fewest failing tests so far, kept in `<id>-best` beside the task's results."""
+    best = base / f"{job_id:05d}-best"
+    shutil.rmtree(best, ignore_errors=True)
+    for rel in rels:
+        src = folder / rel
+        if src.is_file():
+            (best / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, best / rel)
+    best.mkdir(parents=True, exist_ok=True)
+    (best / "best.json").write_text(json.dumps({"failing": failing, "at": time.time()}), encoding="utf-8")
+
+
+def load_best(base: Path, job_id: int) -> tuple[int, Path] | None:
+    best = base / f"{job_id:05d}-best"
+    try:
+        return int(json.loads((best / "best.json").read_text(encoding="utf-8"))["failing"]), best
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def restore_best(best: Path, folder: Path, rels: list[str]) -> list[str]:
+    """Put the best round's files back (only those that differ now); the names put back."""
+    back = []
+    for rel in rels:
+        src = best / rel
+        if src.is_file() and (not (folder / rel).is_file() or (folder / rel).read_bytes() != src.read_bytes()):
+            shutil.copyfile(src, folder / rel)
+            back.append(rel)
+    return back
+
+
+def protected_tests(parent_folder: Path | None, failing_then: set[str] | None) -> set[str]:
+    """The test functions of the earlier version that passed at its last Sandbox run: its test files' test_ names
+    less those that failed then. Empty when that run isn't known (nothing is protected on a guess)."""
+    if parent_folder is None or failing_then is None or not Path(parent_folder).is_dir():
+        return set()
+    names: set[str] = set()
+    for f in Path(parent_folder).rglob("*.py"):
+        if smithy_sandbox.is_test(f.name):
+            try:
+                names |= {n.name for n in ast.walk(ast.parse(f.read_text(encoding="utf-8", errors="replace")))
+                          if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test")}
+            except SyntaxError:
+                continue
+    return names - failing_then
+
+
+def parent_failing(base: Path, parent_id: int) -> set[str] | None:
+    """The tests that failed at the earlier task's last Sandbox run (None if it had none)."""
+    runs = [e for e in smithy_diagnose.read(base / f"{parent_id:05d}-history.jsonl") if e.get("kind") == "sandbox"]
+    return set(runs[-1].get("failing") or []) if runs else None
+
+
+def regression_files(folder: Path, earlier: Path, rels: list[str], named: set[str]) -> list[str]:
+    """The code files this version changed that the request doesn't name, to go back to the earlier version's."""
+    out = []
+    for rel in rels:
+        old, new = Path(earlier) / rel, folder / rel
+        if rel not in named and not smithy_sandbox.is_test(rel) and old.is_file() and new.is_file() \
+                and old.read_bytes() != new.read_bytes():
+            out.append(rel)
+    return out
+
+
+def project_words(name: str) -> str:
+    """A plan's name in plain words: "academy-lessons" is "academy lessons"."""
+    return " ".join(re.sub(r"[^A-Za-z0-9]+", " ", str(name or "")).split()).lower()
+
+
+def _plan_name(job_id: int) -> str:
+    try:
+        return str(json.loads((SMITHY.results_dir / f"{job_id:05d}-plan.json").read_text(encoding="utf-8"))
+                   ["plan"].get("name") or "")
+    except (OSError, ValueError, KeyError, AttributeError):
+        return ""
+
+
+def _subject_of(parent) -> str:
+    """What a task is, for the titles of its new versions: the root build's own title ("the build: academy error
+    test runner"), kept from version to version (Nov 20, Othos main: "version 6 of Smithy task 63" meant nothing
+    a day later)."""
+    pp = json.loads(parent["params"] or "{}")
+    if pp.get("subject"):
+        return str(pp["subject"])
+    jt = REGISTRY.get(parent["type"])
+    try:
+        title = str(parent["title"] or (jt.title(pp) if jt else ""))
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return ""
+    return re.sub(r"^the (?:revised )?plan for ", "", title)       # it's the build that went ahead, not the plan
+
+
 def _check_followup_any(p):
     """A follow-up question, or on a build, a new version of it."""
     out = _check_followup(p)
@@ -5271,8 +5666,14 @@ def _check_followup_any(p):
                          f"(smithy.py reply {out['parent_id']} yes, no, or your answers)")
     if parent["type"] in ("build", "joomla") or "change" in json.loads(parent["params"] or "{}"):
         pp = json.loads(parent["params"] or "{}")
+        subject = _subject_of(parent)
+        project = project_words(pp.get("project") or _plan_name(out["parent_id"]))
         out = {"parent_id": out["parent_id"], "change": out["question"], "version": int(pp.get("version", 1)) + 1,
                "question": out["question"]} | {k: out[k] for k in ("repaired",) if k in out}
+        if subject and not subject.lower().startswith("version "):
+            out["subject"] = subject
+        if project:
+            out["project"] = project
     return out
 
 
@@ -5371,7 +5772,7 @@ REGISTRY: dict[str, JobType] = {
                      see_me=lambda j, m, on: see_me_text(j, m, on)),
     "followup": JobType("followup", "A follow-up question; on a build, a new version of it.", "code",
                         None, _check_followup_any,
-                        lambda p: (f"version {p['version']} of Smithy task {p['parent_id']}" if "change" in p
+                        lambda p: (f"version {p['version']} of {p.get('subject') or 'Smithy task ' + str(p['parent_id'])}" if "change" in p
                                    else f"the answer about Smithy task {p['parent_id']}"),
                         max_tokens=1000, run=_run_followup, minutes_key="max_build_minutes", coding=True,
                         see_me=lambda j, m, on: see_me_text(j, m, on)),

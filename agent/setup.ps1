@@ -110,8 +110,7 @@ if (-not (Test-Path $uiEnv)) {
 # ---- 5. models (Ollama)
 Step "Models"
 $models = @("llama3.2:3b", "nomic-embed-text", "moondream:1.8b", "qwen2.5-coder:3b")
-# approximate model sizes (GB); use "?" if unknown
-$sizes = @{
+$sizes = @{   # download sizes, GB
     "llama3.2:3b"      = "2"
     "nomic-embed-text" = "0.3"
     "moondream:1.8b"   = "1.7"
@@ -123,8 +122,7 @@ else {
     foreach ($m in $models) {
         if ($have -match [regex]::Escape($m)) { Ok "$m already pulled" }
         else {
-            # Determine size string
-            if ($sizes.ContainsKey($m)) { $sz = $sizes[$m] } else { $sz = "?" }
+            $sz = if ($sizes.ContainsKey($m)) { $sizes[$m] } else { "?" }
             Write-Host "   pulling $m (about $sz GB; this can take a few minutes)"
             if ([Console]::IsOutputRedirected) {
                 cmd.exe /d /c "ollama pull $m >nul 2>&1"

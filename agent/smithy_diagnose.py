@@ -134,6 +134,30 @@ def progressed(events: list[dict]) -> bool:
     return bool(now) and bool(before - now)
 
 
+NO_GAIN_LIMIT = 25      # kept fixes, over the whole task, with no better check or test result
+
+
+def kept_without_gain(events: list[dict]) -> int:
+    """How many fixes were kept since the task last got better: fewer failing tests in a Sandbox run, or fewer
+    missing items plus build problems in a check round. Over the whole task, every run of it (Nov 20, task 67:
+    76 kept fixes over 9 runs and 28.8 hours, and the draft ended no better than its best early round)."""
+    best_tests = best_check = None
+    since = 0
+    for e in events:
+        kind = e.get("kind")
+        if kind == "sandbox" and e.get("status") in ("passed", "failed"):
+            n = len(e.get("failing") or [])
+            if best_tests is None or n < best_tests:
+                best_tests, since = n, 0
+        elif kind == "check":
+            n = len(e.get("missing") or []) + len(e.get("problems") or [])
+            if best_check is None or n < best_check:
+                best_check, since = n, 0
+        elif kind == "fix" and e.get("kept"):
+            since += 1
+    return since
+
+
 def no_progress(events: list[dict]) -> int:
     """How many check rounds in a row, at the end of this run, found exactly what the one before found (missing
     items and build problems), while there was something to fix. 0 = progress (or nothing left)."""

@@ -17,7 +17,8 @@ worker_engine.py.
     smithy.py reply ID yes|no|ANSWERS      answer a plan: yes builds it, no drops it, anything else
                                            is answers or changes and gets a revised plan
     smithy.py plans | plan ID              plans waiting for an answer (JSON, for the app)
-    smithy.py continue ID                  a stopped or failed build carries on from the files it wrote
+    smithy.py continue ID [--force]        a stopped or failed build carries on from the files it wrote
+                                           (refused after 25 kept fixes with no better result; --force overrides)
     smithy.py replay ID [RUN]              The Smithy's own decisions on a task's last test run, no model,
                                            nothing run: where each fix would go, and what would hold it back
     smithy.py decide ID TEST test|code|both  an override only: The Smithy judges a test that keeps failing
@@ -28,6 +29,8 @@ worker_engine.py.
     smithy.py add ... --provider NAME      on another model provider (worker_cloud.py; off by default)
     smithy.py cloud | set-provider NAME|local
     smithy.py list | status | types | log
+    smithy.py tidy [--discard]             what is waiting, replaced by a later kept version, or stuck;
+                                           --discard drops the replaced ones (only when you say so)
     smithy.py cancel [ID]
     smithy.py models
     smithy.py set-model code NAME
@@ -72,7 +75,7 @@ PROFILE = worker_engine.Profile(
                + "   (any: --provider NAME [--model NAME]; build/joomla: --no-ask builds without a plan to answer)"
                + "\n       smithy.py reply TASK_ID yes|no|ANSWERS"),
     add_parse=_add,
-    on_idle=smithy_jobs.answer_waiting_plans)        # a plan nobody answered (build_ask_wait_hours)
+    on_idle=smithy_jobs.on_idle)        # restart-needed note; a plan nobody answered (build_ask_wait_hours)
 
 def _cloud(argv: list[str]) -> bool:
     """The window's Provider row: `cloud` (JSON: what's turned on, the default, today's use)
@@ -93,11 +96,21 @@ def _cloud(argv: list[str]) -> bool:
         except ValueError as e:
             raise SystemExit(f"can't do that: {e}")
         return True
+    if cmd == "result":                                  # a task's result file, for the app's "Open its result"
+        row = SMITHY.get(int(argv[2])) if len(argv) > 2 and argv[2].isdigit() else None
+        print(row["result_path"] or "" if row is not None else "")
+        return True
+    if cmd == "tidy":                                    # what is waiting, replaced or stuck; --discard drops the replaced
+        if "--discard" in argv[2:]:
+            print("Discarded the replaced versions: " + (", ".join(map(str, smithy_jobs.discard_superseded())) or "none"))
+        else:
+            print(smithy_jobs.tidy_text(smithy_jobs.open_work()))
+        return True
     if cmd == "continue":                                # a stopped or failed build carries on where it was
         if len(argv) < 3 or not argv[2].isdigit():
-            raise SystemExit("usage: smithy.py continue TASK_ID")
+            raise SystemExit("usage: smithy.py continue TASK_ID [--force]")
         try:
-            print(smithy_jobs.carry_on(int(argv[2])))
+            print(smithy_jobs.carry_on(int(argv[2]), force="--force" in argv[3:]))
         except ValueError as e:
             raise SystemExit(f"can't do that: {e}")
         return True

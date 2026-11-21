@@ -105,7 +105,6 @@ is never committed. Anything not listed as required can stay empty.
 | Line | What it is | Where to get it | Needed? |
 |---|---|---|---|
 | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` | the local call server (`ws://127.0.0.1:7880`, `devkey`, `secret`) | already filled in | yes, leave as is |
-| `LIVEKIT_TOKEN_SERVER_ID`, `AGENT_NAME` | LiveKit Cloud options | - | leave empty |
 | `GREET_ON_START` | Othos says hello when the call starts | - | optional (`true`) |
 | `OTHOS_SPEECH` | `cloud` or `local` (see [Setup modes](#setup-modes)) | - | yes |
 | `DEEPGRAM_API_KEY` | speech-to-text (cloud) | [console.deepgram.com](https://console.deepgram.com/) (free credit on sign-up) | cloud speech |

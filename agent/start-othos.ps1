@@ -82,10 +82,16 @@ if (-not (Test-Ollama)) {
     if (-not (Test-Ollama)) { Say "Ollama didn't start within 20 seconds. Check $LogDir\ollama.log." }
 }
 
-# Warm the Ollama model in the background (fails quietly if Ollama is not running)
-$body = '{\"model\":\"' + $OllamaModel + '\",\"keep_alive\":\"-1m\"}'
-Start-Process curl.exe -WindowStyle Hidden `
-    -ArgumentList "-s http://127.0.0.1:11434/api/generate -d `"$body`""
+# Warm the Ollama model in the background (fails quietly if Ollama is not running).
+# Not when voice-llm.json puts the conversation on llama-server: the agent starts that and
+# would only unload Ollama's copy again.
+$onLlamaServer = $false
+try { $onLlamaServer = ((Get-Content "$AgentDir\voice-llm.json" -Raw -Encoding utf8 | ConvertFrom-Json).backend -eq "llama-server") } catch { }
+if (-not $onLlamaServer) {
+    $body = '{\"model\":\"' + $OllamaModel + '\",\"keep_alive\":\"-1m\"}'
+    Start-Process curl.exe -WindowStyle Hidden `
+        -ArgumentList "-s http://127.0.0.1:11434/api/generate -d `"$body`""
+}
 
 Start-Hidden "server" $LiveKitDir "`"$LiveKitDir\livekit-server.exe`" --dev"
 Start-Sleep -Seconds 4

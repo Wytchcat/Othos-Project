@@ -568,7 +568,9 @@ _FILLER_ONLY = re.compile(r"^\W*(?:also|and|so|um+|uh+|hmm+|er+|well|but|oh|like
 # Nov 19 call: the rest, "last two task results?", came as its own turn and neither half was understood)
 _CUT_OFF = re.compile(r"\b(?:its|the|a|an|my|your|our|their|of|with|and|or|but|from|some|any|if|because|than|into|"
                       r"to|about|for|whether|which|whose|what|why|how|when|where|who)\s*,?\s*$"
-                      r"|\b(?:can|could|shall|should|will|would|do|does|did|may|might)\s+(?:we|you|i|they)\s*,?\s*$",
+                      r"|\b(?:can|could|shall|should|will|would|do|does|did|may|might)\s+(?:we|you|i|they)\s*,?\s*$"
+                      r"|\b(?:what|who|where|when|why|how|which)\s+(?:is|was|are|were|do|does|did|can|could|would|should|will|has|have|had)"
+                      r"\s*,?\s*$",
                       re.I)   # the second half: "Okay. Can we" (Nov 19, 13:34: answered with "Sorry, I didn't catch...")
 
 
@@ -966,6 +968,83 @@ def _headline(r: dict) -> str:
         line = re.split(r"(?<=[.!?])\s", _clean_text(r.get("content", "")))[0]
         line = " ".join(line.split()[:20])
     return line.rstrip(" .!?:;,")
+
+
+def _spoken_headline(r: dict, words: int = 10) -> str:
+    """_headline cut to what's worth saying aloud: a store's product title ("Bully Tools 5-Tine Broadfork, Fiberglass
+    Handles, 56" 10-Gauge Steel...") ran 35 s over four results (Nov 20: "that was quite a lot"). The first clause, at
+    most `words` words, never ending on a small word."""
+    line = re.sub(r"^[\w.-]+\.(?:com|net|org)\s*:\s*", "", _headline(r))     # "Amazon.com : Bully Tools..."
+    first = re.split(r",\s+", line)[0]
+    if len(first.split()) >= 3:
+        line = first
+    parts = line.split()
+    if len(parts) > words:
+        parts = parts[:words]
+        while len(parts) > 3 and parts[-1].lower().strip(",.") in _READOUT_SMALL:
+            parts.pop()
+    return " ".join(parts).rstrip(" .!?:;,-")
+
+
+_READOUT_SMALL = {"a", "an", "the", "and", "or", "of", "in", "on", "to", "for", "with", "by", "at", "as", "from", "-", "&"}
+READOUT_COUNT = 3   # results read per page (was 4): about 20 s of speech, and less for the model to re-read each turn
+
+# "Where can I get a broadfork?": the user wants places that sell it, near home (the user, Nov 20), not pages about
+# the product, forum threads, or stores in another state
+_WHERE_TO_BUY = re.compile(
+    r"\bwhere\s+(?:can|could|do|should|would)\s+(?:i|we)\s+(?:get|buy|find|purchase|pick\s+up|order)\b|"
+    r"\bwhere\s+to\s+(?:get|buy|find|purchase|pick\s+up|order)\b|"
+    r"\b(?:buy|purchase|get|find)\b[^.?!]{0,30}\b(?:near|nearby|locally|around|in\s+stock|for\s+sale)\b|"
+    r"\b(?:near|nearby|local)\b[^.?!]{0,20}\b(?:stores?|shops?|retailers?|dealers?|sellers?)\b|\bfor\s+sale\b", re.I)
+_BIG_BOX = {"homedepot.com", "lowes.com", "walmart.com", "target.com", "costco.com", "tractorsupply.com", "acehardware.com",
+            "menards.com", "harborfreight.com", "bestbuy.com", "staples.com", "officedepot.com", "samsclub.com", "kroger.com",
+            "safeway.com", "fredmeyer.com", "albertsons.com", "walgreens.com", "cvs.com", "petsmart.com", "petco.com",
+            "michaels.com", "joann.com", "hobbylobby.com", "autozone.com", "oreillyauto.com", "napaonline.com",
+            "cabelas.com", "basspro.com", "sportsmans.com", "rei.com", "dickssportinggoods.com", "northerntool.com",
+            "grainger.com", "fastenal.com", "ikea.com", "lowes.ca", "homedepot.ca", "canadiantire.ca"}
+_LOCAL_LISTINGS = {"yelp.com", "yellowpages.com", "mapquest.com", "bbb.org", "manta.com", "maps.google.com"}
+_ONLINE_ONLY = {"amazon.com", "ebay.com", "etsy.com", "wayfair.com", "aliexpress.com", "temu.com", "alibaba.com"}
+_FORUMS = {"reddit.com", "quora.com", "facebook.com", "pinterest.com", "youtube.com", "tiktok.com", "instagram.com",
+           "x.com", "twitter.com", "stackexchange.com", "stackoverflow.com", "wikipedia.org", "fandom.com", "medium.com",
+           "tumblr.com", "nextdoor.com", "answers.com", "wikihow.com"}
+
+
+def _domain_in(site: str, names: set) -> bool:
+    return any(site == n or site.endswith("." + n) for n in names)
+
+
+def _rank_for_buying(results: list, home: str) -> list:
+    """Re-order results for a "where can I buy..." question: big-box stores and local sellers first, then other sellers,
+    then pages about the product, and forum or social posts last (a subreddit is rarely local). Stable: results with the
+    same score keep the search engine's order."""
+    place = {w.lower() for w in re.findall(r"[A-Za-z][A-Za-z.'-]{2,}", home or "") if w.lower() not in {"county", "usa"}}
+
+    def score(r: dict) -> float:
+        site = _site(r.get("url", "")).lower()
+        path = urlparse(r.get("url", "") or "").path.lower()
+        title = (r.get("title") or "").strip()
+        text = f"{title} {r.get('content', '')} {path}".lower()
+        v = 0.0
+        if _domain_in(site, _BIG_BOX):
+            v += 3
+        elif _domain_in(site, _LOCAL_LISTINGS):
+            v += 2
+        elif _domain_in(site, _ONLINE_ONLY):
+            v += 0.5
+        elif _domain_in(site, _FORUMS):
+            v -= 3
+        if place and any(re.search(rf"\b{re.escape(w)}\b", text) for w in place):
+            v += 2
+        if re.search(r"/(?:stores?|locations?|store-?locator|find-a-store|shop|product|products|p|dp|ip)\b", path):
+            v += 1.5
+        if re.search(r"\b(?:in stock|add to cart|buy now|\$\s?\d)", text):
+            v += 1
+        if re.match(r"(?:how|what|why|which|best|top|where|guide|review)\b", title, re.I):
+            v -= 1.5        # a page about the product or a question, not a seller
+        return v
+
+    order = sorted(range(len(results)), key=lambda i: (-score(results[i]), i))
+    return [results[i] for i in order]
 
 
 _ADDRESS = re.compile(r"^\W*(?:(?:hey|hi|ok|okay)\W+)?(?:othos|osos|otis)\b\W*", re.I)
@@ -2611,6 +2690,7 @@ class Assistant(Agent):
         self._followup_query = ""  # a question about one story, to search
         self._user_text = ""     # what the user said this turn (tools can't see it)
         self._recent_user: list[str] = []  # their last few earlier turns (a search borrows the topic from them)
+        self._last_subject = ""            # what the last search was about ("hairless cats"): a follow-up borrows it
         self._verbatim = False   # the last tool output is ready to speak as-is
         self._say_first = ""     # spoken before the model's answer to a search
         self._force_web = False  # next web_search skips the free sources ("yes, search the web")
@@ -3231,7 +3311,7 @@ class Assistant(Agent):
     # ---- web search -------------------------------------------------------
     def _read_page(self, start: int, count: int, intro: str) -> str:
         """Results worded for speech by code: 'N. site: what it is.'"""
-        items = self._results[start:start + count]
+        items = self._results[start:start + (count if self._news else min(count, READOUT_COUNT))]
         self._cursor = start + len(items)
         if self._news:
             # a roundup, like someone catching you up; sources are on request ("where's that from?")
@@ -3255,7 +3335,7 @@ class Assistant(Agent):
             return text
         else:
             words = _ORDINALS if start == 0 else _ORDINALS[1:]  # a "more" page starts at "Next"
-            lines = [f"{words[min(i, len(words) - 1)]}, from {_site(r.get('url', ''))}: {_headline(r)}."
+            lines = [f"{words[min(i, len(words) - 1)]}, from {_site(r.get('url', ''))}: {_spoken_headline(r)}."
                      for i, r in enumerate(items)]
         more = self._cursor < len(self._results)
         tail = "Want to hear more?" if more else "That's everything I found."
@@ -3293,7 +3373,8 @@ class Assistant(Agent):
         if user and not _WEATHER_TOPIC.search(clean):
             # "What are any good recommendations?" after "I'm looking for a butcher in my area": keep the topic,
             # and "near me" / "local" becomes the user's city and state (searchctx.py)
-            clean, topic = searchctx.resolve(clean, user, self._recent_user, HOME_LOCATION)
+            clean, topic = searchctx.resolve(clean, user, self._recent_user, HOME_LOCATION,
+                                              getattr(self, "_last_subject", ""))
         if (HOME_LOCATION and _WEATHER_TOPIC.search(clean) and not _PLACE_NAMED.search(user or "")
                 and not _PLACE_NAMED.search(clean) and not sources.topic_of(f"{user} {clean}")):
             # (not "keep the solar battery warm": that's off-grid, not weather)
@@ -3401,8 +3482,13 @@ class Assistant(Agent):
                 result, engine_used = {"results": rs, "answer": None}, "Brave"
         self._results = result.get("results", [])
         self._cursor = 0
+        if self._results and _WHERE_TO_BUY.search(clean):
+            self._results = _rank_for_buying(self._results, HOME_LOCATION)
+            log.info("where-to-buy order: %s", [_site(r.get("url", "")) for r in self._results[:4]])
         if not self._results:
             return "No results found."
+        if len(clean.split()) <= 6 and not searchctx.is_generic(clean) and not _WEATHER_TOPIC.search(clean):
+            self._last_subject = topic or clean     # "hairless cats": the next "options for breeders" is about them
         if topic and not searchctx.relevant(topic, self._results, result.get("answer")):
             # nothing that came back mentions what was asked for (TV shows for a butcher): don't read it out
             log.info("search for %r came back off-topic (%d results); not read out", topic, len(self._results))
@@ -3417,6 +3503,9 @@ class Assistant(Agent):
         if as_list:
             return self._read_page(0, count, note + "Here's what I found.")
         spoken = _short_answer(_fahrenheit_only(result.get("answer")) if weather else result.get("answer"))
+        if spoken and topic and not searchctx.answer_fits(topic, spoken):
+            log.info("search answer doesn't mention %r; not spoken: %s", topic, spoken[:120])
+            spoken = ""      # (Nov 20: hairless cat breeders, answered with the Kennel Club's advice for dogs)
         if spoken and _backed_by(spoken, self._results):
             self._cursor = len(self._results)  # nothing left to page through
             self._verbatim = True

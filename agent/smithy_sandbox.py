@@ -22,6 +22,7 @@ import re
 import shutil
 import subprocess
 import time
+from contextvars import ContextVar
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -29,6 +30,14 @@ log = logging.getLogger("worker")
 steps = logging.getLogger("worker.step")
 _NO_WINDOW = 0x08000000
 PYTHON_SIGNER = "Python Software Foundation"
+# what the build is about, in plain words ("academy lessons"), set by smithy_jobs once the plan is known, so a step
+# line says what is being done for what (Nov 20, Othos main: voice reads the latest step aloud)
+ABOUT: ContextVar[str] = ContextVar("smithy_about", default="")
+
+
+def about() -> str:
+    """" for the academy lessons" (or "" when not known), to put after a step's verb."""
+    return f" for the {ABOUT.get()}" if ABOUT.get() else ""
 
 
 def is_test(rel: str) -> bool:
@@ -215,7 +224,7 @@ def run_tests(job_id: int, folder: Path, rels: list[str], cfg: dict, results_dir
     limit = time.monotonic() + 60 * float(cfg.get("sandbox_minutes", 15))
     sid, viewer = "", None
     try:
-        steps.info("Running the tests in a throwaway Windows Sandbox (networking off): %s.", ", ".join(tests))
+        steps.info("Running the tests%s in a throwaway Windows Sandbox (networking off): %s.", about(), ", ".join(tests))
         code, out = _wsb("start", "--config", _config(kit), "--raw", timeout=180)
         m = re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", out, re.I)
         if code != 0 or not m:
