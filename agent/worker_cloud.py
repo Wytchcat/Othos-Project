@@ -106,7 +106,7 @@ PROVIDERS: dict[str, Provider] = {p.name: p for p in [
     Provider("huggingface", "Hugging Face", "openai", "https://router.huggingface.co/v1", "HF_TOKEN", "openai/gpt-oss-120b",
              alt_env=("HUGGINGFACE_API_KEY", "HUGGINGFACEHUB_API_TOKEN", "HF_API_KEY")),
     # Puter (added Nov 15 2026, the user: "Let's set it up"): its OpenAI-compatible address, so no Puter.js / Node.
-    # The key is the account's auth token (puter.com/dashboard, Account, API token): anyone with it can act as her
+    # The key is the account's auth token (puter.com/dashboard, Account, API token): anyone with it can act as the user
     # on Puter. Calls are billed to that account. It passes requests on to many companies' models, and its pages
     # don't say what they may keep, so it counts as "trains" (refused until accept_data_use lists it). No default
     # model: none was confirmed by a real call, so one is typed in the Providers window (cloud.models.puter).
@@ -123,7 +123,7 @@ PROVIDERS: dict[str, Provider] = {p.name: p for p in [
 # figures as the first. Shown in the Providers window once "Add a 2nd key" is pressed (cloud.second_keys) or a key
 # for it is saved.
 def _second(p: Provider) -> Provider:
-    # every name the first key goes by, with _2 (Nov 16: hers is CEREBRAS_AI_KEY, so the second was CEREBRAS_AI_KEY_2)
+    # every name the first key goes by, with _2 (Nov 16: the user's is CEREBRAS_AI_KEY, so the second was CEREBRAS_AI_KEY_2)
     return Provider(f"{p.name}-2", f"{p.spoken} (2nd key)", p.kind, p.base_url, f"{p.key_env}_2", p.model,
                     alt_env=tuple(f"{a}_2" for a in p.alt_env), trains=p.trains, note=f"A second {p.spoken} account's key. Switching uses it like any other "
                     f"provider, so it can go on when the first account's day is used up.",

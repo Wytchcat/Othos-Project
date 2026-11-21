@@ -85,7 +85,7 @@ def _cloud(argv: list[str]) -> bool:
     import worker_cloud
     import worker_shared
     cmd = argv[1] if len(argv) > 1 else ""
-    if cmd == "reply":                                   # her answer to a plan: yes | no | answers / changes
+    if cmd == "reply":                                   # the user's answer to a plan: yes | no | answers / changes
         rest = argv[3:]
         build_now = "--build" in rest                  # the app's "Build with these answers"
         rest = [r for r in rest if r != "--build"]

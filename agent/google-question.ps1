@@ -2,7 +2,7 @@
 # Same words as the installer's page (google-prompt.txt); same record (state\google-prompt.json), so you are never asked twice.
 #   Asked only when run by a person in a console (the installer shows its own page, and its output is redirected),
 #   and only when the record allows it: not when "dont_ask_again" is true or the answer was "connect".
-# Nothing is connected here and no network call is made: "y" opens the Connect Google window (google-connect.ps1), where she signs in.
+# Nothing is connected here and no network call is made: "y" opens the Connect Google window (google-connect.ps1), where the user signs in.
 param([switch]$Force, [string]$Reply = $null, [string]$StateDir = "")
 
 $A = $PSScriptRoot

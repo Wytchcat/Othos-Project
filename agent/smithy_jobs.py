@@ -41,6 +41,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 from pathlib import Path, PurePosixPath
 
@@ -632,7 +633,7 @@ def _changed_tests(old: str, new: str, names: set[str]) -> list[str]:
 
 # -- a test correction that checks less than before (Nov 18, task 60: test_personal_glossary_sentence_not_kept, judged
 # wrong, went from checking json.dumps(entry), the whole saved entry, to entry.get("lesson") alone, and from 5 words
-# to 3; it kept its one assertion and her sentence, so no guard saw it)
+# to 3; it kept its one assertion and the user's sentence, so no guard saw it)
 _ASSERT_TARGET = {"assertIn": 1, "assertNotIn": 1, "assertRegex": 0, "assertNotRegex": 0, "assertCountEqual": 0}
 
 
@@ -1011,11 +1012,20 @@ def request_retests(request: str) -> set[str]:
     "Not in my glossary yet:" line, and "test_request.py holds the tests written from the request and a fix doesn't
     change them" refused it, so the miswritten tests could never pass; the user: "fix the smithy, not the request".)"""
     out: set[str] = set()
+    for sentence in retest_sentences(request):
+        out |= set(re.findall(r"\b(test_\w+)\b", sentence)) - {"test_request"} or {"*"}
+    return out
+
+
+def retest_sentences(request: str) -> list[str]:
+    """The request's sentences that ask for its own tests to change (request_retests), as written: told to the judge
+    and to the step that corrects those tests, so both work from the request's own words (Nov 21, task 70)."""
+    out: list[str] = []
     for sentence in re.split(r"\n\s*\n|(?<=[.;])\s+(?=[A-Z(])|\n(?=\s*(?:[-*]|\(?[a-z0-9]\)|\d+\.)\s)", request or ""):
         who = _RETEST_WHO.search(sentence)              # the tests named first, then what's done to them,
         if who and (_RETEST_DO.search(sentence, who.end())   # or an order right before them ("Correct test_request.py")
                     or re.search(r"\b(?:change|rewrite|correct|update)\W+(?:\w+\W+){0,2}$", sentence[:who.start()], re.I)):
-            out |= set(re.findall(r"\b(test_\w+)\b", sentence)) - {"test_request"} or {"*"}
+            out.append(" ".join(sentence.split()))
     return out
 
 
@@ -2043,7 +2053,7 @@ def build_problems(folder: Path, rels: list[str], stdlib_only: bool = False,
             checked.append("unittest.main() placed so the tests run")
         for r in py:
             text = (folder / r).read_text(encoding="utf-8-sig", errors="replace")
-            problems += stdlib_patch_problems(r, text) + delete_problems(r, text) \
+            problems += stdlib_patch_problems(r, text) + delete_problems(r, text) + doubled_escape_problems(r, text) \
                 + ([] if net_ok else network_problems(r, text))
         checked.append("no change to Python's own modules, no deleting outside the build"
                        + ("" if net_ok else ", no network use (the request doesn't ask for it)"))
@@ -2284,6 +2294,32 @@ def network_problems(rel: str, text: str) -> list[str]:
             if mod.split(".")[0] in _NET_MODULES:
                 out.append(f"{rel} line {node.lineno}: it imports {mod}, for network use, which the request never "
                            "asks for. Take it out: the program works on this PC without the network")
+    return out
+
+
+_DOUBLED = re.compile(r"\\\\[bBwWdDsS]")
+
+
+def doubled_escape_problems(rel: str, text: str) -> list[str]:
+    """A raw string with a doubled backslash before a regex letter (r"\\\\b", r"\\\\w", r"\\\\d", r"\\\\s"): in a raw
+    string that means a literal backslash, so the pattern never matches what it was written for. Python accepts it
+    and ruff and pyright don't flag it (Nov 21, task 70: academy_mine.py's topic pattern had r"\\\\b..." throughout,
+    so ALL-CAPS words like JSON never matched and the personal glossary dropped them, check (j), in four runs)."""
+    import io
+    import tokenize
+    out = []
+    try:
+        toks = list(tokenize.generate_tokens(io.StringIO(text).readline))
+    except (tokenize.TokenError, SyntaxError, IndentationError):
+        return []
+    for tok in toks:
+        if tok.type != tokenize.STRING:
+            continue
+        prefix = re.match(r"[A-Za-z]*", tok.string).group(0).lower()
+        if "r" in prefix and (m := _DOUBLED.search(tok.string)):
+            out.append(f"{rel} line {tok.start[0]}: the raw string has {m.group(0)}, a doubled backslash: in a raw "
+                       f"string that's a literal backslash, so the pattern never matches. Write \\{m.group(0)[-1]} "
+                       "(one backslash) in a raw string")
     return out
 
 
@@ -3380,6 +3416,62 @@ def uncovered_checks(checks: list[str], tests_src: str) -> list[str]:
     return [c for c in checks if _plain(c.split(": ", 1)[-1])[:60] not in have]
 
 
+def corrected_funcs(reply: str, names: set[str]) -> tuple[dict[str, str], list[str]]:
+    """From a model's reply: ({test name: its source, dedented}, the top-level import lines), for the named tests only;
+    ({}, []) when the reply doesn't parse."""
+    body = _strip_outer_fence(reply or "", False)
+    try:
+        tree = ast.parse(body)
+    except SyntaxError:
+        return {}, []
+    lines = body.splitlines()
+    funcs = {}
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in names and n.name not in funcs:
+            start = min([d.lineno for d in n.decorator_list] + [n.lineno])
+            funcs[n.name] = textwrap.dedent("\n".join(lines[start - 1:n.end_lineno]))
+    imports = [ast.get_source_segment(body, n) or "" for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))]
+    return funcs, [i for i in imports if i]
+
+
+def replace_funcs(text: str, funcs: dict[str, str], imports: list[str] = ()) -> str:
+    """The test file with each named function replaced by the given source (at the old one's indentation), and any of
+    `imports` it lacks added after its last top-level import."""
+    tree = ast.parse(text)
+    lines = text.splitlines()
+    spots = []
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in funcs:
+            start = min([d.lineno for d in n.decorator_list] + [n.lineno])
+            spots.append((start, n.end_lineno, n.col_offset, n.name))
+    for start, end, col, name in sorted(spots, reverse=True):
+        new = textwrap.indent(funcs[name].strip("\n"), " " * col).splitlines()
+        lines[start - 1:end] = new
+    have = {" ".join(x.split()) for x in lines}
+    missing = [i for i in imports if " ".join(i.split()) not in have]
+    if missing:
+        last = max([n.end_lineno for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))] or [0])
+        lines[last:last] = missing
+    return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+
+
+def _correct_tests_messages(request: str, said: list[str], tests_src: str, written: dict[str, str]) -> list[dict]:
+    code = "\n\n".join(f"--- {r} (outline) ---\n{outline(r, written[r])}" for r in sorted(written)
+                       if r.endswith(".py") and not _is_test(r))
+    return [{"role": "system", "content": SYSTEM},
+            {"role": "user", "content": "The request (it decides):\n\n" + redact(request[:12000])
+             + "\n\nThe request itself says its own tests are wrong and must change:\n- " + "\n- ".join(said)
+             + "\n\nThe program's Python files (outlines):\n\n" + code},
+            {"role": "user", "content":
+             f"These tests in {REQUEST_TESTS} were written for an earlier request and fail. Correct each one so it does "
+             "what the request says, for example: look only at the line the request names, or set up its own small "
+             "stand-in data (in a temporary folder) instead of reading the project's real files, when the request says "
+             "so. Keep each test's name. Keep every check the request asks for, as strictly as before; never skip a "
+             "test and never take out an assertion. Call the code exactly as the outlines show.\n\n```python\n"
+             + tests_src + "\n```\n\nReply with one Python code block: any imports these tests need, then "
+             "`class Corrected(unittest.TestCase):` holding only these test methods, corrected."}]
+
+
 def add_request_tests(tests_src: str, new_src: str) -> str:
     """`tests_src` with the tests of `new_src` (its own imports and class) put before the `if __name__` guard."""
     guard = re.compile(r'(?m)^if __name__ == [\'"]__main__[\'"]:.*(?:\n[ \t]+.*)*\s*$')
@@ -3988,6 +4080,76 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
                                  f"tests added for the {len(new_checks)} checks of this request that no test there "
                                  "quoted; the earlier tests stay.")
                     smithy_diagnose.record(hist, "request_tests_added", checks=len(new_checks))
+            # the request says its own tests are wrong: those that failed in the earlier version (or the ones it names)
+            # are corrected ONCE here, by a strong model with the request in hand, before any fix round (Nov 21, task
+            # 70: 92c9e58 let fixes change them, but the checklist called (c) done, the judge blamed the code, and an
+            # older guard refused a correction, so 17 of task 68's 18 failing tests still failed)
+            said = retest_sentences(p.get("change") or p.get("request", ""))
+            done_before = any(r.get("kind") == "request_tests_corrected" for r in smithy_diagnose.read(hist))
+            if said and not done_before:
+                own = set(_func_nodes(written[REQUEST_TESTS])) - {
+                    n for n in _func_nodes(written[REQUEST_TESTS]) if n.startswith(f"test_t{job_id}_")}
+                wanted = (retest - {"*"}) if retest - {"*"} else (
+                    parent_failing(SMITHY.results_dir, int(p["parent_id"])) or set() if p.get("parent_id") else set())
+                todo = sorted(n for n in wanted & own if n.startswith("test"))
+                if todo:
+                    steps.info("The request says its own tests are wrong: correcting %d of them once, before the "
+                               "fix rounds (%s).", len(todo), ", ".join(todo[:6]) + (", ..." if len(todo) > 6 else ""))
+                    before = written[REQUEST_TESTS]
+                    nodes = _func_nodes(before)
+                    src = "\n\n".join(textwrap.dedent(ast.get_source_segment(before, nodes[n]) or "") for n in todo)
+                    try:
+                        with worker_shared.strong_models(float(ctx.cfg.get("rewrite_min_model_b", 70) or 0)):
+                            reply = ctx.chat(_correct_tests_messages(p.get("change") or p.get("request", ""), said,
+                                                                     src, written), 8000)
+                    except (BudgetOut, TooLongForLocal):
+                        raise
+                    except (worker_cloud.NoStrongModel, RuntimeError, ValueError) as e:
+                        reply = ""
+                        steps.info("The request's own tests weren't corrected: %s.", e)
+                    funcs, imports = corrected_funcs(reply, set(todo))
+                    kept_c, refused_c = {}, []
+                    for n, fsrc in funcs.items():            # each one under the guards that never weaken a test
+                        old_f = textwrap.dedent(ast.get_source_segment(before, nodes[n]) or "")
+                        try:
+                            fewer = _assert_count(old_f) > _assert_count(fsrc)
+                        except SyntaxError:
+                            fewer = True
+                        why = "it takes out an assertion" if fewer else added_skips(old_f, fsrc)
+                        if why:
+                            refused_c.append(f"{n} ({why})")
+                        else:
+                            kept_c[n] = fsrc
+                    after = before
+                    if kept_c:
+                        try:
+                            after = replace_funcs(before, kept_c, imports)
+                            ast.parse(after)
+                            weaker = {w.split(":")[0].split()[0] for w in weakened_tests(before, after)}
+                            if weaker & set(kept_c):             # checks less than before: that one stays as it was
+                                refused_c += [f"{n} (it checks less than before)" for n in sorted(weaker & set(kept_c))]
+                                kept_c = {n: s for n, s in kept_c.items() if n not in weaker}
+                                after = replace_funcs(before, kept_c, imports) if kept_c else before
+                            problems_before = len(_own_problems(REQUEST_TESTS))
+                            target.write_text(after, encoding="utf-8")
+                            if len(_own_problems(REQUEST_TESTS)) > problems_before:   # calls the code wrongly
+                                refused_c.append("all of them (they add build problems)")
+                                kept_c, after = {}, before
+                                target.write_text(before, encoding="utf-8")
+                        except SyntaxError:
+                            refused_c.append("all of them (the file didn't parse)")
+                            kept_c, after = {}, before
+                            target.write_text(before, encoding="utf-8")
+                    written[REQUEST_TESTS] = after
+                    if kept_c:
+                        notes.append(f"`{REQUEST_TESTS}`: corrected {', '.join(sorted(kept_c))} once, before the fix "
+                                     "rounds, because the request says its own tests are wrong: "
+                                     + "; ".join(f'"{s[:160]}"' for s in said[:2]))
+                    if refused_c or len(funcs) < len(todo):
+                        notes.append(f"`{REQUEST_TESTS}`: not corrected: " + ", ".join(
+                            refused_c + [f"{n} (no correction came back)" for n in todo if n not in funcs]))
+                    smithy_diagnose.record(hist, "request_tests_corrected", tests=sorted(kept_c),
+                                           refused=refused_c[:20], asked=todo)
         elif (checks_asked := _request_checks(items)):
             steps.info("Writing %s: one test for each of the request's %d checks and rules.", REQUEST_TESTS,
                        len(checks_asked))
@@ -4394,7 +4556,16 @@ def _verify_build(ctx, job_id: int, p: dict, desc: str, plan: dict, folder: Path
                     srcs = _test_funcs(folder / t, [n for n in failing if n in to_judge])
                     pending = [n for n in failing if n in to_judge]
                     code_seen = {r: written[r] for r in named if r != t and r in written}
-                    found = judge_tests(ctx, request_text, {n: srcs.get(n, "") for n in pending}, full, code_seen,
+                    # the request's own words when it says its own tests are wrong, spelled out for the judge (Nov 21,
+                    # task 70: 6 of 7 such tests were judged CODE, and the fixes went to code that can't satisfy them)
+                    said_wrong = retest_sentences(p.get("change") or p.get("request", "")) \
+                        if t == REQUEST_TESTS and retest else []
+                    judge_request = request_text + (
+                        "\n\nThe request itself says its own tests (in " + REQUEST_TESTS + ") are wrong and must change:\n- "
+                        + "\n- ".join(said_wrong) + "\nA test here that does what those words rule out is wrong (TEST), "
+                        "even when the code doesn't satisfy it either; judge CODE only for what the request asks of "
+                        "the code." if said_wrong else "")
+                    found = judge_tests(ctx, judge_request, {n: srcs.get(n, "") for n in pending}, full, code_seen,
                                         float(ctx.cfg.get("rewrite_min_model_b", 70) or 0)) if pending else {}
                     for n in pending:
                         verdict = found.get(n)
@@ -4727,7 +4898,7 @@ def tidy_text(work: dict) -> str:
 
 
 def discard_superseded() -> list[int]:
-    """Discards the replaced versions (their drafts too). Only on her say-so: smithy.py tidy --discard."""
+    """Discards the replaced versions (their drafts too). Only on the user's say-so: smithy.py tidy --discard."""
     import shutil
     gone = []
     for s in open_work()["superseded"]:
@@ -4742,10 +4913,10 @@ def discard_superseded() -> list[int]:
 # the user: "Build for The Smithy to read a prompt, ask for clarification where needed, create a plan
 # offered with a yes/no prompt and make any adaptations for further user input." A new build is a
 # proposal first (build_ask_first, on): its questions, what doesn't fit together, what it will assume, and
-# the plan, then it waits. Her reply (smithy.py reply ID TEXT, or the app's Plan window): yes builds it
+# the plan, then it waits. The user's reply (smithy.py reply ID TEXT, or the app's Plan window): yes builds it
 # with that plan, no drops it, anything else is answers or changes and gets a revised proposal.
 def ask_first(cfg: dict, p: dict) -> bool:
-    """Whether this build is proposed first (not a new version, not one she already said yes to)."""
+    """Whether this build is proposed first (not a new version, not one the user already said yes to)."""
     return bool(cfg.get("build_ask_first", True)) and not p.get("no_ask") and not p.get("plan_task") \
         and not p.get("parent_id")
 
@@ -4948,7 +5119,7 @@ def request_facts(request: str, limit_chars: int = 3500) -> str:
     return "\n".join(out)[:limit_chars]
 
 
-# -- what The Smithy can't do here, said before she says yes (suggestion 6)
+# -- what The Smithy can't do here, said before the user says yes (suggestion 6)
 _UNCHECKED_EXT = {".php", ".css", ".scss", ".js", ".jsx", ".ts", ".tsx", ".html", ".sql", ".sh", ".yml", ".yaml"}
 
 
@@ -4968,7 +5139,7 @@ def build_limits(plan: dict, request: str, cfg: dict) -> list[str]:
     return out
 
 
-# -- cost and time, before she says yes (suggestion 2): its own token limit, and what earlier builds of
+# -- cost and time, before the user says yes (suggestion 2): its own token limit, and what earlier builds of
 # about this size really used (each result's first line: "N cloud tokens, ... S s")
 _SPENT = re.compile(r"([\d,]+) cloud tokens.*?(\d+) s,")
 
@@ -5058,7 +5229,7 @@ def cloud_note(cfg: dict) -> str:
 
 
 def plan_changes(before: dict, after: dict) -> list[str]:
-    """What a revised plan changed, in plain words (so she can see her answers took effect)."""
+    """What a revised plan changed, in plain words (so the user can see their answers took effect)."""
     out = []
     files_b = {f["path"] for f in (before.get("plan") or {}).get("files", [])}
     files_a = {f["path"] for f in after["plan"].get("files", [])}
@@ -5083,7 +5254,7 @@ def plan_changes(before: dict, after: dict) -> list[str]:
 
 
 def proposal_text(prop: dict) -> str:
-    """The proposal as she reads it (the result, voice, and the app's Plan window)."""
+    """The proposal as the user reads it (the result, voice, and the app's Plan window)."""
     out = []
     if prop.get("changes"):
         out.append("## What changed since the last plan\n\n" + "\n".join(f"- {c}" for c in prop["changes"]))
@@ -5122,7 +5293,7 @@ def _build_budget(ctx) -> int:
 
 
 def run_proposal(ctx, p: dict):
-    """Read the request, ask what's unclear, propose a plan; nothing is built. Waits for her reply."""
+    """Read the request, ask what's unclear, propose a plan; nothing is built. Waits for the user's reply."""
     job_id = ctx.row["id"]
     max_files = int(ctx.cfg.get("max_build_files", 20))
     earlier = None
@@ -5158,7 +5329,7 @@ def run_proposal(ctx, p: dict):
             "answers": earlier["answers"] if earlier else [], "revises": p.get("proposal_of"),
             "asked": time.time()}
     prop["conflicts"] += layout_conflicts(prop)        # a default that contradicts the real files (in code)
-    if p.get("proposal_of"):                            # what her answers changed (suggestion 8)
+    if p.get("proposal_of"):                            # what the user's answers changed (suggestion 8)
         prop["changes"] = plan_changes(load_proposal(p["proposal_of"]) or {}, prop)
     try:
         prop["cost"] = cost_line(plan, {"request": request}, ctx.cfg, _build_budget(ctx))
@@ -5209,7 +5380,7 @@ def _mark(job_id: int, status: str, text: str) -> None:
 
 
 def reply_to_proposal(job_id: int, text: str, build_now: bool = False) -> str:
-    """Her reply to a proposal: yes -> the build is queued with that plan; no -> dropped; anything else ->
+    """The user's reply to a proposal: yes -> the build is queued with that plan; no -> dropped; anything else ->
     a revised proposal is queued. build_now (the app's "Build with these answers"): the answers are added
     and it's built straight away, without a revised plan. Returns what was done, in plain words."""
     prop = load_proposal(job_id)
@@ -5462,7 +5633,7 @@ def _set_own_limit(ctx, job_id: int, plan: dict, p: dict, budget: int, parent: d
                                      len(numbered_items(p.get("change", ""))) if parent else 0)
     least = int(cc.get("max_tokens_per_task", 200_000))
     # each second key that's On adds another ceiling's worth (Nov 16, the user: a task stopped at 600,000 the
-    # minute her second Cerebras key came in, which "defeats the purpose of the second key completely")
+    # minute the user's second Cerebras key came in, which "defeats the purpose of the second key completely")
     extra = worker_cloud.second_keys_on(cc)
     most = max(least, int(cc.get("auto_task_tokens_max", 600_000))) * (1 + len(extra))
     limit = min(max(est, least), most)
@@ -5499,10 +5670,10 @@ def run_build(ctx, p: dict):
                                                           "(the first version's request wasn't found)")
              + f"\n\nNew version {p.get('version', '')}: {p['change']}"}
 
-    # 0. a new build is a proposal first: questions and a plan, then it waits for her yes (Nov 14)
+    # 0. a new build is a proposal first: questions and a plan, then it waits for the user's yes (Nov 14)
     if p.get("proposal_of") or (not parent and ask_first(ctx.cfg, p)):
         return run_proposal(ctx, p)
-    if p.get("plan_task") and not plan_path.exists():     # the plan she said yes to
+    if p.get("plan_task") and not plan_path.exists():     # the plan the user said yes to
         agreed = results / f"{int(p['plan_task']):05d}-plan.json"
         if agreed.exists():
             shutil.copyfile(agreed, plan_path)
@@ -5836,7 +6007,7 @@ def _check_build(p, joomla: bool = False):
     if p.get("no_ask"):                                      # build straight away, no plan to answer first
         out["no_ask"] = True
     # a plan's links, kept: the worker checks every task's params again before it runs (Nov 14, task 46 lost
-    # plan_task and planned again; tasks 44 and 45 lost proposal_of and her answers)
+    # plan_task and planned again; tasks 44 and 45 lost proposal_of and the user's answers)
     for key in ("plan_task", "proposal_of"):
         if p.get(key):
             out[key] = int(p[key])

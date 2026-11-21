@@ -223,7 +223,7 @@ def _email_from(id_token: str) -> str:
 
 
 def forbidden_reason(r: httpx.Response) -> str:
-    """Google's real reason for a 403, in plain words. Nov 18: the Calendar API was switched off in her own Google
+    """Google's real reason for a 403, in plain words. Nov 18: the Calendar API was switched off in the user's own Google
     project, and every 403 was reported as "permission not given". Never includes the project number."""
     try:
         err = r.json().get("error")

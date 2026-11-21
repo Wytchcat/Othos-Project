@@ -352,7 +352,7 @@ _COUNT_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "couple": 
 _LATEST = re.compile(r"\b(?:last|latest|newest|most\s+recent|recent)\s+(?:(?P<n>one|two|three|four|five|couple(?:\s+of)?|"
                      r"few|[1-5])\s+)?(?:(?:task|coding|build)\s+)?(?P<what>results?|tasks?|reviews?|builds?)\b", re.I)
 LAST_WHO_SECONDS = 300   # "its last results" means the worker talked about within this long
-QUIET_SECONDS = 3.0      # an announcement waits this long after speech-to-text last heard her
+QUIET_SECONDS = 3.0      # an announcement waits this long after speech-to-text last heard the user
 
 
 def _not_running(q: Queue) -> str:
@@ -466,16 +466,16 @@ class WorkersVoice:
         self.tm_asking = False                                      # asked "a particular task or the current one?"
         self._step_pos: dict[str, int] = {}                         # how far each steps file has been read
         # "While you were away, N tasks finished. Want to hear about them?" (the user, Nov 14: not read
-        # out unasked). The tasks asked about, and when; they're marked heard on her answer.
+        # out unasked). The tasks asked about, and when; they're marked heard on the user's answer.
         self.away: list | None = None
         self._away_ts = 0.0
-        self._away_skip: set[tuple[str, int]] = set()               # not read this call (she moved on)
-        # a Smithy build's plan waiting for her answer (smithy_jobs.run_proposal), once it's been told or
+        self._away_skip: set[tuple[str, int]] = set()               # not read this call (the user moved on)
+        # a Smithy build's plan waiting for the user's answer (smithy_jobs.run_proposal), once it's been told or
         # read: {"q", "id", "stage": "intro" | "decide" | "confirm", "text", "ts"}. Conversational: yes
         # builds it, no leaves it waiting (never dropped by voice), anything else is read back first.
         self.plan_pending: dict | None = None
         self._last_who: tuple[str | None, float] = (None, 0.0)       # the worker last named, for "its last results"
-        self._last_heard = 0.0                                      # when speech-to-text last heard her (any piece)
+        self._last_heard = 0.0                                      # when speech-to-text last heard the user (any piece)
 
     # -- one turn: a reply from code ('' = say nothing), or None for "not about the workers"
     def handle(self, text: str) -> str | None:
@@ -696,7 +696,7 @@ class WorkersVoice:
         provider, self._provider = getattr(self, "_provider", None), None
         try:
             params = jt.check(raw)
-            if provider:                                   # checked now, so she hears why straight away
+            if provider:                                   # checked now, so the user hears why straight away
                 cfg = worker_shared.load_json(Path(__file__).parent / ("smithy.json" if target == "smithy" else "worker.json"))
                 worker_cloud.pick(cfg, {"provider": provider}, kind)
                 params["provider"] = provider
@@ -725,7 +725,7 @@ class WorkersVoice:
         return said
 
     def _open_answer(self, offer: dict, text: str) -> str | None:
-        """Her answer to "Shall I open it and queue this?" (None: something else; nothing is queued)."""
+        """The user's answer to "Shall I open it and queue this?" (None: something else; nothing is queued)."""
         ans = worker_shared.answer(text) if len(text.split()) <= 6 else None
         if ans == "no":
             return "Okay, I haven't queued it."
@@ -939,7 +939,7 @@ class WorkersVoice:
         self.reading = (name, rest, 0)
         return f"{name}, {_title(q, job)}. {summary} Say read the rest for the full result, or show me {name}."
 
-    # -- a build's plan waiting for her answer (Nov 14)
+    # -- a build's plan waiting for the user's answer (Nov 14)
     def _plan_hook(self, q, j) -> str:
         """After a plan's summary is said: the question that goes with it, and remember it's asked."""
         if q.key != "smithy" or j["status"] != "review":
@@ -954,7 +954,7 @@ class WorkersVoice:
 
     def _plan_answer(self, text: str) -> str | None:
         pp = self.plan_pending
-        if time.time() - pp["ts"] > PLAN_ANSWER_SECONDS:      # she moved on: not asked again
+        if time.time() - pp["ts"] > PLAN_ANSWER_SECONDS:      # the user moved on: not asked again
             self.plan_pending = None
             return None
         q, n = pp["q"], pp["id"]
@@ -984,7 +984,7 @@ class WorkersVoice:
             if ans == "no":
                 pp["stage"] = "decide"
                 return "Okay. Shall I build it as it is, or would you like to change something?"
-            pp["stage"] = "decide"                             # straight to her answers
+            pp["stage"] = "decide"                             # straight to the user's answers
         if pp["stage"] == "decide":
             if ans == "yes":
                 self.plan_pending = None
@@ -1110,8 +1110,8 @@ class WorkersVoice:
         word = "Keep" if verdict == "kept" else "Discard"
         return f"{word} {_name(q, job_id)}, {_title(q, job)}? Say yes or no."
 
-    # -- "While you were away...": asked first, read only if she wants it. Conversational, not a
-    # code-checked gate (it only reads a list; nothing is sent or applied). Her next reply answers it,
+    # -- "While you were away...": asked first, read only if the user wants it. Conversational, not a
+    # code-checked gate (it only reads a list; nothing is sent or applied). The user's next reply answers it,
     # or it's dropped: something else is just carried on with, and it isn't asked again this call.
     @staticmethod
     def _is_plan(q, j) -> bool:
@@ -1119,8 +1119,8 @@ class WorkersVoice:
 
     def _away_question(self, jobs) -> str:
         """Asked after the greeting's well-being exchange, not in the greeting (the user, Nov 20: inside the greeting it
-        broke the flow): 'A task finished since we last spoke. Want to hear about it?' Plans waiting for her answer
-        come first, since they're the ones that need her (Nov 14, suggestion 5)."""
+        broke the flow): 'A task finished since we last spoke. Want to hear about it?' Plans waiting for the user's answer
+        come first, since they're the ones that need the user (Nov 14, suggestion 5)."""
         plans = sum(1 for q, j in jobs if self._is_plan(q, j))
         rest = len(jobs) - plans
         bits = []
@@ -1133,7 +1133,7 @@ class WorkersVoice:
         return f"{text[0].upper()}{text[1:]}. Want to hear about {what}?"
 
     def _she_has_spoken(self) -> bool:
-        """She has said something in this call (so the greeting's well-being exchange has begun)."""
+        """The user has said something in this call (so the greeting's well-being exchange has begun)."""
         try:
             items = list(getattr(getattr(self.session, "history", None), "items", []) or [])
         except Exception:
@@ -1172,7 +1172,7 @@ class WorkersVoice:
               or worker_shared.answer(text) == "yes"):
             ans = "yes"
         else:
-            self._away_drop()                          # something else: carry on with what she said
+            self._away_drop()                          # something else: carry on with what the user said
             return None
         self.away = None
         for q, j in jobs:                              # heard (or skipped): still there by "list" / "read me task N"
@@ -1180,7 +1180,7 @@ class WorkersVoice:
         log.info("workers: away list %s for %s", "read" if ans == "yes" else "skipped",
                  [_name(q, j["id"]) for q, j in jobs])
         if ans == "no" and len(re.findall(r"\w+", text)) > 4:
-            return None                                # "no, what's the time?": skipped, and her question answered
+            return None                                # "no, what's the time?": skipped, and the user's question answered
         return self._away_reply_text(jobs).strip() if ans == "yes" else "Okay."
 
     # -- "it's ready" announcements, between turns only
@@ -1194,8 +1194,8 @@ class WorkersVoice:
         return out
 
     def _out_answer(self, text: str) -> str | None:
-        """Her answer to the free-tokens question, or "finish task 3 on this PC" at any time.
-        This PC only on a clear yes (worker_shared.answer) or her own "finish it on this PC" with
+        """The user's answer to the free-tokens question, or "finish task 3 on this PC" at any time.
+        This PC only on a clear yes (worker_shared.answer) or the user's own "finish it on this PC" with
         no "no" word in it; anything else, or nothing, leaves it waiting. The question is used up
         by the first reply, so a later "yes" to something else can't count."""
         m = _OUT_LOCAL.search(text)
@@ -1240,7 +1240,7 @@ class WorkersVoice:
         return "Do you want a particular task or the current one?"
 
     def _task_mode_answer(self, text: str) -> str | None:
-        """Her answer to "a particular task or the current one?" (None: not an answer; the question lapses)."""
+        """The user's answer to "a particular task or the current one?" (None: not an answer; the question lapses)."""
         if _TM_NEVER.search(text) or worker_shared.answer(text) == "no":
             return "Okay, task mode stays off."
         who, t = _who(text)
@@ -1337,7 +1337,7 @@ class WorkersVoice:
 
     def _say_steps(self) -> bool:
         if self.howto.recording and not self.howto.paused:
-            return False                               # never over her how-to narration: held until it pauses or ends
+            return False                               # never over the user's how-to narration: held until it pauses or ends
         new = self._new_steps()
         if not new:
             return False
@@ -1365,9 +1365,9 @@ class WorkersVoice:
             self._announcer = asyncio.create_task(self._announce_loop())
 
     def _othos_asking(self) -> bool:
-        """Othos's own last reply is a question she hasn't answered yet (Nov 16: "Can I look up some local
-        options for you?" and, 1.7 s later, the away question: her "Sure." answered both). Announcements that
-        ask something wait until she has."""
+        """Othos's own last reply is a question the user hasn't answered yet (Nov 16: "Can I look up some local
+        options for you?" and, 1.7 s later, the away question: the user's "Sure." answered both). Announcements that
+        ask something wait until the user has."""
         try:
             items = list(getattr(self.session.history, "items", []) or [])
         except Exception:
@@ -1381,11 +1381,11 @@ class WorkersVoice:
         return False
 
     def heard(self) -> None:
-        """Speech-to-text heard a piece of what she said (called for every piece, finished or not)."""
+        """Speech-to-text heard a piece of what the user said (called for every piece, finished or not)."""
         self._last_heard = time.monotonic()
 
     def _owes_reply(self) -> bool:
-        """Her last words haven't been answered yet (the newest message in the call is hers)."""
+        """The user's last words haven't been answered yet (the newest message in the call is theirs)."""
         try:
             items = list(getattr(getattr(self.session, "history", None), "items", []) or [])
         except Exception:
@@ -1398,8 +1398,8 @@ class WorkersVoice:
 
     def _between_turns(self) -> bool:
         # The voice detector can fall behind when the PC is busy (Nov 19: Discord opening put it 19 s behind), and
-        # then says she's quiet while she's mid-sentence. So also wait until speech-to-text has heard nothing for a
-        # few seconds and her last words have had their reply (the away question came out in the middle of hers).
+        # then says the user is quiet while they're mid-sentence. So also wait until speech-to-text has heard nothing for a
+        # few seconds and the user's last words have had their reply (the away question came out in the middle of theirs).
         s = self.session
         return (getattr(s, "agent_state", "") == "listening" and getattr(s, "user_state", "") != "speaking"
                 and (s.current_speech is None or s.current_speech.done())
@@ -1414,9 +1414,9 @@ class WorkersVoice:
                     log.info("workers: no answer to the away question; dropped for this call")
                     self._away_drop()
                 if self.away is not None:
-                    pass                                # waiting for her answer: nothing else is announced
+                    pass                                # waiting for the user's answer: nothing else is announced
                 elif self._between_turns():
-                    asking = self._othos_asking()          # her answer to Othos comes first
+                    asking = self._othos_asking()          # the user's answer to Othos comes first
                     for q, st in ([] if asking else await asyncio.to_thread(self._waiting_out)):
                         key = (q.key, int(st["task_id"]))
                         if key in self._asked_out or st.get("out_choice"):
@@ -1445,7 +1445,7 @@ class WorkersVoice:
                         await asyncio.sleep(5)
                         continue
                     if jobs and not first and asking and self._is_plan(*jobs[0]):
-                        await asyncio.sleep(5)              # a plan's "is ready" asks too: after her answer
+                        await asyncio.sleep(5)              # a plan's "is ready" asks too: after the user's answer
                         continue
                     if jobs:
                         if first and not self._she_has_spoken():
@@ -1462,7 +1462,7 @@ class WorkersVoice:
                         else:
                             q, j = jobs[0]
                             text, done = f"{_name(q, j['id'])}, {_title(q, j)}, is ready. {_brief_summary(q, j)}", [jobs[0]]
-                            text += self._plan_hook(q, j)       # a plan: asks for her answer
+                            text += self._plan_hook(q, j)       # a plan: asks for the user's answer
                         for q, j in done:
                             await asyncio.to_thread(q.mark_announced, j["id"])
                         log.info("workers: announced %s", [_name(q, j["id"]) for q, j in done])
@@ -1481,7 +1481,7 @@ _OUT_LOCAL = re.compile(r"\b(?:finish|carry\s+on|continue|do)\b(?:\s+(?:task\s+)
                         r"|\blocally\b", re.I)
 _OUT_WAIT = re.compile(r"\b(?:wait|later|hold\s+on|leave\s+it)\b", re.I)
 
-# Her answer to "While you were away, N tasks finished. Want to hear about them?" A reply that's
+# The user's answer to "While you were away, N tasks finished. Want to hear about them?" A reply that's
 # neither (another question, a new topic) is carried on with, and the question is dropped.
 AWAY_ANSWER_SECONDS = 60                                 # no reply this long: dropped, nothing read
 PLAN_ANSWER_SECONDS = 180                                # a plan's question: dropped after this long (it waits)

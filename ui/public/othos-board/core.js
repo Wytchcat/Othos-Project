@@ -73,7 +73,7 @@ const AV = (() => {
   //   ?res=0.5     canvas resolution as a fraction of the window (1 = upstream)
   //   ?hud=1       show the measured frame rate and settings in the corner
   const num = (k, d) => { const v = parseFloat(Q.get(k)); return isFinite(v) ? v : d; };
-  const MAXFPS = Math.max(0, num("maxfps", 30));   // the user: 30 fps, res 0.5 on her 4K (even pacing at 60 Hz)
+  const MAXFPS = Math.max(0, num("maxfps", 30));   // the user: 30 fps, res 0.5 on the user's 4K (even pacing at 60 Hz)
   const RES = Math.min(1, Math.max(0.2, num("res", 0.5)));
   //   ?idlefps=8   lower cap while idle (the board barely moves then); keeps the
   //                laptop cooler between turns so the model has thermal headroom

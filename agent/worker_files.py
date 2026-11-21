@@ -25,9 +25,9 @@ CODE_EXT = {".py", ".ps1", ".psm1", ".bat", ".cmd", ".cs", ".ts", ".tsx", ".js",
             ".md", ".css", ".scss", ".html", ".php", ".yml", ".yaml", ".toml", ".ini", ".txt", ".sql", ".xml", ".sh"}
 BLOCKED_DIRS = {"brain", "logs", "state", ".git", ".venv", "venv", "node_modules", ".next", "__pycache__",
                 "drafts", "old", "icons", ".claude", "workers"}
-# personal.json and keys.dat hold her personal details and keys (the user's private-files list; Nov 14). A copy
+# personal.json and keys.dat hold the user's personal details and keys (the user's private-files list; Nov 14). A copy
 # of personal.json (personal.backup.json, personal.old.json) is blocked too; personal.example.json is the
-# shareable template with nothing of hers in it, so it stays readable (Nov 18).
+# shareable template with nothing of the user's in it, so it stays readable (Nov 18).
 BLOCKED_NAMES = re.compile(r"^(\.env.*|profile\.md|personal\.json|personal\.(?!example\.json$).+\.json|keys\.dat|.*\.(db|db-wal|db-shm|sqlite|pem|key|pfx|p12|crt)|"
                            r"id_rsa.*|.*secret.*|.*credential.*|.*token.*\.json|pids\.txt)$", re.I)
 MAX_BYTES = 120_000

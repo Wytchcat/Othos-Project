@@ -98,7 +98,7 @@ _SAYS_TASK = {"kept": re.compile(r"^\W*(?:(?:othos|osos)\W+)?(?:(?:yes|yeah|yep|
               "discarded": re.compile(r"^\W*(?:(?:othos|osos)\W+)?(?:(?:yes|yeah|yep|ok(?:ay)?)\W+)?"
                                       r"(?:discard|delete|bin|scrap)" + _TASK_N, re.I)}
 # a task number spoken in words, 0-999 ("sixty eight", "sixty-eight", "a hundred and five", "one oh five"), as
-# speech-to-text may write it (Nov 21, Othos main's note: only digits counted, so she was asked again)
+# speech-to-text may write it (Nov 21, Othos main's note: only digits counted, so the user was asked again)
 _UNITS = {w: i for i, w in enumerate("zero one two three four five six seven eight nine".split())} | {"oh": 0}
 _TEENS = {w: 10 + i for i, w in enumerate("ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen "
                                           "nineteen".split())}

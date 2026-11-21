@@ -675,7 +675,7 @@ def _print_rows(rows: list[dict], tabs: bool) -> None:
 
 
 # ---------------------------------------------------------------- downloads (the window's Get button)
-# Only on her click and a Yes in the window. Progress as JSON lines, like model_fetch.py:
+# Only on the user's click and a Yes in the window. Progress as JSON lines, like model_fetch.py:
 #   {"event": "progress", "done": N, "total": N, "status": "..."}  {"event": "done"}  {"event": "error"}
 TAG_RX = re.compile(r"^[a-z0-9][a-z0-9_.\-/]*:[A-Za-z0-9_.\-]+$")
 

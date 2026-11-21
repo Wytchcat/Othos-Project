@@ -1054,7 +1054,7 @@ class FirestarterForm : Form
         codeChat = MakeButton("Code chat", 22, gy + 82, 378);
         codeChat.Enabled = false;
         codeChat.Click += (s, e) => FirestarterApp.OpenPage("http://127.0.0.1:3000/code");
-        // a build's plan, for her yes, no, or answers (PlanForm)
+        // a build's plan, for the user's yes, no, or answers (PlanForm)
         plansButton = MakeButton("Plans…", 22, gy + 120, 378);
         plansButton.Click += (s, e) => LoadPlans(true);
         // close The Smithy and its worker, the same as the window's X (Nov 16, the user: there was no Close button)
@@ -1189,7 +1189,7 @@ class FirestarterForm : Form
         cur.Controls.Add(provider);
     }
 
-    // a build's plan waiting for her answer (smithy_jobs.run_proposal): opened by itself once per plan,
+    // a build's plan waiting for the user's answer (smithy_jobs.run_proposal): opened by itself once per plan,
     // or from the Plans button. Checked every 30 seconds, with the cloud line.
     readonly HashSet<string> shownPlans = new HashSet<string>();
     bool loadingPlans;
@@ -1532,7 +1532,7 @@ class FirestarterForm : Form
         StartWorker();
     }
 
-    // every provider in the switch order is out of free tokens: her choice, asked once per task
+    // every provider in the switch order is out of free tokens: the user's choice, asked once per task
     void AskOut(string tid, string title, string back)
     {
         var a = ThemedBox.Show(this, "Task " + tid + (title != "" ? " (" + title + ")" : "") + " has used up the free tokens " +
@@ -1636,7 +1636,7 @@ class FirestarterForm : Form
         Text = alive ? FirestarterApp.Name + ": " + st : FirestarterApp.Name;
 #if SMITHY
         if (++cloudTicks % 15 == 0) LoadCloud();        // today's cloud use, every 30 seconds
-        if (alive && cloudTicks % 15 == 2) LoadPlans(false);   // a plan waiting for her answer
+        if (alive && cloudTicks % 15 == 2) LoadPlans(false);   // a plan waiting for the user's answer
 #endif
         if (alive && ++noteTicks % 15 == 7) CheckWorkerNotes(st, tid, Get(s, "queued"));   // restart; a run ended
         if (tid == "" && (DateTime.Now - restartedAt).TotalSeconds < 60)
@@ -1689,7 +1689,7 @@ class FirestarterForm : Form
 }
 
 #if SMITHY
-// "Plan" window: a build's plan waiting for her answer (smithy_jobs.run_proposal; the user, Nov 14: "read
+// "Plan" window: a build's plan waiting for the user's answer (smithy_jobs.run_proposal; the user, Nov 14: "read
 // a prompt, ask for clarification where needed, create a plan offered with a yes/no prompt and make any
 // adaptations for further user input"). Build it = yes; Send answers = a revised plan; Don't build = no
 // (asked again first). Closing it (X, Escape, Alt+F4) answers nothing: the plan keeps waiting.
@@ -1774,7 +1774,7 @@ class PlanForm : Form
         Load += (s, e) => LoadPlan();
         Shown += (s, e) => { if (quiet) Flash(); };
         // answered by voice (or in another window) meanwhile: say so, and nothing here can answer it twice
-        // (Nov 14, suggestion 2). Checked every 10 seconds; her typing is left as it is.
+        // (Nov 14, suggestion 2). Checked every 10 seconds; the user's typing is left as it is.
         watch.Interval = 10000;
         watch.Tick += (s, e) => CheckStillWaiting();
         Shown += (s, e) => watch.Start();
@@ -1804,7 +1804,7 @@ class PlanForm : Form
         return b;
     }
 
-    // what she changed, as one reply: each question whose box isn't its default, then the other changes
+    // what the user changed, as one reply: each question whose box isn't its default, then the other changes
     string Answers()
     {
         var parts = new List<string>();
@@ -2409,7 +2409,7 @@ class SiteSetupForm : Form
 
 // "Download docs" (the user, Nov 16): the official docs of the extensions saved in Site setup, into the
 // shared library on this PC (library\<site>\extensions\<name>, ext_docs.py), which Othos and Firestarter
-// both search. Only the ones she ticks here; public pages only, the site's own docs folder only.
+// both search. Only the ones the user ticks here; public pages only, the site's own docs folder only.
 class DocsForm : Form
 {
     static readonly Color Bg = Color.FromArgb(2, 7, 5), Ink = Color.FromArgb(200, 230, 210),
@@ -2512,7 +2512,7 @@ class DocsForm : Form
             {
                 if (stopping) break;
                 string name = names[key], final = null; bool ok = false;
-                // she ticked it and pressed Download: that's the approval docs_fetch needs
+                // the user ticked it and pressed Download: that's the approval docs_fetch needs
                 var p = FirestarterApp.Start("ext_docs.py fetch " + site + " " + key + " --approved");
                 job = p;
                 string line;
@@ -2694,7 +2694,7 @@ class SiteBuildForm : Form
                 {
                     var link = new LinkLabel(); link.Text = "Source: " + new Uri(src).Host; link.AutoSize = true;
                     link.LinkColor = Dim; link.ActiveLinkColor = Ember; link.Location = new Point(56, y);
-                    link.LinkClicked += (s, e) => { try { Process.Start(src); } catch { } };   // opens in her browser
+                    link.LinkClicked += (s, e) => { try { Process.Start(src); } catch { } };   // opens in the user's browser
                     body.Controls.Add(link); y = link.Bottom;
                 }
             }
@@ -2737,7 +2737,7 @@ class SiteBuildForm : Form
                     if (!url.StartsWith("https://")) continue;
                     var link = new LinkLabel(); link.Text = "Its page: " + new Uri(url).Host; link.AutoSize = true;
                     link.LinkColor = Dim; link.ActiveLinkColor = Ember; link.Location = new Point(36, jy);
-                    link.LinkClicked += (s, e) => { try { Process.Start(url); } catch { } };   // her browser
+                    link.LinkClicked += (s, e) => { try { Process.Start(url); } catch { } };   // the user's browser
                     joomlaPanel.Controls.Add(link); jy = link.Bottom;
                 }
                 jy += 6;
@@ -2844,7 +2844,7 @@ class SiteBuildForm : Form
         });
     }
 
-    // The Joomla build: downloads (checked), PHP and MariaDB, Joomla's installer, her password on STDIN, the site
+    // The Joomla build: downloads (checked), PHP and MariaDB, Joomla's installer, the user's password on STDIN, the site
     // started on 127.0.0.1; one JSON line per step (worker.py joomla-build).
     void BuildJoomla(string file)
     {
@@ -2902,7 +2902,7 @@ class SiteBuildForm : Form
 }
 
 // "Your Joomla sites": the Joomla sites made on this PC (joomla_stack.py). Start runs one on 127.0.0.1, Stop stops
-// it, Open opens it in her browser, Steps opens its steps.html. "Stop all" also stops the database. Only processes
+// it, Open opens it in the user's browser, Steps opens its steps.html. "Stop all" also stops the database. Only processes
 // Firestarter started are ever stopped.
 class JoomlaSitesForm : Form
 {

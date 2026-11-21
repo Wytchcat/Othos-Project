@@ -312,7 +312,7 @@ class Worker:
                 "progress": cur.get("progress"),
                 "see_me": cur.get("see_me"),           # the last "See me" check-in on a long job: {ts, text}
                 "paused_task": self.paused_task if state == "paused" else None,
-                # every provider in the switch order is out (worker_cloud.Chain): when they're back, and her answer
+                # every provider in the switch order is out (worker_cloud.Chain): when they're back, and the user's answer
                 "free_tokens_back_ts": cur.get("free_tokens_back") if state == "waiting for free tokens" else None,
                 "out_choice": cur.get("out_choice", "") if state == "waiting for free tokens" else "",
                 "queued": c.get("queued", 0), "review": c.get("review", 0),
@@ -540,13 +540,13 @@ class Worker:
                     raise Stopped("cancelled")
                 choice = worker_cloud.out_choice(q.status_path, row["id"])
                 if choice == "local":
-                    log.info("task %d: finishing on this PC's model (her choice)", row["id"])
+                    log.info("task %d: finishing on this PC's model (the user's choice)", row["id"])
                     steps.info("Finishing on this PC's model, as you asked.")
                     result = "local"
                     break
                 if choice == "wait" and self.current.get("out_choice") != "wait":
                     self.current["out_choice"] = "wait"
-                    log.info("task %d: waiting for free tokens (her choice)", row["id"])
+                    log.info("task %d: waiting for free tokens (the user's choice)", row["id"])
                     steps.info("Waiting for free tokens, as you asked.")
                 if time.time() >= resume:
                     log.info("task %d: free tokens should be back; carrying on", row["id"])

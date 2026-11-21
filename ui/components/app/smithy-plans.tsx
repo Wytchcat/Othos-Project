@@ -27,7 +27,7 @@ function PlanCard({ plan, onDone }: { plan: Plan; onDone: (said: string) => void
   const [sureNo, setSureNo] = useState(false);
   const [note, setNote] = useState('');
 
-  // what she changed, as one reply: each question whose box isn't its default, then the other changes
+  // what the user changed, as one reply: each question whose box isn't its default, then the other changes
   const changed = [
     ...plan.questions
       .map((x, i) =>
